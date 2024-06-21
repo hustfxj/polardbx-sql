@@ -10,6 +10,7 @@ create tablegroup t_a_t_s_tg8;
 create tablegroup t_a_t_s_tg9;
 create tablegroup t_a_t_s_tg10;
 create tablegroup t_a_t_s_tg11;
+create tablegroup t_a_t_s_tg12;
 create table if not exists st_1(a int) single;
 create table if not exists st_2(b varchar(20)) single;
 create table if not exists bt_1(a int) broadcast;
@@ -45,9 +46,9 @@ alter table pt_k_5 set tablegroup=t_a_t_s_tg2 force;
 alter table pt_k_6 set tablegroup=t_a_t_s_tg2 force;
 is not match to table
 alter table pt_k_6 set tablegroup=t_a_t_s_tg10 force;
-## error_msg: $# is not compatible with tablegroup #$
+## error_msg: $# are not compatible with tablegroup #$
 alter table pt_k_7 set tablegroup=t_a_t_s_tg10 force;
-is not compatible with tablegroup
+are not compatible with tablegroup
 alter table pt_k_7 set tablegroup=t_a_t_s_tg4 force;
 ## error_msg: $# is not match to table #$
 alter table pt_k_8 set tablegroup=t_a_t_s_tg4 force;
@@ -130,10 +131,10 @@ pt_k_2,CREATE TABLE `pt_k_2` (
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4
 PARTITION BY KEY(`b`)
 PARTITIONS 3
-(PARTITION p1 VALUES LESS THAN (-3074457345618258601) ENGINE = InnoDB,
- PARTITION p2 VALUES LESS THAN (3074457345618258603) ENGINE = InnoDB,
- PARTITION p3 VALUES LESS THAN (9223372036854775807) ENGINE = InnoDB)
-/* tablegroup = `tg` */
+(PARTITION p3 VALUES LESS THAN (-4611686018427387903) ENGINE = InnoDB,
+ PARTITION p4 VALUES LESS THAN (1) ENGINE = InnoDB,
+ PARTITION p2 VALUES LESS THAN (9223372036854775807) ENGINE = InnoDB)
+tablegroup = `t_a_t_s_tg2`
 /*TDDL:SHOW_HASH_PARTITIONS_BY_RANGE=TRUE*/show full create table pt_k_3;
 Table,Create Table
 pt_k_3,CREATE TABLE `pt_k_3` (
@@ -496,3 +497,12 @@ PARTITIONS 3
  PARTITION p2 VALUES LESS THAN (3074457345618258603,9223372036854775807) ENGINE = InnoDB,
  PARTITION p3 VALUES LESS THAN (9223372036854775807,9223372036854775807) ENGINE = InnoDB)
 tablegroup = `t_a_t_s_tg4`
+create table pt_k_11(a int, b varchar(10),global index name (b) partition by key(b) partitions 2) partition by key(a) partitions 3;
+create table pt_k_12(a int, b varchar(10),global index name (b) partition by key(b) partitions 3) partition by key(a) partitions 3;
+alter table pt_k_11.name set tablegroup=t_a_t_s_tg12;
+## error_msg: $# due to need repartition #$
+alter table pt_k_12.name set tablegroup=t_a_t_s_tg12 force;
+due to need repartition
+select TABLE_GROUP_NAME,TABLE_COUNT,INDEX_COUNT from information_schema.table_group where TABLE_GROUP_NAME='t_a_t_s_tg12';
+TABLE_GROUP_NAME,TABLE_COUNT,INDEX_COUNT
+t_a_t_s_tg12,0,1

@@ -16,8 +16,6 @@
 
 package com.alibaba.polardbx.common.partition;
 
-import com.alibaba.polardbx.common.utils.hash.IBlockHasher;
-import com.alibaba.polardbx.common.utils.hash.Murmur3_128Hasher;
 import com.google.common.hash.HashCode;
 import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hashing;
@@ -50,5 +48,6 @@ public class MurmurHashUtils {
     public static long murmurHashWithZeroSeed(long data) {
         return murmurHash3_128(data);
     }
+
 }
 

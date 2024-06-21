@@ -17,6 +17,7 @@
 package com.alibaba.polardbx.optimizer.config.table;
 
 import com.alibaba.polardbx.common.utils.GeneralUtil;
+import com.alibaba.polardbx.druid.util.StringUtils;
 import com.alibaba.polardbx.gms.metadb.table.ColumnStatus;
 import com.alibaba.polardbx.gms.metadb.table.ColumnsRecord;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
@@ -56,6 +57,11 @@ public class ColumnMeta implements Serializable {
 
     private final long flag;
 
+    /**
+     * 映射列名 online change column
+     */
+    private final String mappingName;
+
     public ColumnMeta(String tableName, String name, String alias, Field field) {
         this.tableName = (tableName);
         this.name = (name);
@@ -63,15 +69,18 @@ public class ColumnMeta implements Serializable {
         this.field = field;
         this.status = ColumnStatus.PUBLIC;   //兼容以前
         this.flag = 0;
+        this.mappingName = null;
     }
 
-    public ColumnMeta(String tableName, String name, String alias, Field field, ColumnStatus status, long flag) {
+    public ColumnMeta(String tableName, String name, String alias, Field field, ColumnStatus status, long flag,
+                      String mappingName) {
         this.tableName = (tableName);
         this.name = (name);
         this.alias = alias;
         this.field = field;
         this.status = status;
         this.flag = flag;
+        this.mappingName = mappingName;
     }
 
     public String getTableName() {
@@ -231,4 +240,21 @@ public class ColumnMeta implements Serializable {
         return (flag & ColumnsRecord.FLAG_BINARY_DEFAULT) != 0L;
     }
 
+    public boolean isLogicalGeneratedColumn() {
+        return (flag & ColumnsRecord.FLAG_LOGICAL_GENERATED_COLUMN) != 0L;
+    }
+
+    public boolean isGeneratedColumn() {
+        return field.getExtra() != null && (field.getExtra().equalsIgnoreCase("VIRTUAL GENERATED") || field.getExtra()
+            .equalsIgnoreCase("STORED GENERATED"));
+    }
+
+    public boolean isDefaultExpr() {
+        return (flag & ColumnsRecord.FLAG_DEFAULT_EXPR) != 0L && !StringUtils.isEmpty(field.getUnescapeDefault())
+            && !isGeneratedColumn();
+    }
+
+    public String getMappingName() {
+        return mappingName;
+    }
 }

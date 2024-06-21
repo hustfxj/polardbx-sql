@@ -29,9 +29,9 @@ import com.alibaba.polardbx.druid.sql.ast.SQLOrderBy;
 import com.alibaba.polardbx.druid.sql.ast.SQLParameter;
 import com.alibaba.polardbx.druid.sql.ast.SQLPartition;
 import com.alibaba.polardbx.druid.sql.ast.SQLPartitionBy;
-import com.alibaba.polardbx.druid.sql.ast.SQLPartitionValue;
 import com.alibaba.polardbx.druid.sql.ast.SQLSetQuantifier;
 import com.alibaba.polardbx.druid.sql.ast.SQLStatement;
+import com.alibaba.polardbx.druid.sql.ast.SQLSubPartition;
 import com.alibaba.polardbx.druid.sql.ast.SQLWindow;
 import com.alibaba.polardbx.druid.sql.ast.expr.SQLAggregateExpr;
 import com.alibaba.polardbx.druid.sql.ast.expr.SQLBinaryOpExpr;
@@ -55,13 +55,15 @@ import com.alibaba.polardbx.druid.sql.ast.expr.SQLVariantRefExpr;
 import com.alibaba.polardbx.druid.sql.ast.statement.DrdsAlterTableAllocateLocalPartition;
 import com.alibaba.polardbx.druid.sql.ast.statement.DrdsAlterTableExpireLocalPartition;
 import com.alibaba.polardbx.druid.sql.ast.statement.DrdsExtractHotKey;
+import com.alibaba.polardbx.druid.sql.ast.statement.DrdsInspectIndexStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.DrdsMergePartition;
 import com.alibaba.polardbx.druid.sql.ast.statement.DrdsMovePartition;
 import com.alibaba.polardbx.druid.sql.ast.statement.DrdsRenamePartition;
-import com.alibaba.polardbx.druid.sql.ast.statement.DrdsAlterTableGroupReorgPartition;
-import com.alibaba.polardbx.druid.sql.ast.statement.DrdsSplitPartition;
 import com.alibaba.polardbx.druid.sql.ast.statement.DrdsSplitHotKey;
+import com.alibaba.polardbx.druid.sql.ast.statement.DrdsSplitPartition;
+import com.alibaba.polardbx.druid.sql.ast.statement.MySQLInstanceReadonlyItem;
 import com.alibaba.polardbx.druid.sql.ast.statement.MySQLRotateInnodbMasterKey;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterDatabaseStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterFunctionStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterJoinGroupStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterProcedureStatement;
@@ -91,6 +93,8 @@ import com.alibaba.polardbx.druid.sql.ast.statement.SQLExprTableSource;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLExternalRecordFormat;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLForeignKeyImpl;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLIfStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLImportDatabaseStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLImportSequenceStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLInsertStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLLoopStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLMergeTableGroupStatement;
@@ -136,9 +140,241 @@ import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.expr.MySqlCharExpr;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.expr.MySqlOrderingExpr;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.expr.MySqlOutFileExpr;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.expr.MySqlUserName;
-import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.*;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.CobarShowStatus;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.CreateFileStorageStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsAlignToTableGroup;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsAlterFileStorageStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsAlterTableAsOfTimeStamp;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsAlterTableBroadcast;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsAlterTablePartition;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsAlterTablePurgeBeforeTimeStamp;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsAlterTableSingle;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsBaselineStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCancelDDLJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCancelRebalanceJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsChangeDDLJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsChangeRuleVersionStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCheckColumnarIndex;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCheckColumnarPartition;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCheckGlobalIndex;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsClearCclRulesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsClearCclTriggersStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsClearDDLJobCache;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsClearFileStorageStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsClearSeqCacheStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsContinueDDLJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsContinueScheduleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsConvertAllSequencesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCreateCclRuleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCreateCclTriggerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsCreateScheduleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsDropCclRuleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsDropCclTriggerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsDropFileStorageStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsDropScheduleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsFireScheduleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsInspectDDLJobCache;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsInspectRuleVersionStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsInspectSeqRangeStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsMoveDataBase;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsPauseDDLJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsPauseRebalanceJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsPauseScheduleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsPurgeTransStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsPushDownUdfStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsRecoverDDLJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsRefreshLocalRulesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsRefreshTopology;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsRemoveDDLJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsRollbackDDLJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowCclRuleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowCclTriggerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowChangeSet;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowColumnarIndex;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowCreateTableGroup;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowDDLJobs;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowDDLResults;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowGlobalDeadlocks;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowGlobalIndex;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowLocalDeadlocks;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowLocality;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowMetadataLock;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowMoveDatabaseStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowPhysicalDdl;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowRebalanceBackFill;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowScheduleResultStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowStorage;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowTableGroup;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowTableReplicate;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowTransStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsShowTransStatsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsSkipRebalanceSubjob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsSlowSqlCclStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsTerminateRebalanceJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.DrdsUnArchiveStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySql8ShowGrantsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterDatabaseKillJob;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterDatabaseSetOption;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterEventStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterInstanceStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterLogFileGroupStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterServerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableAlterColumn;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableAlterFullTextIndex;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableChangeColumn;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableCheckConstraint;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableDiscardTablespace;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableForce;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableImportTablespace;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableLock;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableModifyColumn;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableOption;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableOrderBy;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTableValidation;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterTablespaceStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAlterUserStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlAnalyzeStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlBinlogStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlChangeMasterStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlChangeReplicationFilterStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCheckTableStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlChecksumTableStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlClearPartitionsHeatmapCacheStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlClearPlanCacheStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateAddLogFileGroupStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateEventStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateExternalCatalogStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateRoleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateServerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableSpaceStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableStatement;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableStatement.TableSpaceOption;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateUserStatement;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateUserStatement.UserSpecification;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlDeleteStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlDisabledPlanCacheStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlDropRoleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlEventSchedule;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlExecuteForAdsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlExecuteStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlExplainPlanCacheStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlExplainStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlExtPartition;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlFlashbackStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlFlushLogsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlFlushStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlGrantRoleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlHelpStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlHintStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlInsertStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlLoadDataInFileStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlLoadXmlStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlLockTableStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlManageInstanceGroupStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlMigrateStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlOptimizeStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlPartitionByKey;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlPrepareStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlRaftLeaderTransferStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlRaftMemberChangeStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlRenameSequenceStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlRenameTableStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlResetSlaveStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlResetStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlRevokeRoleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlSelectQueryBlock;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlSetDefaultRoleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlSetRoleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlSetTransactionStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowAuthorsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowBinLogEventsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowBinaryLogsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowBinaryStreamsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowBroadcastsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowCharacterSetStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowClusterNameStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowCollationStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowConfigStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowContributorsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowCreateDatabaseStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowCreateEventStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowCreateFunctionStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowCreateProcedureStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowCreateTriggerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowDatabaseStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowDatasourcesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowDdlStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowDsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowEngineStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowEnginesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowErrorsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowEventsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowFilesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowFunctionCodeStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowFunctionStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowGrantsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowHMSMetaStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowHelpStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowJobStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowMasterLogsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowMasterStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowMigrateTaskStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowNodeStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowOpenTablesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowPartitionsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowPhysicalProcesslistStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowPlanCacheStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowPlanCacheStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowPluginsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowPrivilegesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowProcedureCodeStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowProcedureStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowProcessListStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowProfileStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowProfilesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowPruneTraceStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowRelayLogEventsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowRuleStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowRuleStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowSequencesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowSlaveHostsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowSlaveStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowSlowStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowTableInfoStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowTableStatusStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowTopologyStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowTraceStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowTriggersStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowVariantsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlShowWarningsStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlStartSlaveStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlStopSlaveStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlSubPartitionByKey;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlSubPartitionByList;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlSubPartitionByValue;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlTableIndex;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlUnlockTablesStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlUpdatePlanCacheStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlUpdateStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlUpdateTableSource;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlAlterFullTextStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlCreateFullTextAnalyzerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlCreateFullTextCharFilterStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlCreateFullTextDictionaryStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlCreateFullTextTokenFilterStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlCreateFullTextTokenizerStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlDeallocatePrepareStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlDropFullTextStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlShowCreateFullTextStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlShowDbLockStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlShowFullTextStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlShowHtcStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlShowRouteStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MysqlShowStcStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.SQLAlterTableAddRoute;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.SQLShowPartitionsHeatmapStatement;
+import com.alibaba.polardbx.druid.sql.parser.ParserException;
 import com.alibaba.polardbx.druid.sql.visitor.ExportParameterVisitorUtils;
 import com.alibaba.polardbx.druid.sql.visitor.SQLASTOutputVisitor;
 import com.alibaba.polardbx.druid.sql.visitor.VisitorFeature;
@@ -152,6 +388,8 @@ import java.util.List;
 import java.util.Map;
 
 public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTVisitor {
+
+    private static boolean shardingSupportChecked = false;
 
     {
         this.dbType = DbType.mysql;
@@ -172,8 +410,6 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             // skip
         }
     }
-
-    private static boolean shardingSupportChecked = false;
 
     public void configFromProperty() {
         if (this.parameterized && !shardingSupportChecked) {
@@ -388,6 +624,14 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(ucase ? " VIRTUAL" : " virtual");
         }
 
+        if (x.isStored()) {
+            print0(ucase ? " STORED" : " stored");
+        }
+
+        if (x.isLogical()) {
+            print0(ucase ? " LOGICAL" : " logical");
+        }
+
         if (x.isVisible()) {
             print0(ucase ? " VISIBLE" : " visible");
         }
@@ -415,7 +659,13 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         final SQLExpr defaultExpr = x.getDefaultExpr();
         if (defaultExpr != null) {
             print0(ucase ? " DEFAULT " : " default ");
+            if (x.isDefaultExprHasLp()) {
+                print0("(");
+            }
             defaultExpr.accept(this);
+            if (x.isDefaultExprHasLp()) {
+                print0(")");
+            }
         }
 
         final SQLExpr storage = x.getStorage();
@@ -479,7 +729,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         }
 
         if (x.getStep() != null) {
-            print0(ucase ? " STEP " : " STEP ");
+            print0(" STEP ");
             printExpr(x.getStep());
         }
 
@@ -489,7 +739,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             delimiter.accept(this);
         }
 
-        if (x.isDisableIndex() == true) {
+        if (x.isDisableIndex()) {
             print0(ucase ? " DISABLEINDEX TRUE" : " disableindex true");
         }
 
@@ -510,10 +760,6 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print(')');
         }
 
-        if (x.isStored()) {
-            print0(ucase ? " STORED" : " stored");
-        }
-
         if (x.getEncode() != null) {
             print0(ucase ? " ENCODE=" : " encode=");
             x.getEncode().accept(this);
@@ -528,7 +774,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         if (colProperties != null && colProperties.size() > 0) {
             print0(ucase ? " COLPROPERTIES (" : " colproperties (");
             printAndAccept(colProperties, ", ");
-            print0(ucase ? ")" : ")");
+            print0(")");
         }
 
         for (SQLColumnConstraint item : x.getConstraints()) {
@@ -536,6 +782,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
                 print(' ');
                 item.accept(this);
             }
+        }
+
+        if (null != x.getSecuredWith()) {
+            this.print0(this.ucase ? " COLUMN SECURED WITH " : "column secured with ");
+            x.getSecuredWith().accept(this);
         }
 
         this.parameterized = parameterized;
@@ -605,7 +856,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(x.getCollate());
         }
 
-        List<SQLCommentHint> hints = ((SQLCharacterDataType) x).hints;
+        List<SQLCommentHint> hints = x.hints;
         if (hints != null) {
             print(' ');
             for (SQLCommentHint hint : hints) {
@@ -643,6 +894,10 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(ucase ? "LOCAL " : "local ");
         } else if (x.getIndexDefinition().isClustered()) {
             print0(ucase ? "CLUSTERED " : "clustered ");
+        }
+
+        if (x.getIndexDefinition().isColumnar()) {
+            print0(ucase ? "COLUMNAR " : "columnar ");
         }
 
         print0(ucase ? "INDEX" : "index");
@@ -738,9 +993,18 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             partitionBy.accept(this);
         }
 
-        if (x.getTableGroup() != null) {
-            print0(ucase ? " TABLEGROUP =  " : " tablegroup = ");
+        if (x.isWithImplicitTablegroup()) {
+            print0(ucase ? " WITH TABLEGROUP=" : " with tablegroup=");
             x.getTableGroup().accept(this);
+            print0(ucase ? " IMPLICIT" : " implicit");
+        } else if (x.getTableGroup() != null) {
+            print0(ucase ? " TABLEGROUP= " : " tablegroup= ");
+            x.getTableGroup().accept(this);
+        }
+
+        if (x.isColumnar() && null != x.getEngineName()) {
+            print0(ucase ? " ENGINE = " : " engine = ");
+            x.getEngineName().accept(this);
         }
 
         /*
@@ -760,6 +1024,10 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         */
         if (x.getIndexDefinition().hasOptions()) {
             x.getIndexDefinition().getOptions().accept(this);
+        }
+
+        if (!x.getVisible()) {
+            print0(ucase ? " INVISIBLE " : " invisible ");
         }
 
         return false;
@@ -808,7 +1076,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         } else if (clustering) {
             print0(ucase ? "CLUSTERING " : "clustering ");
         } else if (clustered) {
-            print0(ucase ? "CLUSTERED " : "CLUSTERED ");
+            print0("CLUSTERED ");
         }
 
         print0(ucase ? "KEY" : "key");
@@ -833,6 +1101,12 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             x.getColumns().get(i).accept(this);
         }
         print(')');
+
+        if (x.isWithImplicitTablegroup()) {
+            print0(ucase ? " WITH TABLEGROUP=" : " with tablegroup=");
+            x.getTableGroup().accept(this);
+            print0(ucase ? " IMPLICIT" : " implicit");
+        }
 
         SQLExpr comment = x.getComment();
         if (comment != null) {
@@ -983,7 +1257,6 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         x.getStatementName().accept(this);
         if (x.getParameters().size() > 0) {
             print0(ucase ? " USING " : " using ");
-            ;
             printAndAccept(x.getParameters(), ", ");
         }
         return false;
@@ -2082,6 +2355,32 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
+    public void endVisit(DrdsUnArchiveStatement x) {
+    }
+
+    @Override
+    public boolean visit(DrdsUnArchiveStatement x) {
+        print0(ucase ? "UNARCHIVE " : "unarchive ");
+        switch (x.getTarget()) {
+        case TABLE:
+            print0(ucase ? "TABLE " : "table ");
+            x.getTableSource().accept(this);
+            break;
+        case TABLE_GROUP:
+            print0(ucase ? "TABLEGROUP " : "tablegroup ");
+            x.getTableGroup().accept(this);
+            break;
+        case DATABASE:
+            print0(ucase ? "DATABASE " : "database ");
+            x.getDatabase().accept(this);
+            break;
+        default:
+            throw new ParserException("syntax error, expect TABLE/TABLE_GROUP/DATABASE");
+        }
+        return false;
+    }
+
+    @Override
     public void endVisit(DrdsPushDownUdfStatement x) {
     }
 
@@ -2167,6 +2466,31 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
+    public void endVisit(DrdsPauseRebalanceJob x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsPauseRebalanceJob x) {
+        print0(ucase ? "PAUSE REBALANCE" : "pause rebalance");
+        if (x.isAllJobs()) {
+            print0(ucase ? " ALL" : " all");
+        } else {
+            boolean first = true;
+            for (Long id : x.getJobIds()) {
+                if (first) {
+                    first = false;
+                    print0(" ");
+                } else {
+                    print0(", ");
+                }
+                print(id);
+            }
+        }
+        return false;
+    }
+
+    @Override
     public void endVisit(DrdsRollbackDDLJob x) {
 
     }
@@ -2174,6 +2498,81 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     @Override
     public boolean visit(DrdsRollbackDDLJob x) {
         print0(ucase ? "ROLLBACK DDL" : "rollback ddl");
+        if (x.isAllJobs()) {
+            print0(ucase ? " ALL" : " all");
+        } else {
+            boolean first = true;
+            for (Long id : x.getJobIds()) {
+                if (first) {
+                    first = false;
+                    print0(" ");
+                } else {
+                    print0(", ");
+                }
+                print(id);
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsTerminateRebalanceJob x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsTerminateRebalanceJob x) {
+        print0(ucase ? "ROLLBACK REBALANCE" : "rollback rebalance");
+        if (x.isAllJobs()) {
+            print0(ucase ? " ALL" : " all");
+        } else {
+            boolean first = true;
+            for (Long id : x.getJobIds()) {
+                if (first) {
+                    first = false;
+                    print0(" ");
+                } else {
+                    print0(", ");
+                }
+                print(id);
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsSkipRebalanceSubjob x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsSkipRebalanceSubjob x) {
+        print0(ucase ? "SKIP REBALANCE SUBJOB" : "skip rebalance subjob");
+        if (x.isAllJobs()) {
+            print0(ucase ? " ALL" : " all");
+        } else {
+            boolean first = true;
+            for (Long id : x.getJobIds()) {
+                if (first) {
+                    first = false;
+                    print0(" ");
+                } else {
+                    print0(", ");
+                }
+                print(id);
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsCancelRebalanceJob x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsCancelRebalanceJob x) {
+        print0(ucase ? "CANCEL REBALANCE" : "cancel rebalance");
         if (x.isAllJobs()) {
             print0(ucase ? " ALL" : " all");
         } else {
@@ -2310,7 +2709,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             List<SQLCommentHint> headHints = x.getHeadHintsDirect();
             if (headHints != null) {
                 for (SQLCommentHint hint : headHints) {
-                    visit((SQLCommentHint) hint);
+                    visit(hint);
                     println();
                 }
             }
@@ -2328,6 +2727,21 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     @Override
     public boolean visit(DrdsShowGlobalIndex x) {
         print0(ucase ? "SHOW GLOBAL INDEX" : "show global index");
+        if (x.getTableName() != null) {
+            print0(ucase ? " FROM " : " from ");
+            printExpr(x.getTableName(), parameterized);
+        }
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsShowColumnarIndex x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsShowColumnarIndex x) {
+        print0(ucase ? "SHOW COLUMNAR INDEX" : "show columnar index");
         if (x.getTableName() != null) {
             print0(ucase ? " FROM " : " from ");
             printExpr(x.getTableName(), parameterized);
@@ -2407,6 +2821,41 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
+    public void endVisit(DrdsCheckColumnarPartition x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsCheckColumnarPartition x) {
+        print0(ucase ? "CHECK COLUMNAR PARTITION " : "check columnar partition ");
+        printExpr(x.getTableName(), parameterized);
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsCheckColumnarIndex x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsCheckColumnarIndex x) {
+        print0(ucase ? "CHECK COLUMNAR INDEX" : "check columnar index");
+        if (x.getIndexName() != null) {
+            print0(" ");
+            printExpr(x.getIndexName(), parameterized);
+        }
+        if (x.getTableName() != null) {
+            print0(ucase ? " ON " : " on ");
+            printExpr(x.getTableName(), parameterized);
+        }
+        if (x.getExtraCmd() != null) {
+            print0(" ");
+            print0(x.getExtraCmd());
+        }
+        return false;
+    }
+
+    @Override
     public void endVisit(DrdsCreateScheduleStatement x) {
 
     }
@@ -2414,9 +2863,8 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     @Override
     public boolean visit(DrdsCreateScheduleStatement x) {
         print0(ucase ? "CREATE SCHEDULE FOR " : "create schedule for ");
-        if (x.isForLocalPartition()) {
-            print0(ucase ? "LOCAL_PARTITION " : "local_partition ");
-        }
+        print0(ucase ? x.getExecutorType().toUpperCase() : x.getExecutorType().toLowerCase());
+        print0(" ");
         print0(ucase ? "ON " : "on ");
         x.getName().accept(this);
         print0(" ");
@@ -2908,15 +3356,55 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(MySqlPartitionByKey x) {
+
+        if (printBySourceSqlIfNeed(x)) {
+            return false;
+        }
+
         if (x.isLinear()) {
             print0(ucase ? "LINEAR KEY (" : "linear key (");
         } else {
             print0(ucase ? "KEY (" : "key (");
         }
-        printAndAccept(x.getColumns(), ", ");
+        if (x.isForTableGroup()) {
+            printAndAccept(x.getColumnsDefinition(), ", ");
+        } else {
+            printAndAccept(x.getColumns(), ", ");
+        }
         print(')');
 
         printPartitionsCountAndSubPartitions(x);
+        if (x.getSubPartitionBy() != null && (x.getSubPartitionBy().getSubPartitionTemplate() == null
+            || x.getSubPartitionBy().getSubPartitionTemplate().isEmpty())) {
+//            if (x.getPartitions().size() > 0) {
+//                print(" (");
+//                this.indentCount++;
+//                for (int i = 0, size = x.getPartitions().size(); i < size; ++i) {
+//                    if (i != 0) {
+//                        print(',');
+//                    }
+//                    println();
+//                    x.getPartitions().get(i).accept(this);
+//                }
+//                this.indentCount--;
+//                println();
+//                print(')');
+//            }
+            printSQLSubPartitions(x.getSubPartitionBy().getSubPartitionTemplate());
+        }
+
+        boolean useSubPart = x.getSubPartitionBy() != null;
+        boolean useSubPartTemp = false;
+        if (useSubPart) {
+            useSubPartTemp = x.getSubPartitionBy().getSubPartitionTemplate() != null && !x.getSubPartitionBy()
+                .getSubPartitionTemplate().isEmpty();
+        }
+
+        if (isEnabled(VisitorFeature.OutputHashPartitionsByRange) || (useSubPart && !useSubPartTemp)) {
+            if (x.getPartitions().size() > 0) {
+                printSQLPartitions(x.getPartitions());
+            }
+        }
         return false;
     }
 
@@ -3038,6 +3526,10 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
                 print0(ucase ? " TERMINATED BY " : " terminated by ");
                 x.getLinesTerminatedBy().accept(this);
             }
+        }
+
+        if (x.getStatistics()) {
+            print0(ucase ? " STATISTICS " : " statistics ");
         }
 
         return false;
@@ -3351,7 +3843,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(MySqlShowBinaryLogsStatement x) {
-        print0(ucase ? "SHOW BINARY LOGS" : "show binary logs");
+        if (x.isFull()) {
+            print0(ucase ? "SHOW FULL BINARY LOGS" : "show full binary logs");
+        } else {
+            print0(ucase ? "SHOW BINARY LOGS" : "show binary logs");
+        }
         if (x.getWith() != null) {
             print0(ucase ? " WITH " : " with ");
             x.getWith().accept(this);
@@ -3361,7 +3857,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(MySqlShowMasterLogsStatement x) {
-        print0(ucase ? "SHOW MASTER LOGS" : "show master logs");
+        if (x.isFull()) {
+            print0(ucase ? "SHOW FULL MASTER LOGS" : "show full master logs");
+        } else {
+            print0(ucase ? "SHOW MASTER LOGS" : "show master logs");
+        }
         if (x.getWith() != null) {
             print0(ucase ? " WITH " : " with ");
             x.getWith().accept(this);
@@ -3475,6 +3975,10 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     @Override
     public void endVisit(MySqlShowCreateEventStatement x) {
 
+    }
+
+    @Override
+    public void endVisit(SQLAlterDatabaseStatement x) {
     }
 
     @Override
@@ -3725,7 +4229,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(MySqlShowMasterStatusStatement x) {
-        print0(ucase ? "SHOW MASTER STATUS" : "show master status");
+        if (x.isFull()) {
+            print0(ucase ? "SHOW FULL MASTER STATUS" : "show full master status");
+        } else {
+            print0(ucase ? "SHOW MASTER STATUS" : "show master status");
+        }
         if (x.getWith() != null) {
             print0(ucase ? " WITH " : " with ");
             x.getWith().accept(this);
@@ -3947,7 +4455,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(ucase ? "FULL " : "full ");
         }
         if (x.isPhysical()) {
-            print0(ucase ? "PHYSICAL_SLOW" : "PHYSICAL_SLOW");
+            print0("PHYSICAL_SLOW");
         } else {
             print0(ucase ? "SLOW" : "slow");
         }
@@ -4009,6 +4517,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print(' ');
             print0(ucase ? "FOR CHANNEL " : "for channel ");
             x.getChannel().accept(this);
+        }
+        if (x.getSubChannel() != null) {
+            print(' ');
+            print0(ucase ? "FOR SUB_CHANNEL " : "for sub_channel ");
+            x.getSubChannel().accept(this);
         }
         return false;
     }
@@ -4499,6 +5012,12 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     public boolean visit(MySqlAlterTableAlterFullTextIndex x) {
         print0(ucase ? " ALTER INDEX " : " alter index ");
         x.getIndexName().accept(this);
+        if (x.isAlterIndexVisibility()) {
+            print0(ucase ? " " + x.getIndexVisibility().toUpperCase() + " " :
+                " " + x.getIndexVisibility().toLowerCase() + " ");
+            return false;
+        }
+
         print0(ucase ? " FULLTEXT " : " fulltext ");
         if (x.getAnalyzerType() != null) {
             String analyzerType = x.getAnalyzerType().toString();
@@ -4608,6 +5127,44 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public void endVisit(MySqlShowTraceStatement x) {
+
+    }
+
+    @Override
+    public boolean visit(MySqlShowPruneTraceStatement x) {
+        print0(ucase ? "SHOW PRUNE TRACE" : "show prune trace");
+
+        if (x.getSelectList() != null) {
+            print0("(");
+            for (int i = 0; i < x.getSelectList().size(); i++) {
+                if (i != 0) {
+                    print0(", ");
+                }
+                x.getSelectList().get(i).accept(this);
+            }
+            print0(")");
+        }
+
+        if (x.getWhere() != null) {
+            print0(ucase ? " WHERE " : " where ");
+            x.getWhere().accept(this);
+        }
+
+        if (x.getOrderBy() != null) {
+            print0(" ");
+            x.getOrderBy().accept(this);
+        }
+
+        if (x.getLimit() != null) {
+            print0(" ");
+            x.getLimit().accept(this);
+        }
+
+        return false;
+    }
+
+    @Override
+    public void endVisit(MySqlShowPruneTraceStatement x) {
 
     }
 
@@ -4818,6 +5375,22 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
+    public boolean visit(MySqlShowFilesStatement x) {
+        print0(ucase ? "SHOW " : "show ");
+
+        print0(ucase ? "FILES FROM " : "files from ");
+
+        print0(x.getName().getSimpleName());
+
+        return false;
+    }
+
+    @Override
+    public void endVisit(MySqlShowFilesStatement x) {
+
+    }
+
+    @Override
     public boolean visit(MySqlShowTopologyStatement x) {
         print0(ucase ? "SHOW " : "show ");
 
@@ -4894,18 +5467,26 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             }
         }
 
-        print0(ucase ? "ALTER " : "alter ");
-        if (x.isOnline()) {
-            print0(ucase ? "ONLINE  " : "online ");
-        } else if (x.isOffline()) {
-            print0(ucase ? "OFFLINE  " : "offline ");
-        }
-        if (x.isIgnore()) {
-            print0(ucase ? "IGNORE " : "ignore ");
-        }
-        print0(ucase ? "TABLE " : "table ");
+        if (x.getAlterIndexName() != null) {
+            print(ucase ? "ALTER INDEX " : "alter index ");
+            printTableSourceExpr(x.getAlterIndexName());
+            print(ucase ? " ON TABLE " : " on table ");
+            printTableSourceExpr(x.getName());
+        } else {
+            print0(ucase ? "ALTER " : "alter ");
+            if (x.isOnline()) {
+                print0(ucase ? "ONLINE  " : "online ");
+            } else if (x.isOffline()) {
+                print0(ucase ? "OFFLINE  " : "offline ");
+            }
+            if (x.isIgnore()) {
+                print0(ucase ? "IGNORE " : "ignore ");
+            }
+            print0(ucase ? "TABLE " : "table ");
 
-        printTableSourceExpr(x.getName());
+            printTableSourceExpr(x.getName());
+        }
+
         boolean needParentheses = false;
         this.indentCount++;
         for (int i = 0; i < x.getItems().size(); ++i) {
@@ -4913,8 +5494,70 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             if (i != 0) {
                 print(',');
             } else if (item instanceof SQLAlterTableModifyPartitionValues) {
-                //print0(ucase ? " MODIFY PARTITION " : "modify partition ");
-                needParentheses = false;
+                /**
+                 * <pre>
+                 *     type0:
+                 *          ALTER TABLE tbl
+                 *          {(Syntax of SQLAlterTableModifyPartitionValues)
+                 *
+                 *              MODIFY PARTITION/SUBPARTITION
+                 *              [(]
+                 *              p1 ADD/DROP VALUES (...),
+                 *              p2 ADD/DROP VALUES (...),
+                 *              ...
+                 *              pn ADD/DROP VALUES (...)
+                 *              [)]
+                 *          }
+                 *          ,
+                 *
+                 *    type1:
+                 *          ALTER TABLE tbl
+                 *          MODIFY PARTITION p1
+                 *          {( Syntax of SQLAlterTableModifyPartitionValues)
+                 *              MODIFY SUBPARTITION
+                 *              [(]
+                 *              sp1 ADD/DROP VALUES (...),
+                 *              sp2 ADD/DROP VALUES (...),
+                 *              ...
+                 *              spn ADD/DROP VALUES (...)
+                 *              [)]
+                 *          },
+                 *          MODIFY PARTITION p2
+                 *          {( Syntax of SQLAlterTableModifyPartitionValues)
+                 *              MODIFY SUBPARTITION
+                 *              [(]
+                 *              sp1 ADD/DROP VALUES (...),
+                 *              sp2 ADD/DROP VALUES (...),
+                 *              ...
+                 *              spn ADD/DROP VALUES (...)
+                 *              [)]
+                 *          }
+                 *
+                 * </pre>
+                 *
+                 *
+                 */
+                SQLAlterTableModifyPartitionValues itemVal = (SQLAlterTableModifyPartitionValues) item;
+                boolean needPrintModifyPartition = false;
+                SQLName partName = null;
+                if (itemVal.isSubPartition()) {
+                    SQLPartition part = itemVal.getSqlPartition();
+                    if (part.getName() == null) {
+                        needPrintModifyPartition = false;
+                    } else {
+                        partName = part.getName();
+                        needPrintModifyPartition = true;
+                    }
+                }
+                if (needPrintModifyPartition) {
+                    print0(ucase ? " MODIFY PARTITION " : "modify partition ");
+                    if (partName != null) {
+                        partName.accept(this);
+                    }
+                    if (x.getItems().size() > 1) {
+                        needParentheses = true;
+                    }
+                }
             }
             println();
             if (i == 0 && needParentheses) {
@@ -4942,7 +5585,6 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             }
             println();
         }
-
         this.indentCount--;
 
         int i = 0;
@@ -4977,6 +5619,25 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             partitionBy.accept(this);
         }
 
+        if (x.getLocality() != null) {
+            println();
+            String localityString = "LOCALITY = " + x.getLocality().toString();
+            print0(ucase ? localityString.toUpperCase() : localityString.toLowerCase());
+        }
+        if (x.getTargetImplicitTableGroup() != null) {
+            print0(ucase ? " WITH TABLEGROUP=" : " with tablegroup=");
+            x.getTargetImplicitTableGroup().accept(this);
+            print0(ucase ? " IMPLICIT" : " implicit");
+        }
+
+        for (int pos = 0; pos < x.getIndexTableGroupPair().size(); pos++) {
+            print0(", ");
+            print0(ucase ? "INDEX " : "index ");
+            x.getIndexTableGroupPair().get(pos).getKey().accept(this);
+            print0(ucase ? " WITH TABLEGROUP=" : " with tablegroup=");
+            x.getIndexTableGroupPair().get(pos).getValue().accept(this);
+            print0(ucase ? " IMPLICIT" : " implicit");
+        }
         DrdsAlignToTableGroup alignToTableGroup = x.getAlignToTableGroup();
         if (alignToTableGroup != null) {
             alignToTableGroup.accept(this);
@@ -4985,26 +5646,26 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         return false;
     }
 
-    public boolean visit(SQLAlterTableModifyPartitionValues x) {
-
-        SQLPartition sqlPartitionDef = x.getSqlPartition();
-        SQLName name = sqlPartitionDef.getName();
-        SQLPartitionValue values = sqlPartitionDef.getValues();
-        boolean isAdd = x.isAdd();
-
-        print0(ucase ? " MODIFY PARTITION " : " modify partition ");
-
-        name.accept(this);
-
-        if (isAdd) {
-            print0(ucase ? " ADD " : "add ");
-        } else {
-            print0(ucase ? " DROP " : "drop ");
-        }
-        values.accept(this);
-
-        return false;
-    }
+//    public boolean visit(SQLAlterTableModifyPartitionValues x) {
+//
+//        SQLPartition sqlPartitionDef = x.getSqlPartition();
+//        SQLName name = sqlPartitionDef.getName();
+//        SQLPartitionValue values = sqlPartitionDef.getValues();
+//        boolean isAdd = x.isAdd();
+//
+//        print0(ucase ? " MODIFY PARTITION " : " modify partition ");
+//
+//        name.accept(this);
+//
+//        if (isAdd) {
+//            print0(ucase ? " ADD " : "add ");
+//        } else {
+//            print0(ucase ? " DROP " : "drop ");
+//        }
+//        values.accept(this);
+//
+//        return false;
+//    }
 
     @Override
     public boolean visit(SQLAlterTableAddColumn x) {
@@ -5455,13 +6116,16 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(MysqlForeignKey x) {
-        if (x.isHasConstraint()) {
-            print0(ucase ? "CONSTRAINT " : "constraint ");
-            if (x.getName() != null) {
-                x.getName().accept(this);
-                print(' ');
-            }
+        /**
+         *  always has constraint in fk
+         */
+//        if (x.isHasConstraint()) {
+        print0(ucase ? "CONSTRAINT " : "constraint ");
+        if (x.getName() != null) {
+            x.getName().accept(this);
+            print(' ');
         }
+//        }
 
         print0(ucase ? "FOREIGN KEY" : "foreign key");
 
@@ -5497,6 +6161,13 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(ucase ? " ON UPDATE " : " on update ");
             print0(ucase ? x.getOnUpdate().name : x.getOnUpdate().name_lcase);
         }
+
+        if (x.getPushDown() != null) {
+            print0(ucase ? " /* TYPE " : " /* type ");
+            print0(ucase ? x.getPushDown().name : x.getPushDown().name_lcase);
+            print0(" */");
+        }
+
         return false;
     }
 
@@ -5660,7 +6331,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(")");
             if (x.getAdbWhere() != null) {
                 println();
-                print0(ucase ? " WHERE " : " WHERE ");
+                print0(" WHERE ");
                 printExpr(x.getAdbWhere());
             }
         } else if (!x.getAdbColumnsGroup().isEmpty()) {
@@ -5669,13 +6340,13 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(")");
             if (x.getAdbWhere() != null) {
                 println();
-                print0(ucase ? " WHERE " : " WHERE ");
+                print0(" WHERE ");
                 printExpr(x.getAdbWhere());
             }
         } else if (!x.getTableSources().isEmpty()) {
             if (x.getAdbWhere() != null) {
                 println();
-                print0(ucase ? " WHERE " : " WHERE ");
+                print0(" WHERE ");
                 printExpr(x.getAdbWhere());
             }
         }
@@ -6179,9 +6850,16 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     public boolean visit(MySqlAlterTableAlterColumn x) {
         print0(ucase ? "ALTER COLUMN " : "alter column ");
         x.getColumn().accept(this);
-        if (x.getDefaultExpr() != null) {
+        final SQLExpr defaultExpr = x.getDefaultExpr();
+        if (defaultExpr != null) {
             print0(ucase ? " SET DEFAULT " : " set default ");
-            x.getDefaultExpr().accept(this);
+            if (x.isDefaultExprHasLp()) {
+                print0("(");
+            }
+            defaultExpr.accept(this);
+            if (x.isDefaultExprHasLp()) {
+                print0(")");
+            }
         } else if (x.isDropDefault()) {
             print0(ucase ? " DROP DEFAULT" : " drop default");
         }
@@ -6270,17 +6948,45 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(MySqlSubPartitionByKey x) {
+
+        if (printBySourceSqlIfNeed(x)) {
+            return false;
+        }
+
         if (x.isLinear()) {
             print0(ucase ? "SUBPARTITION BY LINEAR KEY (" : "subpartition by linear key (");
         } else {
             print0(ucase ? "SUBPARTITION BY KEY (" : "subpartition by key (");
         }
-        printAndAccept(x.getColumns(), ", ");
+        if (x.isForTableGroup()) {
+            printAndAccept(x.getColumnsDefinition(), ", ");
+        } else {
+            printAndAccept(x.getColumns(), ", ");
+        }
         print(')');
 
         if (x.getSubPartitionsCount() != null) {
             print0(ucase ? " SUBPARTITIONS " : " subpartitions ");
             x.getSubPartitionsCount().accept(this);
+        }
+
+        if (isEnabled(VisitorFeature.OutputHashPartitionsByRange)) {
+            List<SQLSubPartition> subPartSpecTemp = x.getSubPartitionTemplate();
+            if (subPartSpecTemp != null && subPartSpecTemp.size() > 0) {
+                printSQLSubPartitions(subPartSpecTemp);
+//                print(" (");
+//                this.indentCount++;
+//                for (int i = 0, size = subPartSpecTemp.size(); i < size; ++i) {
+//                    if (i != 0) {
+//                        print(',');
+//                    }
+//                    println();
+//                    subPartSpecTemp.get(i).accept(this);
+//                }
+//                this.indentCount--;
+//                println();
+//                print(')');
+            }
         }
         return false;
     }
@@ -7304,7 +8010,9 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(SQLValuesTableSource x) {
-        print('(');
+        if (x.isBracket()) {
+            print('(');
+        }
         incrementIndent();
         println();
         print0(ucase ? "VALUES " : "values ");
@@ -7318,8 +8026,18 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             visit(list);
         }
         decrementIndent();
+        if (x.getOrderBy() != null) {
+            println();
+            visit(x.getOrderBy());
+        }
+        if (x.getLimit() != null) {
+            println();
+            visit(x.getLimit());
+        }
         println();
-        print0(")");
+        if (x.isBracket()) {
+            print0(")");
+        }
         if (x.getAlias() != null) {
             print0(" AS ");
             print0(x.getAlias());
@@ -7349,6 +8067,21 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public void endVisit(DrdsInspectRuleVersionStatement x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsInspectIndexStatement x) {
+        print0(ucase ? "INSPECT INDEX" : "inspect index");
+        if (x.isFromTable()) {
+            print0(ucase ? " FROM" : " from");
+            x.getTableName().accept(this);
+        }
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsInspectIndexStatement x) {
 
     }
 
@@ -7397,14 +8130,14 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
-    public boolean visit(DrdsInspectGroupSeqRangeStatement x) {
-        print0(ucase ? "INSPECT GROUP SEQUENCE RANGE FOR " : "inspect group sequence range for ");
+    public boolean visit(DrdsInspectSeqRangeStatement x) {
+        print0(ucase ? "INSPECT SEQUENCE RANGE FOR " : "inspect sequence range for ");
         x.getName().accept(this);
         return false;
     }
 
     @Override
-    public void endVisit(DrdsInspectGroupSeqRangeStatement x) {
+    public void endVisit(DrdsInspectSeqRangeStatement x) {
 
     }
 
@@ -7412,10 +8145,10 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     public boolean visit(DrdsConvertAllSequencesStatement x) {
         print0(ucase ? "CONVERT ALL SEQUENCES FROM " : "convert all sequences from ");
         x.getFromType().accept(this);
-        print0(ucase ? "TO" : "to");
+        print0(ucase ? " TO " : " to ");
         x.getToType().accept(this);
         if (!x.isAllSchemata()) {
-            print0(ucase ? "FOR" : "for");
+            print0(ucase ? " FOR " : " for ");
             x.getSchemaName().accept(this);
         }
         return false;
@@ -7438,6 +8171,39 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
+    public void endVisit(DrdsShowTransStatsStatement x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsShowTransStatsStatement x) {
+        print0(ucase ? "SHOW TRANS STATS" : "show trans stats");
+        return false;
+    }
+
+    @Override
+    public boolean visit(DrdsShowChangeSet x) {
+        print0(ucase ? "SHOW CHANGESET" : "show changeset");
+        return false;
+    }
+
+    @Override
+    public boolean visit(DrdsShowTableReplicate x) {
+        print0(ucase ? "SHOW TABLE REPLICATE" : "show table replicate");
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsShowChangeSet x) {
+
+    }
+
+    @Override
+    public void endVisit(DrdsShowTableReplicate x) {
+
+    }
+
+    @Override
     public void endVisit(DrdsPurgeTransStatement x) {
 
     }
@@ -7450,6 +8216,17 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public void endVisit(DrdsShowLocality x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsShowPhysicalDdl x) {
+        print0("SHOW PHYSICAL DDL");
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsShowPhysicalDdl x) {
 
     }
 
@@ -7470,6 +8247,10 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         if (x.isCleanUpCommand()) {
             print0(ucase ? " CLEAN" : " clean");
         }
+        if (x.getHeadHintsDirect() != null && x.getHeadHintsDirect().size() > 0) {
+            print(' ');
+            printAndAccept(x.getHeadHintsDirect(), " ");
+        }
         boolean firstKey = true;
         for (Map.Entry<String, List<String>> entry : x.getStorageGroups().entrySet()) {
             boolean firstGroup = true;
@@ -7488,12 +8269,16 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
                 } else {
                     print0(", ");
                 }
+                print("'");
                 print(ucase ? id.toUpperCase() : id.toLowerCase());
+                print("'");
             }
             if (!x.isCleanUpCommand()) {
                 print0(")");
                 print0(ucase ? " TO " : " to ");
+                print0("'");
                 print0(ucase ? entry.getKey().toUpperCase() : entry.getKey().toLowerCase());
+                print0("'");
             } else {
                 break;
             }
@@ -7593,6 +8378,17 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
+    public void endVisit(DrdsShowCreateTableGroup x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsShowCreateTableGroup x) {
+        print0(ucase ? "SHOW CREATE TABLEGROUP" : "show create tablegroup");
+        return false;
+    }
+
+    @Override
     public void endVisit(DrdsAlterTablePartition x) {
 
     }
@@ -7660,27 +8456,60 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(DrdsSplitPartition x) {
-        print0(ucase ? "SPLIT PARTITION " : "split partition ");
+        if (x.isSubPartitionsSplit()) {
+            print0(ucase ? "SPLIT SUBPARTITION " : "split subpartition ");
+        } else {
+            print0(ucase ? "SPLIT PARTITION " : "split partition ");
+        }
         x.getSplitPartitionName().accept(this);
         print0(" ");
         if (x.getAtValue() != null) {
             print0(ucase ? "AT(" : "at(");
             x.getAtValue().accept(this);
             print0(") ");
-        }
-        int i = 0;
-        for (SQLObject object : x.getPartitions()) {
-            if (i > 0) {
-                print0(", ");
-            } else {
-                print0(ucase ? "INTO (" : ") into (");
+            int i = 0;
+            for (SQLObject object : x.getPartitions()) {
+                if (i > 0) {
+                    print0(", ");
+                } else {
+                    print0(ucase ? "INTO (" : ") into (");
 
+                }
+                object.accept(this);
+                i++;
             }
-            object.accept(this);
-            i++;
-        }
-        if (i > 0) {
-            print0(")");
+            if (i > 0) {
+                print0(")");
+            }
+        } else {
+            if (x.getNewPartitionNum() != null) {
+                print0(ucase ? "INTO " : "into ");
+                if (x.getNewPartitionNamePrefix() != null) {
+                    x.getNewPartitionNamePrefix().accept(this);
+                    print0(" ");
+                }
+                if (x.isSubPartitionsSplit()) {
+                    print0(ucase ? "SUBPARTITIONS " : "subpartitions ");
+                } else {
+                    print0(ucase ? "PARTITIONS " : "partitions ");
+                }
+                x.getNewPartitionNum().accept(this);
+            } else {
+                int i = 0;
+                for (SQLObject object : x.getPartitions()) {
+                    if (i > 0) {
+                        print0(", ");
+                    } else {
+                        print0(ucase ? "INTO (" : ") into (");
+
+                    }
+                    object.accept(this);
+                    i++;
+                }
+                if (i > 0) {
+                    print0(")");
+                }
+            }
         }
         return false;
     }
@@ -7733,7 +8562,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(DrdsMergePartition x) {
-        print0(ucase ? "MERGE PARTITIONS " : "merge partitions ");
+        if (!x.isSubPartitionsMerge()) {
+            print0(ucase ? "MERGE PARTITIONS " : "merge partitions ");
+        } else {
+            print0(ucase ? "MERGE SUBPARTITIONS " : "merge subpartitions ");
+        }
         int i = 0;
         for (SQLName partition : x.getPartitions()) {
             if (i > 0) {
@@ -7754,7 +8587,8 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(DrdsMovePartition x) {
-        print0(ucase ? "MOVE PARTITIONS " : "move partitions ");
+        final String clause = "MOVE " + (x.isSubPartitionsMoved() ? "SUBPARTITIONS " : "PARTITIONS ");
+        print0(ucase ? clause : clause.toLowerCase());
         int instCount = 0;
         for (Map.Entry<SQLName, List<SQLName>> entry : x.getInstPartitions().entrySet()) {
             int i = 0;
@@ -7763,6 +8597,8 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             }
             SQLName instId = entry.getKey();
             List<SQLName> partitions = entry.getValue();
+
+            print0("(");
             for (SQLName partition : partitions) {
                 if (i > 0) {
                     print0(", ");
@@ -7770,6 +8606,8 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
                 partition.accept(this);
                 i++;
             }
+            print0(")");
+
             print0(ucase ? " TO " : " to ");
             instId.accept(this);
             instCount++;
@@ -7809,12 +8647,21 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public boolean visit(DrdsSplitHotKey x) {
+        if (x.isSubPartitionsSplit() && x.getModifyPartitionName() != null) {
+            print0(ucase ? "MODIFY PARTITION " : "modify partition ");
+            x.getModifyPartitionName().accept(this);
+            print0(" ");
+        }
         print0(ucase ? "SPLIT INTO " : "split into ");
         if (x.getHotKeyPartitionName() != null) {
             x.getHotKeyPartitionName().accept(this);
             print0(" ");
         }
-        print0(ucase ? "PARTITIONS " : " partitions ");
+        if (x.isSubPartitionsSplit()) {
+            print0(ucase ? "SUBPARTITIONS " : "subpartitions ");
+        } else {
+            print0(ucase ? "PARTITIONS " : "partitions ");
+        }
         x.getPartitions().accept(this);
         print0(ucase ? " BY HOT VALUE(" : " by hot value(");
         int i = 0;
@@ -7835,42 +8682,13 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
-    public boolean visit(DrdsAlterTableGroupReorgPartition x) {
-        print0(ucase ? "REORGANIZE PARTITION " : "reorganize partition ");
-        int i = 0;
-        for (SQLName partition : x.getOldPartitions()) {
-            if (i > 0) {
-                print0(", ");
-            }
-            partition.accept(this);
-            i++;
-        }
-        i = 0;
-        for (SQLObject object : x.getNewPartitions()) {
-            if (i > 0) {
-                print0(", ");
-            } else {
-                print0(ucase ? " INTO (" : " into (");
-
-            }
-            object.accept(this);
-            i++;
-        }
-        if (i > 0) {
-            print0(")");
-        }
-        return false;
-    }
-
-    @Override
-    public void endVisit(DrdsAlterTableGroupReorgPartition x) {
-
-    }
-
-    @Override
     public boolean visit(DrdsRenamePartition x) {
         boolean firstPart = true;
-        print0(ucase ? "RENAME PARTITION " : "rename partition ");
+        if (x.isSubPartitionsRename()) {
+            print0(ucase ? "RENAME SUBPARTITION " : "rename subpartition ");
+        } else {
+            print0(ucase ? "RENAME PARTITION " : "rename partition ");
+        }
         for (Pair<SQLName, SQLName> pair : x.getChangePartitionsPair()) {
             if (!firstPart) {
                 print0(", ");
@@ -7913,6 +8731,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     @Override
     public boolean visit(DrdsAlterTableSingle x) {
         print0(ucase ? "SINGLE" : "single");
+        if (x.getLocality() != null) {
+            println();
+            String localityString = "LOCALITY = " + x.getLocality().toString();
+            print0(ucase ? localityString.toUpperCase() : localityString.toLowerCase());
+        }
         return false;
     }
 
@@ -7928,6 +8751,50 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     @Override
+    public void endVisit(DrdsAlterTableAsOfTimeStamp x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsAlterTableAsOfTimeStamp x) {
+        print0(ucase ? "AS OF TIMESTAMP " : "as of timestamp ");
+        x.getExpr().accept(this);
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsAlterFileStorageStatement x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsAlterTablePurgeBeforeTimeStamp x) {
+        print0(ucase ? "PURGE BEFORE TIMESTAMP " : "purge before timestamp ");
+        x.getExpr().accept(this);
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsAlterTablePurgeBeforeTimeStamp x) {
+
+    }
+
+    @Override
+    public boolean visit(DrdsAlterFileStorageStatement x) {
+        print0(ucase ? "ATLER FILESTORAGE " : "alter filestorage ");
+        x.getName().accept(this);
+
+        if (x.isAsOf()) {
+            print0(ucase ? "AS OF TIMESTAMP " : "as of timestamp ");
+            x.getTimestamp().accept(this);
+        } else if (x.isPurgeBefore()) {
+            print0(ucase ? "PURGE BEFORE TIMESTAMP " : "purge before timestamp ");
+            x.getTimestamp().accept(this);
+        }
+        return false;
+    }
+
+    @Override
     public boolean visit(MySqlChangeMasterStatement x) {
         print0(ucase ? "CHANGE MASTER TO " : "change master to ");
         printAndAccept(x.getOptions(), ", ");
@@ -7935,6 +8802,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print(' ');
             print0(ucase ? "FOR CHANNEL " : "for channel ");
             x.getChannel().accept(this);
+        }
+        if (x.getSubChannel() != null) {
+            print(' ');
+            print0(ucase ? "FOR SUB_CHANNEL " : "for sub_channel ");
+            x.getSubChannel().accept(this);
         }
         return false;
     }
@@ -7948,6 +8820,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(ucase ? "FOR CHANNEL " : "for channel ");
             x.getChannel().accept(this);
         }
+        if (x.getSubChannel() != null) {
+            print(' ');
+            print0(ucase ? "FOR SUB_CHANNEL " : "for sub_channel ");
+            x.getSubChannel().accept(this);
+        }
         return false;
     }
 
@@ -7959,6 +8836,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print0(ucase ? "FOR CHANNEL " : "for channel ");
             x.getChannel().accept(this);
         }
+        if (x.getSubChannel() != null) {
+            print(' ');
+            print0(ucase ? "FOR SUB_CHANNEL " : "for sub_channel ");
+            x.getSubChannel().accept(this);
+        }
         return false;
     }
 
@@ -7969,6 +8851,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print(' ');
             print0(ucase ? "FOR CHANNEL " : "for channel ");
             x.getChannel().accept(this);
+        }
+        if (x.getSubChannel() != null) {
+            print(' ');
+            print0(ucase ? "FOR SUB_CHANNEL " : "for sub_channel ");
+            x.getSubChannel().accept(this);
         }
         return false;
     }
@@ -7984,6 +8871,11 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
             print(' ');
             print0(ucase ? "FOR CHANNEL " : "for channel ");
             x.getChannel().accept(this);
+        }
+        if (x.getSubChannel() != null) {
+            print(' ');
+            print0(ucase ? "FOR SUB_CHANNEL " : "for sub_channel ");
+            x.getSubChannel().accept(this);
         }
         return false;
     }
@@ -8020,7 +8912,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     public boolean visit(SQLDropJoinGroupStatement x) {
         print0(ucase ? "DROP JOINGROUP " : "drop joingroup ");
         if (x.isIfExists()) {
-            print0(ucase ? "IF NOT EXISTS " : "if not exists ");
+            print0(ucase ? "IF EXISTS " : "if exists ");
         }
         x.getName().accept(this);
 
@@ -8048,7 +8940,7 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     public boolean visit(SQLMergeTableGroupStatement x) {
-        print0(ucase ? "MERGE TABLEROUPS " : "merge tablegroups ");
+        print0(ucase ? "MERGE TABLEGROUPS " : "merge tablegroups ");
 
         int i = 0;
         for (SQLName tableName : x.getSourceTableGroup()) {
@@ -8067,81 +8959,22 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
         return false;
     }
 
-    @Override
-    public void endVisit(DrdsUnArchiveStatement x) {
-    }
+    public boolean visit(SQLImportDatabaseStatement x) {
+        print0(ucase ? "IMPORT DATABASE " : "import database ");
 
-    @Override
-    public boolean visit(DrdsUnArchiveStatement x) {
-        print0(ucase ? "UNARCHIVE " : "unarchive ");
-        switch (x.getTarget()) {
-        case TABLE:
-            print0(ucase ? "TABLE " : "table ");
-            x.getTableSource().accept(this);
-            break;
-        case TABLE_GROUP:
-            print0(ucase ? "TABLEGROUP " : "tablegroup ");
-            x.getTableGroup().accept(this);
-            break;
-        case DATABASE:
-            print0(ucase ? "DATABASE " : "database ");
-            x.getDatabase().accept(this);
-            break;
-        default:
-            throw new IllegalArgumentException("syntax error, expect TABLE/TABLE_GROUP/DATABASE");
-        }
+        x.getSrcPhyDb().accept(this);
+        print0(ucase ? " AS " : " as ");
+        x.getDstLogicalDb().accept(this);
+        print0(ucase ? " LOCALITY=" : " locality=");
+        x.getLocality().accept(this);
         return false;
     }
 
-    @Override
-    public boolean visit(MySqlShowFilesStatement x) {
-        print0(ucase ? "SHOW " : "show ");
-        print0(ucase ? "FILES FROM " : "files from ");
-        print0(x.getName().getSimpleName());
-        return false;
-    }
+    public boolean visit(SQLImportSequenceStatement x) {
+        print0(ucase ? "IMPORT SEQUENCE FROM " : "import sequence from ");
 
-    @Override
-    public void endVisit(MySqlShowFilesStatement x) {
-    }
+        x.getLogicalDatabase().accept(this);
 
-    @Override
-    public void endVisit(DrdsAlterTableAsOfTimeStamp x) {
-    }
-
-    @Override
-    public boolean visit(DrdsAlterTableAsOfTimeStamp x) {
-        print0(ucase ? "AS OF TIMESTAMP " : "as of timestamp ");
-        x.getExpr().accept(this);
-        return false;
-    }
-
-    @Override
-    public void endVisit(DrdsAlterFileStorageStatement x) {
-    }
-
-    @Override
-    public boolean visit(DrdsAlterTablePurgeBeforeTimeStamp x) {
-        print0(ucase ? "PURGE BEFORE TIMESTAMP " : "purge before timestamp ");
-        x.getExpr().accept(this);
-        return false;
-    }
-
-    @Override
-    public void endVisit(DrdsAlterTablePurgeBeforeTimeStamp x) {
-    }
-
-    @Override
-    public boolean visit(DrdsAlterFileStorageStatement x) {
-        print0(ucase ? "ATLER FILESTORAGE " : "alter filestorage ");
-        x.getName().accept(this);
-        if (x.isAsOf()) {
-            print0(ucase ? "AS OF TIMESTAMP " : "as of timestamp ");
-            x.getTimestamp().accept(this);
-        } else if (x.isPurgeBefore()) {
-            print0(ucase ? "PURGE BEFORE TIMESTAMP " : "purge before timestamp ");
-            x.getTimestamp().accept(this);
-        }
         return false;
     }
 
@@ -8152,6 +8985,25 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     }
 
     public void endVisit(MySqlAlterInstanceStatement x) {
+
+    }
+
+    @Override
+    public boolean visit(MySQLInstanceReadonlyItem x) {
+        print0(ucase ? "SET " : "set ");
+        printAndAccept(x.getOptions(), ", ");
+
+//        SQLName on = x.getOn();
+//        if (on != null) {
+//            print0(ucase ? " ON " : " on ");
+//            on.accept(this);
+//        }
+
+        return false;
+    }
+
+    @Override
+    public void endVisit(MySQLInstanceReadonlyItem x) {
 
     }
 
@@ -8173,6 +9025,17 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
 
     @Override
     public void endVisit(DrdsDropFileStorageStatement x) {
+    }
+
+    @Override
+    public boolean visit(DrdsClearFileStorageStatement x) {
+        print0(ucase ? "CLEAR FILESTORAGE " : "clear filestorage ");
+        x.getName().accept(this);
+        return false;
+    }
+
+    @Override
+    public void endVisit(DrdsClearFileStorageStatement x) {
     }
 
     @Override
@@ -8203,4 +9066,18 @@ public class MySqlOutputVisitor extends SQLASTOutputVisitor implements MySqlASTV
     @Override
     public void endVisit(DrdsAlignToTableGroup x) {
     }
+
+    @Override
+    public boolean visit(MySqlFlushLogsStatement x) {
+        print0(ucase ? "FLUSH LOGS" : "flush logs");
+        if (x.getWith() != null) {
+            print0(ucase ? " WITH " + x.getWith().toString() : " with " + x.getWith().toString());
+        }
+        return false;
+    }
+
+    @Override
+    public void endVisit(MySqlFlushLogsStatement x) {
+    }
+
 } //

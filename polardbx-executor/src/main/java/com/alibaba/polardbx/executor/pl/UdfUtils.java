@@ -17,17 +17,17 @@
 package com.alibaba.polardbx.executor.pl;
 
 import com.alibaba.polardbx.druid.sql.SQLUtils;
-import com.alibaba.polardbx.druid.sql.ast.SQLDataType;
 import com.alibaba.polardbx.druid.sql.ast.SQLParameter;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLBlockStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLCreateFunctionStatement;
-import com.alibaba.polardbx.executor.pl.type.BasicTypeBuilders;
+import com.alibaba.polardbx.druid.sql.visitor.VisitorFeature;
+import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
 import com.alibaba.polardbx.optimizer.core.TddlOperatorTable;
 import com.alibaba.polardbx.optimizer.core.TddlRelDataTypeSystemImpl;
 import com.alibaba.polardbx.optimizer.parse.FastsqlUtils;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
 import org.apache.calcite.rel.type.RelDataType;
-import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.schema.Function;
 import org.apache.calcite.schema.impl.TypeKnownScalarFunction;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -58,11 +58,6 @@ public class UdfUtils {
         SqlStdOperatorTable.instance().enableTypeCoercion(udf);
     }
 
-    // TODO : check collation and other situation
-    private static RelDataType createBasicSqlType(RelDataTypeSystem typeSystem, SQLDataType dataType) {
-        return BasicTypeBuilders.getTypeBuilder(dataType.getName()).createBasicSqlType(typeSystem, dataType);
-    }
-
     public static SqlUserDefinedFunction createSqlUdf(String createFunctionStr, boolean canPush) {
         SQLCreateFunctionStatement
             statement = (SQLCreateFunctionStatement) FastsqlUtils.parseSql(createFunctionStr).get(0);
@@ -70,13 +65,14 @@ public class UdfUtils {
         // create scalar function
         List<SQLParameter> inputParams = statement.getParameters();
         List<RelDataType> inputTypes =
-            inputParams.stream().map(t -> createBasicSqlType(TddlRelDataTypeSystemImpl.getInstance(), t.getDataType()))
+            inputParams.stream()
+                .map(t -> DataTypeUtil.createBasicSqlType(TddlRelDataTypeSystemImpl.getInstance(), t.getDataType()))
                 .collect(Collectors.toList());
         List<String> inputNames =
             inputParams.stream().map(t -> t.getName().getSimpleName()).collect(Collectors.toList());
 
         RelDataType returnType =
-            createBasicSqlType(TddlRelDataTypeSystemImpl.getInstance(), statement.getReturnDataType());
+            DataTypeUtil.createBasicSqlType(TddlRelDataTypeSystemImpl.getInstance(), statement.getReturnDataType());
 
         Function function = new TypeKnownScalarFunction(returnType, inputTypes, inputNames);
 
@@ -96,5 +92,26 @@ public class UdfUtils {
         }
         // disable type coercion
         SqlStdOperatorTable.instance().disableTypeCoercion(functionName, SqlSyntax.FUNCTION);
+    }
+
+    public static String removeFuncBody(String createFunctionContent) {
+        SQLCreateFunctionStatement
+            statement = (SQLCreateFunctionStatement) FastsqlUtils.parseSql(createFunctionContent).get(0);
+        statement.setBlock(new SQLBlockStatement());
+        return statement.toString(VisitorFeature.OutputPlOnlyDefinition);
+    }
+
+    public static void validateContent(String content) {
+        String createFunction = UdfUtils.removeFuncBody(content);
+        // validate parser
+        SQLCreateFunctionStatement
+            statement = (SQLCreateFunctionStatement) FastsqlUtils.parseSql(createFunction).get(0);
+        // validate input types
+        List<SQLParameter> inputParams = statement.getParameters();
+        for (SQLParameter param : inputParams) {
+            DataTypeUtil.createBasicSqlType(TddlRelDataTypeSystemImpl.getInstance(), param.getDataType());
+        }
+        // validate return types
+        DataTypeUtil.createBasicSqlType(TddlRelDataTypeSystemImpl.getInstance(), statement.getReturnDataType());
     }
 }

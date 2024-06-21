@@ -244,9 +244,22 @@ public class MySqlTableIndex extends SQLConstraintImpl implements SQLTableElemen
         this.indexDefinition.setClustered(clustered);
     }
 
+    public boolean isColumnar() {
+        return this.indexDefinition.isColumnar();
+    }
+
+    public void setColumnar(boolean columnar) {
+        this.indexDefinition.setColumnar(columnar);
+    }
+
     @Override
     public List<SQLName> getCovering() {
         return indexDefinition.getCovering();
+    }
+
+    @Override
+    public List<SQLName> getClusteredKeys() {
+        return indexDefinition.getClusteredKeys();
     }
 
     public SQLName getIndexAnalyzerName() {
@@ -295,5 +308,21 @@ public class MySqlTableIndex extends SQLConstraintImpl implements SQLTableElemen
 
     public void setTableGroup(SQLName tableGroup) {
         this.indexDefinition.setTableGroup(tableGroup);
+    }
+
+    public boolean isWithImplicitTablegroup() {
+        return this.indexDefinition.isWithImplicitTablegroup();
+    }
+
+    public void setWithImplicitTablegroup(boolean withImplicitTablegroup) {
+        this.indexDefinition.setWithImplicitTablegroup(withImplicitTablegroup);
+    }
+
+    public boolean getVisible() {
+        return this.indexDefinition.isVisible();
+    }
+
+    public SQLName getEngineName() {
+        return indexDefinition.getEngineName();
     }
 }

@@ -16,24 +16,28 @@
 
 package com.alibaba.polardbx.server.handler;
 
-import com.alibaba.polardbx.ErrorCode;
+import com.alibaba.polardbx.PolarPrivileges;
 import com.alibaba.polardbx.atom.CacheVariables;
 import com.alibaba.polardbx.common.SQLMode;
 import com.alibaba.polardbx.common.constants.IsolationLevel;
 import com.alibaba.polardbx.common.constants.ServerVariables;
 import com.alibaba.polardbx.common.constants.TransactionAttribute;
 import com.alibaba.polardbx.common.ddl.Attribute;
+import com.alibaba.polardbx.common.encdb.EncdbException;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.jdbc.BatchInsertPolicy;
 import com.alibaba.polardbx.common.jdbc.ITransactionPolicy;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.properties.ConnectionProperties;
+import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.properties.SystemPropertiesHelper;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.encrypt.aes.BlockEncryptionMode;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.common.utils.version.InstanceVersion;
 import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.executor.balancer.BalanceOptions;
@@ -41,12 +45,16 @@ import com.alibaba.polardbx.executor.balancer.Balancer;
 import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.executor.utils.ExecUtils;
 import com.alibaba.polardbx.executor.utils.failpoint.FailPoint;
+import com.alibaba.polardbx.gms.config.impl.InstConfUtil;
 import com.alibaba.polardbx.gms.config.impl.MetaDbInstConfigManager;
 import com.alibaba.polardbx.gms.ha.impl.StorageHaManager;
 import com.alibaba.polardbx.gms.ha.impl.StorageInstHaContext;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
+import com.alibaba.polardbx.gms.metadb.cdc.CdcConfigAccessor;
 import com.alibaba.polardbx.gms.metadb.table.TableInfoManager;
+import com.alibaba.polardbx.gms.privilege.AccountType;
 import com.alibaba.polardbx.gms.privilege.ActiveRoles;
+import com.alibaba.polardbx.gms.privilege.PolarAccount;
 import com.alibaba.polardbx.gms.privilege.PolarAccountInfo;
 import com.alibaba.polardbx.gms.privilege.PolarPrivManager;
 import com.alibaba.polardbx.gms.topology.DbTopologyManager;
@@ -54,13 +62,17 @@ import com.alibaba.polardbx.gms.topology.InstConfigAccessor;
 import com.alibaba.polardbx.gms.topology.ServerInstIdManager;
 import com.alibaba.polardbx.gms.topology.VariableConfigAccessor;
 import com.alibaba.polardbx.gms.util.InstIdUtil;
+import com.alibaba.polardbx.matrix.jdbc.TConnection;
 import com.alibaba.polardbx.net.compress.PacketOutputProxyFactory;
 import com.alibaba.polardbx.net.packet.MySQLPacket;
 import com.alibaba.polardbx.net.packet.OkPacket;
+import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
+import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.parse.FastsqlParser;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.server.QueryResultHandler;
 import com.alibaba.polardbx.server.ServerConnection;
+import com.alibaba.polardbx.server.exception.UnknownCharsetException;
 import com.alibaba.polardbx.server.util.IsolationUtil;
 import com.alibaba.polardbx.transaction.utils.ParamValidationUtils;
 import org.apache.calcite.sql.SqlBasicCall;
@@ -83,6 +95,7 @@ import org.apache.calcite.sql.VariableScope;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.Pair;
+import org.apache.commons.lang.BooleanUtils;
 import org.apache.commons.lang.StringUtils;
 
 import java.sql.Connection;
@@ -99,6 +112,7 @@ import java.util.Properties;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
+import static com.alibaba.polardbx.common.exception.code.ErrorCode.ERR_CHECK_PRIVILEGE_FAILED;
 import static com.alibaba.polardbx.executor.utils.failpoint.FailPoint.FP_CLEAR;
 import static com.alibaba.polardbx.executor.utils.failpoint.FailPoint.FP_SHOW;
 import static com.alibaba.polardbx.executor.utils.failpoint.FailPoint.SET_PREFIX;
@@ -110,23 +124,29 @@ import static com.alibaba.polardbx.executor.utils.failpoint.FailPoint.SET_PREFIX
  */
 public final class SetHandler {
 
+    private static final Logger logger = LoggerFactory.getLogger(SetHandler.class);
     static FastsqlParser fastsqlParser = new FastsqlParser();
-
     static Object IGNORE_VALUE = new Object();
     static Object RETURN_VALUE = new Object();
 
-    private static final Logger logger = LoggerFactory.getLogger(SetHandler.class);
+    private static final String cdcVariablePrefix = "cdc_";
 
-    public static void handleV2(ByteString stmt, ServerConnection c, int offset, boolean hasMore) {
-        handleV2(stmt, c, offset, hasMore, false);
+    /**
+     * @return true:no error packet
+     */
+    public static boolean handleV2(ByteString stmt, ServerConnection c, int offset, boolean hasMore) {
+        return handleV2(stmt, c, offset, hasMore, false);
     }
 
-    public static void handleV2(ByteString stmt, ServerConnection c, int offset, boolean hasMore,
-                                boolean inProcedureCall) {
+    /**
+     * @return true:no error packet
+     */
+    public static boolean handleV2(ByteString stmt, ServerConnection c, int offset, boolean hasMore,
+                                   boolean inProcedureCall) {
         SqlNodeList results = fastsqlParser.parse(stmt);
         boolean ret = c.initOptimizerContext();
         if (!ret) {
-            return;
+            return true;
         }
         assert results.size() == 1;
         SqlNode result = results.get(0);
@@ -136,21 +156,8 @@ public final class SetHandler {
             // 不在server层处理，需要继续下推的set设置
             List<Pair<SqlNode, SqlNode>> globalDNVariables = new ArrayList<>();
             List<Pair<String, String>> globalCnVariables = new ArrayList<>();
-            for (Pair<SqlNode, SqlNode> variable : statement.getVariableAssignmentList()) {
-                // In cursor mode, only the following requests can be handled:
-                // COM_STMT_FETCH, COM_STMT_CLOSE, begin/commit/set autocommit
-                if (c.isCursorFetchMode()) {
-                    final SqlNode key = variable.getKey();
-                    if (!(key instanceof SqlSystemVar) || !"AUTOCOMMIT".equalsIgnoreCase(
-                        ((SqlSystemVar) key).getName())) {
-                        if (inProcedureCall) {
-                            throw new RuntimeException("Not allow to execute commands except for set autocommit");
-                        }
-                        c.writeErrMessage(ErrorCode.ER_NOT_ALLOWED_COMMAND,
-                            "Not allow to execute commands except for set autocommit");
-                        return;
-                    }
-                }
+            List<Pair<String, String>> globalCdcVariables = new ArrayList<>();
+            for (org.apache.calcite.util.Pair<SqlNode, SqlNode> variable : statement.getVariableAssignmentList()) {
                 final SqlNode oriValue = variable.getValue();
                 if (variable.getKey() instanceof SqlUserDefVar) {
                     final SqlUserDefVar key = (SqlUserDefVar) variable.getKey();
@@ -159,8 +166,7 @@ public final class SetHandler {
                         String value = RelUtils.stringValue(oriValue);
                         c.getUserDefVariables().put(lowerCaseKey, value);
                         //FailPoint command, only works in java -ea mode
-                        if (FailPoint.isAssertEnable()
-                            && StringUtils.startsWith(lowerCaseKey, SET_PREFIX)
+                        if (FailPoint.isAssertEnable() && StringUtils.startsWith(lowerCaseKey, SET_PREFIX)
                             && StringUtils.length(lowerCaseKey) >= 3) {
                             FailPoint.enable(lowerCaseKey, value);
                             c.getUserDefVariables().put(FP_SHOW, FailPoint.show());
@@ -171,18 +177,16 @@ public final class SetHandler {
                         && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.BOOLEAN) {
                         c.getUserDefVariables().put(lowerCaseKey, RelUtils.booleanValue(oriValue));
                         //FailPoint command, only works in java -ea mode
-                        if (FailPoint.isAssertEnable()
-                            && StringUtils.equalsIgnoreCase(lowerCaseKey, FP_CLEAR)) {
+                        if (FailPoint.isAssertEnable() && StringUtils.equalsIgnoreCase(lowerCaseKey, FP_CLEAR)) {
                             FailPoint.clear();
                             c.getUserDefVariables().put(FP_SHOW, FailPoint.show());
                         }
                     } else if (oriValue instanceof SqlLiteral
-                        && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.NULL
-                        && oriValue.toString().equalsIgnoreCase("NULL")) {
+                        && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.NULL && oriValue.toString()
+                        .equalsIgnoreCase("NULL")) {
                         c.getUserDefVariables().remove(lowerCaseKey);
                         //FailPoint command, only works in java -ea mode
-                        if (FailPoint.isAssertEnable()
-                            && StringUtils.startsWith(lowerCaseKey, SET_PREFIX)) {
+                        if (FailPoint.isAssertEnable() && StringUtils.startsWith(lowerCaseKey, SET_PREFIX)) {
                             FailPoint.disable(lowerCaseKey);
                             c.getUserDefVariables().put(FP_SHOW, FailPoint.show());
                         }
@@ -195,7 +199,7 @@ public final class SetHandler {
                         if (checkResultSuccess(c, resultSet, inProcedureCall, true)) {
                             c.getUserDefVariables().put(lowerCaseKey, resultSet.value);
                         } else {
-                            return;
+                            return true;
                         }
                     } else if (oriValue instanceof SqlSystemVar) {
                         final SqlSystemVar var = (SqlSystemVar) oriValue;
@@ -203,9 +207,9 @@ public final class SetHandler {
                             if (inProcedureCall) {
                                 throw new RuntimeException("Unknown system variable '" + var.getName() + "'");
                             }
-                            c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE, "Unknown system variable '"
-                                + var.getName() + "'");
-                            return;
+                            c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE,
+                                "Unknown system variable '" + var.getName() + "'");
+                            return false;
                         }
                         Object sysVarValue = c.getSysVarValue(var);
                         c.getUserDefVariables().put(lowerCaseKey, sysVarValue);
@@ -215,18 +219,11 @@ public final class SetHandler {
                         if (checkResultSuccess(c, resultSet, inProcedureCall, true)) {
                             c.getUserDefVariables().put(lowerCaseKey, resultSet.value);
                         } else {
-                            return;
+                            return true;
                         }
                     } else {
-                        if (inProcedureCall) {
-                            throw new RuntimeException("Variable " + key.getName()
-                                + " can't be set to the value of "
-                                + RelUtils.stringValue(oriValue));
-                        }
-                        c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR, "Variable " + key.getName()
-                            + " can't be set to the value of "
-                            + RelUtils.stringValue(oriValue));
-                        return;
+                        occurError(inProcedureCall, key.getName(), oriValue, c);
+                        return false;
                     }
                 } else if (variable.getKey() instanceof SqlSystemVar) {
                     final SqlSystemVar key = (SqlSystemVar) variable.getKey();
@@ -253,21 +250,15 @@ public final class SetHandler {
 
                     if ("NAMES".equalsIgnoreCase(key.getName())) {
                         String charset = c.getVarStringValue(oriValue);
-                        if (!setCharset(charset, c)) {
-                            return;
+                        if (!setCharsets(charset, c)) {
+                            return false;
                         }
                         c.getExtraServerVariables().put(key.getName().toLowerCase(), charset);
                     } else if ("SOCKETTIMEOUT".equalsIgnoreCase(key.getName())) {
-                        if (!(oriValue instanceof SqlNumericLiteral) &&
-                            !(oriValue instanceof SqlUserDefVar) && !(oriValue instanceof SqlSystemVar)) {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable 'socketTimeout' can't be set to the value of "
-                                    + RelUtils.stringValue(oriValue));
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable 'socketTimeout' can't be set to the value of "
-                                    + RelUtils.stringValue(oriValue));
-                            return;
+                        if (!(oriValue instanceof SqlNumericLiteral) && !(oriValue instanceof SqlUserDefVar)
+                            && !(oriValue instanceof SqlSystemVar)) {
+                            occurError(inProcedureCall, key.getName(), oriValue, c);
+                            return false;
                         }
                         int milliseconds = c.getVarIntegerValue(oriValue);
                         c.setSocketTimeout(milliseconds);
@@ -285,14 +276,8 @@ public final class SetHandler {
                         } else if (oriValue instanceof SqlSystemVar || oriValue instanceof SqlUserDefVar) {
                             Boolean b = c.getVarBooleanValue(oriValue);
                             if (b == null) {
-                                if (inProcedureCall) {
-                                    throw new RuntimeException("Variable 'autocommit' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                }
-                                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                    "Variable 'autocommit' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                return;
+                                occurError(inProcedureCall, "autocommit", oriValue, c);
+                                return false;
                             }
                             autocommit = b;
                         } else if ("ON".equalsIgnoreCase(stipVal)) {
@@ -300,14 +285,8 @@ public final class SetHandler {
                         } else if ("OFF".equalsIgnoreCase(stipVal)) {
                             autocommit = false;
                         } else {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable 'autocommit' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable 'autocommit' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                            return;
+                            occurError(inProcedureCall, "autocommit", oriValue, c);
+                            return false;
                         }
 
                         if (autocommit) {
@@ -337,16 +316,8 @@ public final class SetHandler {
                         } else if ("DEFAULT".equalsIgnoreCase(stipVal)) {
                             asyncDDLPureMode = false;
                         } else {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable '" + ConnectionProperties.PURE_ASYNC_DDL_MODE
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable '" + ConnectionProperties.PURE_ASYNC_DDL_MODE
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                            return;
+                            occurError(inProcedureCall, ConnectionProperties.PURE_ASYNC_DDL_MODE, oriValue, c);
+                            return false;
                         }
                         //c.setAsyncDDLPureModeSession(asyncDDLPureMode);
                         c.getExtraServerVariables().put(key.getName().toLowerCase(), asyncDDLPureMode);
@@ -367,16 +338,10 @@ public final class SetHandler {
                     } else if ("PARTITION_HINT".equalsIgnoreCase(key.getName())) {
                         c.setPartitionHint(RelUtils.stringValue(oriValue));
                     } else if ("TRANSACTION POLICY".equalsIgnoreCase(key.getName())) {
-                        if (!(oriValue instanceof SqlNumericLiteral) &&
-                            !(oriValue instanceof SqlUserDefVar) && !(oriValue instanceof SqlSystemVar)) {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable 'transaction policy' can't be set to the value of "
-                                    + RelUtils.stringValue(oriValue));
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable 'transaction policy' can't be set to the value of "
-                                    + RelUtils.stringValue(oriValue));
-                            return;
+                        if (!(oriValue instanceof SqlNumericLiteral) && !(oriValue instanceof SqlUserDefVar)
+                            && !(oriValue instanceof SqlSystemVar)) {
+                            occurError(inProcedureCall, "transaction policy", oriValue, c);
+                            return false;
                         }
                         int policy = c.getVarIntegerValue(oriValue);
                         String strPolicy;
@@ -386,6 +351,10 @@ public final class SetHandler {
                             strPolicy = "ALLOW_READ";
                             break;
                         case 4:
+                            if (isIgnoreSettingNoTransaction(c)) {
+                                // Ignore setting NO_TRANSACTION by "SET transaction policy 4"
+                                continue;
+                            }
                             c.setTrxPolicy(ITransactionPolicy.NO_TRANSACTION);
                             strPolicy = "NO_TRANSACTION";
                             break;
@@ -399,14 +368,8 @@ public final class SetHandler {
                             strPolicy = "TSO";
                             break;
                         default:
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable 'transaction policy' can't be set to the value of "
-                                    + RelUtils.stringValue(oriValue));
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable 'transaction policy' can't be set to the value of "
-                                    + RelUtils.stringValue(oriValue));
-                            return;
+                            occurError(inProcedureCall, "transaction policy", oriValue, c);
+                            return false;
                         }
                         c.getExtraServerVariables().put(key.getName().toLowerCase(), policy);
                         c.getExtraServerVariables().put("TRANS.POLICY".toLowerCase(), strPolicy);
@@ -424,7 +387,7 @@ public final class SetHandler {
                                 c.writeErrMessage(ErrorCode.ER_VARIABLE_IS_READONLY,
                                     "Variable '" + StringUtils.lowerCase(key.getName())
                                         + "' is read only on auto-commit mode");
-                                return;
+                                return false;
                             }
                         } else {
                             String policy = StringUtils.strip(c.getVarStringValue(oriValue), "'\"");
@@ -447,15 +410,14 @@ public final class SetHandler {
                             } else if ("TSO".equalsIgnoreCase(policy)) {
                                 c.setTrxPolicy(ITransactionPolicy.TSO);
                                 intPolicy = 8;
+                            } else if ("BEST_EFFORT".equalsIgnoreCase(policy) || "2PC".equalsIgnoreCase(policy)
+                                || "FLEXIBLE".equalsIgnoreCase(policy)) {
+                                // to keep compatible
+                                c.setTrxPolicy(ITransactionPolicy.XA);
+                                intPolicy = 6;
                             } else {
-                                if (inProcedureCall) {
-                                    throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of " + policy);
-                                }
-                                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                    "Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of " + policy);
-                                return;
+                                occurError(inProcedureCall, key.getName(), oriValue, c);
+                                return false;
                             }
                             c.getExtraServerVariables().put("TRANSACTION POLICY".toLowerCase(), intPolicy);
                             c.getExtraServerVariables().put("TRANS.POLICY".toLowerCase(), policy.toUpperCase());
@@ -473,16 +435,8 @@ public final class SetHandler {
                         } else if (oriValue instanceof SqlSystemVar || oriValue instanceof SqlUserDefVar) {
                             Boolean b = c.getVarBooleanValue(oriValue);
                             if (b == null) {
-                                if (inProcedureCall) {
-                                    throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                }
-                                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                    "Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                return;
+                                occurError(inProcedureCall, key.getName(), oriValue, c);
+                                return false;
                             }
                             shareReadView = b;
                         } else if ("ON".equalsIgnoreCase(stripVal)) {
@@ -490,27 +444,13 @@ public final class SetHandler {
                         } else if ("OFF".equalsIgnoreCase(stripVal)) {
                             shareReadView = false;
                         } else {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                            return;
+                            occurError(inProcedureCall, key.getName(), oriValue, c);
+                            return false;
                         }
                         if (c.isAutocommit()) {
                             if (!enableSetGlobal || key.getScope().equals(VariableScope.SESSION)) {
-                                if (inProcedureCall) {
-                                    throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' is read only on auto-commit mode");
-                                }
-                                c.writeErrMessage(ErrorCode.ER_VARIABLE_IS_READONLY,
-                                    "Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' is read only on auto-commit mode");
-                                return;
+                                occurError(inProcedureCall, key.getName(), oriValue, c);
+                                return false;
                             }
                         } else {
                             c.setShareReadView(shareReadView);
@@ -518,34 +458,23 @@ public final class SetHandler {
                         if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
                             globalCnVariables.add(new Pair<>(key.getName(), Boolean.toString(shareReadView)));
                         }
-                    } else if (TransactionAttribute.GROUP_PARALLELISM.equalsIgnoreCase(key.getName())
-                        && (!enableSetGlobal || key.getScope() == VariableScope.SESSION)) {
-                        if (variable.getValue() instanceof SqlNumericLiteral) {
-                            Integer val = RelUtils.integerValue((SqlLiteral) variable.getValue());
+                    } else if (TransactionAttribute.GROUP_PARALLELISM.equalsIgnoreCase(key.getName())) {
+
+                        final String value = c.getVarStringValue(oriValue);
+                        try {
+                            Integer val = Integer.parseInt(value);
                             if (val <= 0) {
-                                if (inProcedureCall) {
-                                    throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                }
-                                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                    "Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                return;
+                                occurError(inProcedureCall, key.getName(), oriValue, c);
+                                return false;
                             }
-                            c.setGroupParallelism(Long.valueOf(val));
-                        } else {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
+                            long newGrpParallelism = Long.valueOf(val);
+                            c.setGroupParallelism(newGrpParallelism);
+                            if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
+                                globalCnVariables.add(new Pair<>(key.getName(), Long.toString(newGrpParallelism)));
                             }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                            return;
+                        } catch (NumberFormatException e) {
+                            occurError(inProcedureCall, key.getName(), oriValue, c);
+                            return false;
                         }
                     } else if (TransactionAttribute.DRDS_TRANSACTION_TIMEOUT.equalsIgnoreCase(key.getName())) {
                         final String val = c.getVarStringValue(oriValue);
@@ -553,21 +482,17 @@ public final class SetHandler {
                             final long lval = Long.parseLong(val); // ms -> s
                             c.getServerVariables().put("max_trx_duration", lval < 1000 ? 1 : lval / 1000);
                         } catch (NumberFormatException e) {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of " + val);
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of " + val);
-                            return;
+                            occurError(inProcedureCall, key.getName(), oriValue, c);
+                            return false;
                         }
-                    } else if ("TX_ISOLATION".equals(key.getName().toUpperCase())) {
+                    } else if (ConnectionProperties.TX_ISOLATION.equalsIgnoreCase(key.getName()) ||
+                        ConnectionProperties.TRANSACTION_ISOLATION.equalsIgnoreCase(key.getName())
+                    ) {
                         int isolationCode;
                         IsolationLevel isolation;
                         String value;
                         if (isDefault(oriValue)) {
-                            isolationCode = ConfigDataMode.getTxIsolation();
+                            isolationCode = DynamicConfig.getInstance().getTxIsolation();
                             isolation = IsolationLevel.fromInt(isolationCode);
                             if (isolation == null) {
                                 throw new AssertionError("Invalid global tx_isolation");
@@ -583,22 +508,36 @@ public final class SetHandler {
                                 }
                                 c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
                                     "Variable 'tx_isolation' can't be set to the value of '" + value + "'");
-                                return;
+                                return false;
                             }
                             isolationCode = isolation.getCode();
                         }
                         c.setTxIsolation(isolationCode);
                         c.getExtraServerVariables().put(key.getName().toLowerCase(), value);
+                        // tx_isolation is deprecated in 8.0, use transaction_isolation instead.
+                        c.getServerVariables().put(ConnectionProperties.TRANSACTION_ISOLATION.toLowerCase(), value);
+                        if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
+                            globalCnVariables.add(
+                                new Pair<>(ConnectionProperties.TRANSACTION_ISOLATION, value));
+                            globalCnVariables.add(
+                                new Pair<>(ConnectionProperties.TX_ISOLATION, value));
+
+                            // tx_isolation is deprecated in 8.0, use transaction_isolation instead.
+                            globalDNVariables.add(new Pair<>(
+                                SqlSystemVar.create(((SqlSystemVar) variable.getKey()).getScope(),
+                                    ConnectionProperties.TRANSACTION_ISOLATION, variable.getKey().getParserPosition()),
+                                variable.getValue()));
+                        }
                     } else if ("READ".equalsIgnoreCase(key.getName())) {
-                        if (!(oriValue instanceof SqlCharStringLiteral) &&
-                            !(oriValue instanceof SqlUserDefVar) && !(oriValue instanceof SqlSystemVar)) {
+                        if (!(oriValue instanceof SqlCharStringLiteral) && !(oriValue instanceof SqlUserDefVar)
+                            && !(oriValue instanceof SqlSystemVar)) {
                             if (inProcedureCall) {
                                 throw new RuntimeException(
                                     "unexpected token for SET TRANSACTION statement " + RelUtils.stringValue(oriValue));
                             }
                             c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
                                 "unexpected token for SET TRANSACTION statement " + RelUtils.stringValue(oriValue));
-                            return;
+                            return false;
                         }
                         String readValue = TStringUtil.upperCase(c.getVarStringValue(oriValue));
                         if (TStringUtil.equalsIgnoreCase("WRITE", readValue)) {
@@ -612,74 +551,78 @@ public final class SetHandler {
                             }
                             c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
                                 "unexpected token for SET TRANSACTION statement " + RelUtils.stringValue(oriValue));
-                            return;
+                            return false;
                         }
                         c.getExtraServerVariables().put(key.getName().toLowerCase(), readValue);
-                    } else if ("CHARACTER_SET_RESULTS".equalsIgnoreCase(key.getName())
-                        || "CHARACTER_SET_CONNECTION".equalsIgnoreCase(key.getName())) {
-                        String strVal = RelUtils.stringValue(oriValue);
+                    } else if ("CHARACTER_SET_RESULTS".equalsIgnoreCase(key.getName())) {
                         String charset = null;
-                        if (oriValue instanceof SqlCharStringLiteral) {
-                            charset = RelUtils.stringValue(oriValue);
-                        } else if (oriValue instanceof SqlNumericLiteral) {
-                            charset = RelUtils.stringValue(oriValue);
-                        } else if (oriValue instanceof SqlUserDefVar || oriValue instanceof SqlSystemVar) {
-                            charset = c.getVarStringValue(oriValue);
-                        } else if ((oriValue instanceof SqlLiteral
-                            && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.NULL)
-                            || "NULL".equalsIgnoreCase(strVal)
-                            || StringUtils.isEmpty(strVal)
-                            || StringUtils.isEmpty(StringUtils.strip("'\""))) {
-                            charset = null;
-                        } else if (isDefault(oriValue)) {
-                            charset = "utf8";
-                        } else if (oriValue instanceof SqlIdentifier) {
-                            charset = oriValue.toString();
-                        } else {
+                        try {
+                            charset = parseCharsetValue(c, oriValue);
+                        } catch (UnknownCharsetException e) {
                             if (inProcedureCall) {
-                                throw new RuntimeException("Variable '" + key.getName()
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(oriValue));
+                                throw new RuntimeException(
+                                    "Variable '" + key.getName() + "' can't be set to the value of "
+                                        + RelUtils.stringValue(oriValue));
                             }
                             c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR, "Variable '" + key.getName()
                                 + "' can't be set to the value of "
                                 + RelUtils.stringValue(oriValue));
-                            return;
+
+                            return false;
                         }
 
-                        if (!setCharset(charset, c)) {
-                            return;
+                        if (!setResultCharset(charset, c)) {
+                            return false;
                         }
-                        c.getExtraServerVariables().put("CHARACTER_SET_RESULTS".toLowerCase(), charset);
-                        c.getExtraServerVariables().put("CHARACTER_SET_CONNECTION".toLowerCase(), charset);
+                    } else if ("CHARACTER_SET_CONNECTION".equalsIgnoreCase(key.getName())) {
+                        String charset = null;
+                        try {
+                            charset = parseCharsetValue(c, oriValue);
+                        } catch (UnknownCharsetException e) {
+                            if (inProcedureCall) {
+                                throw new RuntimeException(
+                                    "Variable '" + key.getName() + "' can't be set to the value of "
+                                        + RelUtils.stringValue(oriValue));
+                            }
+                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR, "Variable '" + key.getName()
+                                + "' can't be set to the value of "
+                                + RelUtils.stringValue(oriValue));
+                            return false;
+                        }
+
+                        if (!setConnectionCharset(charset, c)) {
+                            return false;
+                        }
                     } else if ("CHARACTER_SET_CLIENT".equalsIgnoreCase(key.getName())) {
 
                         /* 忽略client属性设置 */
                         // 忽略这个？
                     } else if (BatchInsertPolicy.getVariableName().equalsIgnoreCase(key.getName())) {
-                        if (!(oriValue instanceof SqlCharStringLiteral) &&
-                            !(oriValue instanceof SqlUserDefVar) && !(oriValue instanceof SqlSystemVar)) {
+                        if (!(oriValue instanceof SqlCharStringLiteral) && !(oriValue instanceof SqlUserDefVar)
+                            && !(oriValue instanceof SqlSystemVar)) {
                             if (inProcedureCall) {
-                                throw new RuntimeException("unexpected token for SET BATCH_INSERT_POLICY statement "
-                                    + RelUtils.stringValue(oriValue));
+                                throw new RuntimeException(
+                                    "unexpected token for SET BATCH_INSERT_POLICY statement " + RelUtils.stringValue(
+                                        oriValue));
                             }
                             c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "unexpected token for SET BATCH_INSERT_POLICY statement "
-                                    + RelUtils.stringValue(oriValue));
-                            return;
+                                "unexpected token for SET BATCH_INSERT_POLICY statement " + RelUtils.stringValue(
+                                    oriValue));
+                            return false;
                         }
 
                         String policyValue = TStringUtil.upperCase(c.getVarStringValue(oriValue));
                         BatchInsertPolicy policy = BatchInsertPolicy.getPolicyByName(policyValue);
                         if (policy == null) {
                             if (inProcedureCall) {
-                                throw new RuntimeException("unexpected token for SET BATCH_INSERT_POLICY statement "
-                                    + RelUtils.stringValue(oriValue));
+                                throw new RuntimeException(
+                                    "unexpected token for SET BATCH_INSERT_POLICY statement " + RelUtils.stringValue(
+                                        oriValue));
                             }
                             c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "unexpected token for SET BATCH_INSERT_POLICY statement "
-                                    + RelUtils.stringValue(oriValue));
-                            return;
+                                "unexpected token for SET BATCH_INSERT_POLICY statement " + RelUtils.stringValue(
+                                    oriValue));
+                            return false;
                         }
 
                         c.setBatchInsertPolicy(policy);
@@ -694,29 +637,39 @@ public final class SetHandler {
                         long value = RelUtils.longValue(oriValue);
                         BalanceOptions.setMaxPartitionSize(value);
                         c.getExtraServerVariables().put(key.getName().toLowerCase(), value);
-                    } else if ("group_concat_max_len".equalsIgnoreCase(key.getName())) {
-                        if (key.getScope() != null && key.getScope().name().equalsIgnoreCase("global")) {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("not support set global group_concat_max_len");
-                            }
-                            c.writeErrMessage(ErrorCode.ER_NOT_SUPPORTED_YET,
-                                "not support set global group_concat_max_len");
-                            return;
-                        }
+                    } else if (ConnectionProperties.GROUP_CONCAT_MAX_LEN.equalsIgnoreCase(key.getName())) {
                         try {
                             int v = c.getVarIntegerValue(oriValue);
                             if (v < 4) {
                                 v = 4;
                             }
                             c.getServerVariables().put("group_concat_max_len", v);
-                        } catch (Exception e) {
-                            if (inProcedureCall) {
-                                throw new RuntimeException(
-                                    "Incorrect argument type to variable 'group_concat_max_len'");
+                            c.getConnectionVariables().put(ConnectionProperties.GROUP_CONCAT_MAX_LEN, v);
+                            if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
+                                globalCnVariables.add(
+                                    new Pair(ConnectionProperties.GROUP_CONCAT_MAX_LEN, String.valueOf(v)));
+                                globalDNVariables.add(variable);
                             }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_TYPE_FOR_VAR,
-                                "Incorrect argument type to variable 'group_concat_max_len'");
-                            return;
+                        } catch (Exception e) {
+                            occurError(inProcedureCall, key.getName(), oriValue, c);
+                            return false;
+                        }
+                    } else if (ConnectionProperties.MAX_ALLOWED_PACKET.equalsIgnoreCase(key.getName())) {
+                        try {
+                            int v = c.getVarIntegerValue(oriValue);
+                            if (v <= 0) {
+                                v = 16 * 1024 * 1024;
+                            }
+                            c.getServerVariables().put("max_allowed_packet", v);
+                            c.getConnectionVariables().put(ConnectionProperties.MAX_ALLOWED_PACKET, v);
+                            if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
+                                globalCnVariables.add(
+                                    new Pair(ConnectionProperties.MAX_ALLOWED_PACKET, String.valueOf(v)));
+                                globalDNVariables.add(variable);
+                            }
+                        } catch (Exception e) {
+                            occurError(inProcedureCall, key.getName(), oriValue, c);
+                            return false;
                         }
                     } else if ("sql_mock".equalsIgnoreCase(key.getName())) {
                         String val = TStringUtil.upperCase(c.getVarStringValue(oriValue));
@@ -737,10 +690,13 @@ public final class SetHandler {
                             }
                             c.writeErrMessage(ErrorCode.ER_NOT_SUPPORTED_YET,
                                 "not support set global polardbx_server_id");
-                            return;
+                            return false;
                         }
                         try {
                             int v = c.getVarIntegerValue(oriValue);
+                            if (v <= 0) {
+                                throw new RuntimeException("polardbx_server_id can`t be less than zero.");
+                            }
                             c.getExtraServerVariables().put("polardbx_server_id", v);
                         } catch (Exception | Error e) {
                             if (inProcedureCall) {
@@ -748,14 +704,14 @@ public final class SetHandler {
                             }
                             c.writeErrMessage(ErrorCode.ER_WRONG_TYPE_FOR_VAR,
                                 "Incorrect argument type to variable 'polardbx_server_id'");
-                            return;
+                            return false;
                         }
                     } else if ("time_zone".equalsIgnoreCase(key.getName())) {
                         //在内部添加到customizeVar中
                         c.setTimeZone(c.getVarStringValue(oriValue));
                         Object parserValue = parserValue(oriValue, key, c);
                         if (parserValue == RETURN_VALUE) {
-                            return;
+                            return true;
                         } else if (parserValue != IGNORE_VALUE) {
                             c.getServerVariables().put(key.getName().toLowerCase(), parserValue);
                         }
@@ -775,16 +731,34 @@ public final class SetHandler {
                             c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
                                 "Invalid value '" + RelUtils.stringValue(variable.getValue()) + "' for variable '"
                                     + ConnectionProperties.SUPPORT_INSTANT_ADD_COLUMN + "'. Please use ON or OFF.");
-                            return;
+                            return false;
                         }
                         // global only
                         if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
                             globalCnVariables.add(new Pair<>(key.getName(), iacSupported.toString()));
                             if (TableInfoManager.isXdbInstantAddColumnSupported()) {
-                                SqlSystemVar dnKey = SqlSystemVar.create(key.getScope(),
-                                    Attribute.XDB_VARIABLE_INSTANT_ADD_COLUMN, SqlParserPos.ZERO);
+                                SqlSystemVar dnKey =
+                                    SqlSystemVar.create(key.getScope(), Attribute.XDB_VARIABLE_INSTANT_ADD_COLUMN,
+                                        SqlParserPos.ZERO);
                                 globalDNVariables.add(new Pair<>(dnKey, variable.getValue()));
                             }
+                        }
+                    } else if (ConnectionProperties.ENABLE_CHANGESET.equalsIgnoreCase(key.getName())) {
+                        Boolean enableChangeSet;
+                        String value = StringUtils.strip(RelUtils.stringValue(oriValue), "'\"");
+
+                        if ("ON".equalsIgnoreCase(value) || "TRUE".equalsIgnoreCase(value)) {
+                            enableChangeSet = Boolean.TRUE;
+                        } else if ("OFF".equalsIgnoreCase(value) || "FALSE".equalsIgnoreCase(value)) {
+                            enableChangeSet = Boolean.FALSE;
+                        } else {
+                            enableChangeSet = Boolean.FALSE;
+                        }
+
+                        if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
+                            globalCnVariables.add(
+                                new Pair<>(ConnectionProperties.CN_ENABLE_CHANGESET, enableChangeSet.toString()));
+                            globalDNVariables.add(variable);
                         }
                     } else if (
                         ConnectionProperties.ENABLE_PHYSICAL_TABLE_PARALLEL_BACKFILL.equalsIgnoreCase(key.getName())
@@ -805,64 +779,32 @@ public final class SetHandler {
                         }
                     } else if (ConnectionProperties.PHYSICAL_TABLE_BACKFILL_PARALLELISM.equalsIgnoreCase(key.getName())
                         || ConnectionProperties.SLIDE_WINDOW_SPLIT_SIZE.equalsIgnoreCase(key.getName())
-                        || ConnectionProperties.BACKFILL_PARALLELISM.equalsIgnoreCase(key.getName())) {
-                        if (variable.getValue() instanceof SqlNumericLiteral) {
-                            Integer val = RelUtils.integerValue((SqlLiteral) variable.getValue());
-                            if (val <= 0) {
-                                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                    "Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                return;
-                            }
-                            if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
-                                globalCnVariables.add(new Pair<>(key.getName(), val.toString()));
-                            }
-                        } else {
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of "
-                                    + RelUtils.stringValue(variable.getValue()));
-                        }
-                    } else if (ConnectionProperties.PHYSICAL_TABLE_START_SPLIT_SIZE.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.BACKFILL_PARALLELISM.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.CHANGE_SET_APPLY_PARALLELISM.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.PHYSICAL_TABLE_START_SPLIT_SIZE.equalsIgnoreCase(key.getName())
                         || ConnectionProperties.SLIDE_WINDOW_TIME_INTERVAL.equalsIgnoreCase(key.getName())) {
-                        if (variable.getValue() instanceof SqlNumericLiteral) {
-                            Long val = RelUtils.longValue(variable.getValue());
+                        final String value = c.getVarStringValue(oriValue);
+                        try {
+                            Integer val = Integer.parseInt(value);
                             if (val <= 0) {
                                 c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
                                     "Variable '" + StringUtils.lowerCase(key.getName())
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                return;
+                                        + "' can't be set to the value of " + RelUtils.stringValue(
+                                        variable.getValue()));
+                                return false;
                             }
                             if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
                                 globalCnVariables.add(new Pair<>(key.getName(), val.toString()));
                             }
-                        } else {
+                        } catch (NumberFormatException e) {
                             c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable '" + StringUtils.lowerCase(key.getName())
-                                    + "' can't be set to the value of "
+                                "Variable '" + StringUtils.lowerCase(key.getName()) + "' can't be set to the value of "
                                     + RelUtils.stringValue(variable.getValue()));
+                            return false;
                         }
-                    } else if (ConnectionProperties.ENABLE_STORAGE_TRIGGER.equalsIgnoreCase(key.getName())) {
-
-                        String value = StringUtils.strip(c.getVarStringValue(oriValue), "'\"");
-                        Boolean iacSupported;
-                        if ("ON".equalsIgnoreCase(value)) {
-                            iacSupported = Boolean.TRUE;
-                        } else if ("OFF".equalsIgnoreCase(value)) {
-                            iacSupported = Boolean.FALSE;
-                        } else {
-                            iacSupported = Boolean.FALSE;
-                        }
-
-                        c.getExtraServerVariables()
-                            .put(ConnectionProperties.ENABLE_RANDOM_PHY_TABLE_NAME, !iacSupported);
-
-                        c.getExtraServerVariables()
-                            .put(ConnectionProperties.ENABLE_STORAGE_TRIGGER, iacSupported);
-                    } else if (ConnectionProperties.ENABLE_NEW_SEQ_GROUPING.equalsIgnoreCase(key.getName()) ||
-                        ConnectionProperties.ENABLE_NEW_SEQ_REQUEST_MERGING.equalsIgnoreCase(key.getName())) {
+                    } else if (ConnectionProperties.ENABLE_NEW_SEQ_GROUPING.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.ENABLE_NEW_SEQ_CACHE_ON_CN.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.ENABLE_NEW_SEQ_REQUEST_MERGING.equalsIgnoreCase(key.getName())) {
                         String value = StringUtils.strip(c.getVarStringValue(oriValue), "'\"");
                         Boolean newSeqGroupingEnabled;
                         if ("TRUE".equalsIgnoreCase(value)) {
@@ -875,11 +817,12 @@ public final class SetHandler {
                         if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
                             globalCnVariables.add(new Pair<>(key.getName(), newSeqGroupingEnabled.toString()));
                         }
-                    } else if (ConnectionProperties.NEW_SEQ_CACHE_SIZE.equalsIgnoreCase(key.getName()) ||
-                        ConnectionProperties.NEW_SEQ_GROUPING_TIMEOUT.equalsIgnoreCase(key.getName()) ||
-                        ConnectionProperties.NEW_SEQ_TASK_QUEUE_NUM_PER_DB.equalsIgnoreCase(key.getName()) ||
-                        ConnectionProperties.NEW_SEQ_VALUE_HANDLER_KEEP_ALIVE_TIME.equalsIgnoreCase(key.getName()) ||
-                        ConnectionProperties.GROUP_SEQ_CHECK_INTERVAL.equalsIgnoreCase(key.getName())) {
+                    } else if (ConnectionProperties.NEW_SEQ_CACHE_SIZE.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.NEW_SEQ_CACHE_SIZE_ON_CN.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.NEW_SEQ_GROUPING_TIMEOUT.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.NEW_SEQ_TASK_QUEUE_NUM_PER_DB.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.NEW_SEQ_VALUE_HANDLER_KEEP_ALIVE_TIME.equalsIgnoreCase(key.getName())
+                        || ConnectionProperties.GROUP_SEQ_CHECK_INTERVAL.equalsIgnoreCase(key.getName())) {
                         final String value = c.getVarStringValue(oriValue);
                         try {
                             long longValue = Long.parseLong(value);
@@ -887,14 +830,9 @@ public final class SetHandler {
                                 globalCnVariables.add(new Pair<>(key.getName(), String.valueOf(longValue)));
                             }
                         } catch (NumberFormatException e) {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Variable '" + StringUtils.lowerCase(key.getName()) +
-                                    "' can't be set to the value of " + value);
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                "Variable '" + StringUtils.lowerCase(key.getName()) +
-                                    "' can't be set to the value of " + value);
-                            return;
+                            occurError(inProcedureCall, key.getName(), oriValue, c);
+
+                            return false;
                         }
                     } else if (ConnectionProperties.SQL_SELECT_LIMIT.equalsIgnoreCase(key.getName())) {
                         String value = null;
@@ -926,11 +864,47 @@ public final class SetHandler {
                             globalCnVariables.add(
                                 new Pair<>(key.getName().toUpperCase(Locale.ROOT), String.valueOf(sqlSelectLimit)));
                         }
+                    } else if (ConnectionProperties.MAX_JAVA_UDF_NUM.equalsIgnoreCase(key.getName())) {
+                        String value = null;
+                        if (isDefault(oriValue)) {
+                            value = ConnectionParams.MAX_JAVA_UDF_NUM.getDefault();
+                        } else if (oriValue instanceof SqlBasicCall) {
+                            String sql = "select " + RelUtils.toNativeSql(oriValue);
+                            UserDefVarProcessingResult resultSet = getSelectResult(c, sql);
+                            if (checkResultSuccess(c, resultSet, inProcedureCall, false)) {
+                                value = resultSet.value.toString();
+                            } else {
+                                value = ConnectionParams.MAX_JAVA_UDF_NUM.getDefault();
+                            }
+                        } else {
+                            value = c.getVarStringValue(oriValue);
+                        }
+                        long maxUdfNum = -1L;
+                        boolean parseFail = false;
+                        try {
+                            maxUdfNum = Long.parseLong(value);
+                        } catch (NumberFormatException e) {
+                            parseFail = true;
+                        }
+                        if (parseFail || maxUdfNum <= 0L) {
+                            continue;
+                        }
+                        if (enableSetGlobal && key.getScope() == VariableScope.GLOBAL) {
+                            globalCnVariables.add(
+                                new Pair<>(key.getName().toUpperCase(Locale.ROOT), String.valueOf(maxUdfNum)));
+                        } else {
+                            if (inProcedureCall) {
+                                throw new RuntimeException(
+                                    "Variable 'max_java_udf_num' should be set with global scope");
+                            }
+                            c.writeErrMessage(ErrorCode.ER_GLOBAL_VARIABLE,
+                                "Variable 'max_java_udf_num' should be set with global scope");
+                            return false;
+                        }
                     } else if ("block_encryption_mode".equalsIgnoreCase(key.getName())) {
                         BlockEncryptionMode encryptionMode;
                         boolean supportOpenSSL =
-                            ExecutorContext.getContext(c.getSchema()).getStorageInfoManager()
-                                .supportOpenSSL();
+                            ExecutorContext.getContext(c.getSchema()).getStorageInfoManager().supportOpenSSL();
 
                         if (isDefault(oriValue)) {
                             encryptionMode = BlockEncryptionMode.DEFAULT_MODE;
@@ -939,15 +913,8 @@ public final class SetHandler {
                             try {
                                 encryptionMode = new BlockEncryptionMode(modeStr, supportOpenSSL);
                             } catch (IllegalArgumentException exception) {
-                                if (inProcedureCall) {
-                                    throw new RuntimeException(
-                                        "Variable 'block_encryption_mode' can't be set to the value of '" + modeStr
-                                            + "'");
-                                }
-                                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                    "Variable 'block_encryption_mode' can't be set to the value of '" + modeStr
-                                        + "'");
-                                return;
+                                occurError(inProcedureCall, key.getName(), oriValue, c);
+                                return false;
                             }
                         }
                         c.getExtraServerVariables()
@@ -963,9 +930,8 @@ public final class SetHandler {
                         if (!StringUtils.isEmpty(val)) {
                             String[] sqlmodes = val.split(",");
                             for (String sqlmode : sqlmodes) {
-                                if ("ANSI_QUOTES".equalsIgnoreCase(sqlmode)
-                                    || (SQLMode.isCombSQLMode(sqlmode) && SQLMode.contains(sqlmode,
-                                    SQLMode.ANSI_QUOTES))) {
+                                if ("ANSI_QUOTES".equalsIgnoreCase(sqlmode) || (SQLMode.isCombSQLMode(sqlmode)
+                                    && SQLMode.contains(sqlmode, SQLMode.ANSI_QUOTES))) {
                                     enableANSIQuotes = true;
                                     break;
                                 }
@@ -976,54 +942,133 @@ public final class SetHandler {
                         c.getExtraServerVariables().put(key.getName().toLowerCase(), val);
                         Object parserValue = parserValue(oriValue, key, c);
                         if (parserValue == RETURN_VALUE) {
-                            return;
+                            return true;
                         } else if (parserValue != IGNORE_VALUE) {
                             c.getServerVariables().put(key.getName().toLowerCase(), parserValue);
                             if (enableSetGlobal && (key.getScope() == VariableScope.GLOBAL)) {
                                 globalDNVariables.add(variable);
                             }
                         }
-                    } else if (ConnectionProperties.ENABLE_AUTO_SAVEPOINT.equalsIgnoreCase(key.getName())) {
-                        boolean enableAutoSavepoint = true;
+                    } else if (ConnectionProperties.FOREIGN_KEY_CHECKS.equalsIgnoreCase(key.getName())) {
+                        Boolean foreignKeyChecks = parseBool(oriValue, c);
+                        c.getServerVariables().put(ConnectionProperties.FOREIGN_KEY_CHECKS, foreignKeyChecks);
+                        if (enableSetGlobal && (key.getScope() == VariableScope.GLOBAL)) {
+                            globalCnVariables.add(new Pair<>(key.getName(), String.valueOf(foreignKeyChecks)));
+                            globalDNVariables.add(variable);
+                        }
+                    } else if (ConnectionProperties.STATISTIC_CORRECTIONS.equalsIgnoreCase(key.getName())) {
                         String stipVal = StringUtils.strip(RelUtils.stringValue(oriValue), "'\"");
-                        if (oriValue instanceof SqlLiteral
-                            && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.BOOLEAN) {
-                            enableAutoSavepoint = RelUtils.booleanValue(variable.getValue());
-                        } else if (variable.getValue() instanceof SqlNumericLiteral) {
-                            enableAutoSavepoint = RelUtils.integerValue((SqlLiteral) variable.getValue()) != 0;
-                        } else if (oriValue instanceof SqlSystemVar || oriValue instanceof SqlUserDefVar) {
-                            Boolean b = c.getVarBooleanValue(oriValue);
-                            if (b == null) {
-                                if (inProcedureCall) {
-                                    throw new RuntimeException("Variable '" + ConnectionProperties.ENABLE_AUTO_SAVEPOINT
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                }
-                                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                                    "Variable '" + ConnectionProperties.ENABLE_AUTO_SAVEPOINT
-                                        + "' can't be set to the value of "
-                                        + RelUtils.stringValue(variable.getValue()));
-                                return;
+                        StatisticManager.getInstance().resetCorrectionMap(stipVal);
+                    } else if (ConnectionProperties.ENABLE_SET_GLOBAL_SERVER_ID.equalsIgnoreCase(key.getName())) {
+                        String value = StringUtils.lowerCase(c.getVarStringValue(oriValue));
+                        String[] trueValue = new String[] {"on", "true", "1"};
+                        boolean bValue = false;
+                        for (String v : trueValue) {
+                            if (StringUtils.equals(value, v)) {
+                                bValue = true;
+                                break;
                             }
-                            enableAutoSavepoint = b;
-                        } else if ("ON".equalsIgnoreCase(stipVal)) {
-                            enableAutoSavepoint = true;
-                        } else if ("OFF".equalsIgnoreCase(stipVal)) {
-                            enableAutoSavepoint = false;
-                        } else {
-                            if (inProcedureCall) {
-                                throw new RuntimeException("Incorrect argument type to variable "
-                                    + ConnectionProperties.ENABLE_AUTO_SAVEPOINT);
-                            }
-                            c.writeErrMessage(ErrorCode.ER_WRONG_TYPE_FOR_VAR,
-                                "Incorrect argument type to variable "
-                                    + ConnectionProperties.ENABLE_AUTO_SAVEPOINT);
-                            return;
                         }
                         c.getExtraServerVariables()
-                            .put(ConnectionProperties.ENABLE_AUTO_SAVEPOINT, enableAutoSavepoint);
+                            .put(ConnectionProperties.ENABLE_SET_GLOBAL_SERVER_ID.toLowerCase(), bValue + "");
+                        if (key.getScope() == VariableScope.GLOBAL) {
+                            globalCnVariables.add(new Pair<>(key.getName(), bValue + ""));
+                        }
+                    } else if (ConnectionProperties.SERVER_ID.equalsIgnoreCase(key.getName())) {
+                        if (!BooleanUtils.toBoolean(
+                            String.valueOf(c.getExtraServerVariables()
+                                .get(ConnectionProperties.ENABLE_SET_GLOBAL_SERVER_ID.toLowerCase())))) {
+                            c.writeErrMessage(ErrorCode.ER_NOT_SUPPORTED_YET,
+                                "Variable '" + key.getName()
+                                    + "' is not support to set");
+                            return false;
+                        }
+
+                        if (key.getScope() != org.apache.calcite.sql.VariableScope.GLOBAL) {
+                            c.writeErrMessage(ErrorCode.ER_INCORRECT_GLOBAL_LOCAL_VAR,
+                                "Variable '" + key.getName()
+                                    + "' is a GLOBAL variable and should be set with SET GLOBAL");
+                            return false;
+                        }
+
+                        try {
+                            long v = Long.parseLong(c.getVarStringValue(oriValue));
+                            c.getExtraServerVariables()
+                                .put(ConnectionProperties.SERVER_ID.toLowerCase(), Long.toString(v));
+                            globalCnVariables.add(new Pair<>(key.getName(), Long.toString(v)));
+                        } catch (Throwable t) {
+                            c.writeErrMessage(ErrorCode.ER_WRONG_TYPE_FOR_VAR,
+                                "Incorrect argument type to variable 'server_id'");
+                            return false;
+                        }
+                    } else if (ConnectionProperties.VERSION_PREFIX.equalsIgnoreCase(key.getName())) {
+                        if (!c.isGod()) {
+                            c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE, "Unsupported variable '" +
+                                key.getName() + "' for user " + c.getUser());
+                            return false;
+                        }
+                        if (key.getScope() != VariableScope.GLOBAL) {
+                            c.writeErrMessage(ErrorCode.ER_INCORRECT_GLOBAL_LOCAL_VAR,
+                                "Variable '" + key.getName()
+                                    + "' is a GLOBAL variable and should be set with SET GLOBAL");
+                            return false;
+                        }
+                        final String versionValue = c.getVarStringValue(oriValue);
+                        try {
+                            InstanceVersion.parseVersionPrefix(versionValue);
+                            // put it to global variables if the version value is valid
+                            globalCnVariables.add(new Pair<>(key.getName(), versionValue));
+                        } catch (InstanceVersion.IllegalVersionException e) {
+                            c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
+                                "Variable '" + StringUtils.lowerCase(key.getName()) + "' can't be set to the value of "
+                                    + versionValue);
+                            return false;
+                        }
+                    } else if (ConnectionProperties.TRX_LOG_METHOD.equalsIgnoreCase(key.getName())) {
+                        if (key.getScope() != org.apache.calcite.sql.VariableScope.GLOBAL) {
+                            c.writeErrMessage(ErrorCode.ER_INCORRECT_GLOBAL_LOCAL_VAR,
+                                "Variable '" + key.getName()
+                                    + "' is a GLOBAL variable and should be set with SET GLOBAL");
+                            return false;
+                        }
+                        try {
+                            int v = Integer.parseInt(c.getVarStringValue(oriValue));
+                            if (0 != v && 1 != v) {
+                                c.writeErrMessage(ErrorCode.ER_WRONG_TYPE_FOR_VAR,
+                                    "Variable '" + key.getName()
+                                        + "' can only be set to 0 or 1");
+                                return false;
+                            }
+
+                            globalCnVariables.add(new Pair<>(key.getName(), Integer.toString(v)));
+                        } catch (Throwable t) {
+                            c.writeErrMessage(ErrorCode.ER_WRONG_TYPE_FOR_VAR,
+                                "Incorrect argument type to variable '" + key.getName() + "'");
+                            return false;
+                        }
+                    } else if (ConnectionProperties.ENABLE_ENCDB.equalsIgnoreCase(key.getName())) {
+                        PolarPrivileges polarPrivileges = (PolarPrivileges) c.getPrivileges();
+                        PolarAccountInfo polarUserInfo = polarPrivileges.checkAndGetMatchUser(c.getUser(), c.getHost());
+                        if (!polarUserInfo.getAccountType().isSuperUser()
+                            && polarUserInfo.getAccountType() != AccountType.SSO) {
+                            throw new EncdbException("only DBA/DSA user can set enable_encdb");
+                        }
+                        boolean enable = Boolean.parseBoolean(parserValue(oriValue, key, c).toString());
+                        c.getConnectionVariables().put(ConnectionProperties.ENABLE_ENCDB, enable);
                         if (enableSetGlobal && (key.getScope() == VariableScope.GLOBAL)) {
-                            globalCnVariables.add(new Pair<>(key.getName(), String.valueOf(enableAutoSavepoint)));
+                            globalCnVariables.add(new Pair<String, String>(key.getName(), Boolean.toString(enable)));
+                        }
+                    } else if (ConnectionProperties.ENABLE_LBAC.equalsIgnoreCase(key.getName())) {
+                        PolarPrivileges polarPrivileges = (PolarPrivileges) c.getPrivileges();
+                        PolarAccountInfo polarUserInfo = polarPrivileges.checkAndGetMatchUser(c.getUser(), c.getHost());
+                        if (!polarUserInfo.getAccountType().isSuperUser()
+                            && polarUserInfo.getAccountType() != AccountType.SSO) {
+                            throw new EncdbException("only DBA/DSA user can set enable_lbac");
+                        }
+                        boolean enable = Boolean.parseBoolean(parserValue(oriValue, key, c).toString());
+                        c.getConnectionVariables().put(ConnectionProperties.ENABLE_LBAC, enable);
+                        if (enableSetGlobal && (key.getScope() == VariableScope.GLOBAL)) {
+                            globalCnVariables.add(new Pair<String, String>(key.getName(), Boolean.toString(enable)));
                         }
                     } else if (!isCnVariable(key.getName())) {
                         if (!ServerVariables.isWritable(key.getName())) {
@@ -1032,22 +1077,21 @@ public final class SetHandler {
                             } else {
                                 if (!ServerVariables.contains(key.getName())) {
                                     if (inProcedureCall) {
-                                        throw new RuntimeException("Unknown system variable '"
-                                            + key.getName() + "'");
+                                        throw new RuntimeException("Unknown system variable '" + key.getName() + "'");
                                     }
-                                    c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE, "Unknown system variable '"
-                                        + key.getName() + "'");
-                                    return;
+                                    c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE,
+                                        "Unknown system variable '" + key.getName() + "'");
+                                    return false;
                                 }
 
                                 if (ServerVariables.isReadonly(key.getName())) {
                                     if (inProcedureCall) {
-                                        throw new RuntimeException(
-                                            "Variable '" + key.getName() + "' is a read only variable");
+                                        throw new RuntimeException("Variable '" + key.getName()
+                                            + "' is a read only variable");
                                     }
                                     c.writeErrMessage(ErrorCode.ER_INCORRECT_GLOBAL_LOCAL_VAR,
                                         "Variable '" + key.getName() + "' is a read only variable");
-                                    return;
+                                    return false;
                                 }
                                 if (!enableSetGlobal && key.getScope() == org.apache.calcite.sql.VariableScope.GLOBAL) {
                                     if (inProcedureCall) {
@@ -1055,6 +1099,7 @@ public final class SetHandler {
                                     }
                                     c.writeErrMessage(ErrorCode.ER_INCORRECT_GLOBAL_LOCAL_VAR,
                                         "Don't support SET GLOBAL now!");
+                                    return false;
                                 } else {
                                     if (inProcedureCall) {
                                         throw new RuntimeException("Variable '" + key.getName()
@@ -1063,9 +1108,8 @@ public final class SetHandler {
                                     c.writeErrMessage(ErrorCode.ER_INCORRECT_GLOBAL_LOCAL_VAR,
                                         "Variable '" + key.getName()
                                             + "' is a GLOBAL variable and should be set with SET GLOBAL");
+                                    return false;
                                 }
-
-                                return;
                             }
                         }
                         if (ServerVariables.isBanned(key.getName())) {
@@ -1074,7 +1118,7 @@ public final class SetHandler {
                             }
                             c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE,
                                 "Not supported variable for now '" + key.getName() + "'");
-                            return;
+                            return false;
                         }
                         // ignore variables
                         if (isNeedIgnore(key.getName())) {
@@ -1082,10 +1126,17 @@ public final class SetHandler {
                         }
                         Object parserValue = parserValue(oriValue, key, c);
                         if (parserValue == RETURN_VALUE) {
-                            return;
+                            return true;
                         } else if (parserValue != IGNORE_VALUE) {
                             if (enableSetGlobal && (key.getScope() == VariableScope.GLOBAL)) {
-                                globalDNVariables.add(variable);
+                                if (ServerVariables.isCdcGlobal(key.getName())) {
+                                    globalCdcVariables.add(
+                                        new Pair<>(key.getName().substring(cdcVariablePrefix.length()),
+                                            parserValue.toString()));
+                                } else {
+                                    globalDNVariables.add(variable);
+                                }
+
                                 if (ServerVariables.isWritable(key.getName())) {
                                     //global变量，只有属于writableVariables才属于同时set session
                                     c.getServerVariables().put(key.getName().toLowerCase(), parserValue);
@@ -1097,11 +1148,10 @@ public final class SetHandler {
                     } else {
                         Object parserValue = parserValue(oriValue, key, c);
                         if (parserValue == RETURN_VALUE) {
-                            return;
+                            return true;
                         } else if (parserValue != IGNORE_VALUE && parserValue != null) {
                             String relVal = parserValue.toString();
-                            c.getConnectionVariables().put(
-                                key.getName().toUpperCase(Locale.ROOT), relVal);
+                            c.getConnectionVariables().put(key.getName().toUpperCase(Locale.ROOT), relVal);
                             if (ConnectionProperties.ENABLE_STORAGE_TRIGGER.equalsIgnoreCase(key.getName())) {
                                 boolean iacSupported = false;
                                 if (relVal.equalsIgnoreCase(Boolean.TRUE.toString())) {
@@ -1109,8 +1159,8 @@ public final class SetHandler {
                                 } else {
                                     iacSupported = false;
                                 }
-                                c.getConnectionVariables().put(
-                                    ConnectionProperties.ENABLE_RANDOM_PHY_TABLE_NAME, !iacSupported);
+                                c.getConnectionVariables()
+                                    .put(ConnectionProperties.ENABLE_RANDOM_PHY_TABLE_NAME, !iacSupported);
                             }
                             if (enableSetGlobal && (key.getScope() == VariableScope.GLOBAL)) {
                                 globalCnVariables.add(new Pair<String, String>(key.getName(), parserValue.toString()));
@@ -1120,10 +1170,11 @@ public final class SetHandler {
                 }
             }
 
-            if (!GeneralUtil.isEmpty(globalDNVariables) || !GeneralUtil.isEmpty(globalCnVariables)) {
-                boolean isOk = handleGlobalVariable(c, globalCnVariables, globalDNVariables);
+            if (!GeneralUtil.isEmpty(globalDNVariables) || !GeneralUtil.isEmpty(globalCnVariables)
+                || !GeneralUtil.isEmpty(globalCdcVariables)) {
+                boolean isOk = handleGlobalVariable(c, globalCnVariables, globalDNVariables, globalCdcVariables);
                 if (isOk) {
-                    return;
+                    return true;
                 }
             }
         } else if (result instanceof SqlSetTransaction) {
@@ -1140,7 +1191,7 @@ public final class SetHandler {
                 default:
                     c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
                         "unexpected token for SET TRANSACTION statement " + statement.getAccess());
-                    return;
+                    return false;
                 } // end of switch
             } // end of if
 
@@ -1148,7 +1199,7 @@ public final class SetHandler {
                 if (statement.isGlobal()) {
                     c.writeErrMessage(ErrorCode.ER_INCORRECT_GLOBAL_LOCAL_VAR,
                         "Global isolation level must be set on DRDS console");
-                    return;
+                    return false;
                 }
                 IsolationLevel isolation = IsolationUtil.convertCalcite(statement.getIsolationLevel());
                 if (isolation == null) {
@@ -1168,6 +1219,10 @@ public final class SetHandler {
                     c.setTrxPolicy(ITransactionPolicy.ALLOW_READ_CROSS_DB);
                     break;
                 case 4:
+                    if (isIgnoreSettingNoTransaction(c)) {
+                        // Ignore setting NO_TRANSACTION by "SET transaction policy 4"
+                        break;
+                    }
                     c.setTrxPolicy(ITransactionPolicy.NO_TRANSACTION);
                     break;
                 case 6:
@@ -1179,17 +1234,17 @@ public final class SetHandler {
                     break;
                 default:
                     c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                        "Variable 'transaction policy' can't be set to the value of "
-                            + String.valueOf(statement.getPolicy()));
-                    return;
+                        "Variable 'transaction policy' can't be set to the value of " + String.valueOf(
+                            statement.getPolicy()));
+                    return false;
                 } // end of switch
             } // end of if
         } else if (result instanceof SqlSetNames) {
             // not support collate
             final SqlNode charsetNode = ((SqlSetNames) result).getCharset();
             String charset = RelUtils.stringValue(charsetNode);
-            if (!setCharset(charset, c)) {
-                return;
+            if (!setCharsets(charset, c)) {
+                return true;
             }
         } else if (result instanceof SqlSetRole) {
             final SqlSetRole setRoleNode = (SqlSetRole) result;
@@ -1199,7 +1254,7 @@ public final class SetHandler {
                 throw new RuntimeException(stmt + " should not be set under procedure");
             }
             c.innerExecute(stmt, null, c.createResultHandler(hasMore), null);
-            return;
+            return true;
         }
 
         if (!inProcedureCall) {
@@ -1207,6 +1262,9 @@ public final class SetHandler {
             ok.packetId = c.getNewPacketId();
             ok.insertId = 0;
             ok.affectedRows = 0;
+            if (c.getTddlConnection() != null) {
+                ok.warningCount = c.getTddlConnection().getWarningCount();
+            }
 
             if (c.isAutocommit()) {
                 ok.serverStatus = MySQLPacket.SERVER_STATUS_AUTOCOMMIT;
@@ -1218,6 +1276,51 @@ public final class SetHandler {
             }
             ok.write(PacketOutputProxyFactory.getInstance().createProxy(c));
         }
+
+        return true;
+    }
+
+    private static Boolean parseBool(SqlNode oriValue, ServerConnection c) {
+        Boolean ret = null;
+        String stripVal = StringUtils.strip(RelUtils.stringValue(oriValue), "'\"");
+        if (oriValue instanceof SqlLiteral
+            && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.BOOLEAN) {
+            ret = RelUtils.booleanValue(oriValue);
+        } else if (oriValue instanceof SqlNumericLiteral) {
+            ret = RelUtils.integerValue((SqlLiteral) oriValue) != 0;
+        } else if (oriValue instanceof SqlSystemVar || oriValue instanceof SqlUserDefVar) {
+            ret = c.getVarBooleanValue(oriValue);
+        } else if ("ON".equalsIgnoreCase(stripVal)) {
+            ret = true;
+        } else if ("OFF".equalsIgnoreCase(stripVal)) {
+            ret = false;
+        }
+        return ret;
+    }
+
+    private static String parseCharsetValue(ServerConnection c, SqlNode oriValue) throws UnknownCharsetException {
+        String strVal = RelUtils.stringValue(oriValue);
+        String charset = null;
+        if (oriValue instanceof SqlCharStringLiteral) {
+            charset = RelUtils.stringValue(oriValue);
+        } else if (oriValue instanceof SqlNumericLiteral) {
+            charset = RelUtils.stringValue(oriValue);
+        } else if (oriValue instanceof SqlUserDefVar || oriValue instanceof SqlSystemVar) {
+            charset = c.getVarStringValue(oriValue);
+        } else if ((oriValue instanceof SqlLiteral
+            && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.NULL)
+            || "NULL".equalsIgnoreCase(strVal)
+            || StringUtils.isEmpty(strVal)
+            || StringUtils.isEmpty(StringUtils.strip("'\""))) {
+            charset = null;
+        } else if (isDefault(oriValue)) {
+            charset = "utf8";
+        } else if (oriValue instanceof SqlIdentifier) {
+            charset = oriValue.toString();
+        } else {
+            throw new UnknownCharsetException();
+        }
+        return charset;
     }
 
     private static boolean isNeedIgnore(String variableName) {
@@ -1231,24 +1334,8 @@ public final class SetHandler {
     }
 
     public static boolean isDefault(SqlNode oriValue) {
-        return (oriValue instanceof SqlBasicCall && oriValue.getKind() == SqlKind.DEFAULT)
-            || (oriValue instanceof SqlIdentifier && "DEFAULT".equals(oriValue.toString()));
-    }
-
-    private static class UserDefVarProcessingResult {
-
-        public boolean moreThanOneColumn;
-        public boolean moreThanOneRow;
-        public boolean otherError;
-        public Object value;
-
-        public UserDefVarProcessingResult(boolean moreThanOneColumn, boolean moreThanOneRow, boolean otherError,
-                                          Object value) {
-            this.moreThanOneColumn = moreThanOneColumn;
-            this.moreThanOneRow = moreThanOneRow;
-            this.otherError = otherError;
-            this.value = value;
-        }
+        return (oriValue instanceof SqlBasicCall && oriValue.getKind() == SqlKind.DEFAULT) || (
+            oriValue instanceof SqlIdentifier && "DEFAULT".equals(oriValue.toString()));
     }
 
     private static UserDefVarProcessingResult userDefVarProcessingFunc(ResultSet resultSet) {
@@ -1302,9 +1389,14 @@ public final class SetHandler {
     }
 
     // return value demonstrates whether write packet
-    private static boolean handleGlobalVariable(ServerConnection c,
-                                                List<Pair<String, String>> globalCNVariableList,
-                                                List<Pair<SqlNode, SqlNode>> globalDNVariableList) {
+    private static boolean handleGlobalVariable(ServerConnection c, List<Pair<String, String>> globalCNVariableList,
+                                                List<Pair<SqlNode, SqlNode>> globalDNVariableList,
+                                                List<Pair<String, String>> globalCdcVariableList) {
+
+        if (ConfigDataMode.isColumnarMode() && !globalDNVariableList.isEmpty()) {
+            c.writeErrMessage(ErrorCode.ER_NOT_SUPPORTED_YET, "SET GLOBAL is not supported in read only mode");
+            return true;
+        }
 
         List<Pair<SqlNode, SqlNode>> dnVariableAssignmentList = new ArrayList<>();
 
@@ -1337,10 +1429,8 @@ public final class SetHandler {
                 if (isCnVariable(systemVarName)) {
                     systemVarName = systemVarName.toUpperCase(Locale.ROOT);
                     cnProps.setProperty(systemVarName, systemVarValue);
-
                 } else {
-                    c.writeErrMessage(ErrorCode.ER_GLOBAL_VARIABLE,
-                        "Unsupported variable '" + systemVarName + "'");
+                    c.writeErrMessage(ErrorCode.ER_GLOBAL_VARIABLE, "Unsupported variable '" + systemVarName + "'");
                     return true;
                 }
             } catch (Throwable t) {
@@ -1373,8 +1463,7 @@ public final class SetHandler {
                     dnVariableAssignmentList.add(variable);
                     dnProps.setProperty(systemVarName, systemVarValue);
                 } else {
-                    c.writeErrMessage(ErrorCode.ER_GLOBAL_VARIABLE,
-                        "Unsupported variable '" + systemVarName + "'");
+                    c.writeErrMessage(ErrorCode.ER_GLOBAL_VARIABLE, "Unsupported variable '" + systemVarName + "'");
                     return true;
                 }
 
@@ -1383,6 +1472,23 @@ public final class SetHandler {
                 logger.error(t.getMessage());
                 return true;
             }
+        }
+
+        // check superuser privileges before executing real set global
+        if (!c.isSuperUser()) {
+            if (c.getTddlConnection() == null) {
+                c.initTddlConnection();
+            }
+            TConnection conn = c.getTddlConnection();
+            String msg = "User " + c.getUser()
+                + " trying to execute set global, which will be ignored";
+            if (conn != null && conn.getExecutionContext() != null) {
+                conn.getExecutionContext().addMessage(ExecutionContext.WARNING_MESSAGE,
+                    new ExecutionContext.ErrorMessage(ERR_CHECK_PRIVILEGE_FAILED.getCode(), null, msg));
+            }
+
+            logger.warn("[" + c.getTraceId() + "]" + msg);
+            return false;
         }
 
         try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
@@ -1400,8 +1506,7 @@ public final class SetHandler {
                     if (instHaContext != null && ServerInstIdManager.getInstance().getInstId()
                         .equalsIgnoreCase(instHaContext.getInstId()) && !instHaContext.isMetaDb()) {
                         try (Connection connection = DbTopologyManager.getConnectionForStorage(instHaContext)) {
-                            PreparedStatement statement =
-                                connection.prepareStatement(setStatement.toString());
+                            PreparedStatement statement = connection.prepareStatement(setStatement.toString());
                             statement.execute();
                         } catch (Throwable e) {
                             throw new RuntimeException(e);
@@ -1413,9 +1518,21 @@ public final class SetHandler {
                 CacheVariables.invalidateAll();
                 // FIXME: refresh cache when using X-Protocol
             }
+
             if (!GeneralUtil.isEmpty(cnProps)) {
                 instConfigAccessor.updateInstConfigValue(InstIdUtil.getInstId(), cnProps);
             }
+
+            if (!GeneralUtil.isEmpty(globalCdcVariableList)) {
+                Properties cdcProps = new Properties();
+                for (Pair<String, String> config : globalCdcVariableList) {
+                    cdcProps.setProperty(config.getKey(), config.getValue());
+                }
+                CdcConfigAccessor accessor = new CdcConfigAccessor();
+                accessor.setConnection(metaDbConn);
+                accessor.updateInstConfigValue(cdcProps);
+            }
+
             return false;
         } catch (Throwable t) {
             c.writeErrMessage(ErrorCode.ER_GLOBAL_VARIABLE, "Error occurred when setting global variables");
@@ -1424,24 +1541,79 @@ public final class SetHandler {
         }
     }
 
-    private static boolean setCharset(String charset, ServerConnection c) {
-        if ("default".equalsIgnoreCase(charset) || "null".equalsIgnoreCase(charset) || null == charset) {
-            /* 忽略字符集为null的属性设置 */
-        } else if (c.setCharset(charset)) {
-
-        } else {
-            try {
-                if (c.setCharsetIndex(Integer.parseInt(charset))) {
-                } else {
+    private static boolean setResultCharset(String charset, ServerConnection c) {
+        // 忽略字符集为null的属性设置
+        boolean isDefaultOrNull =
+            "default".equalsIgnoreCase(charset) || "null".equalsIgnoreCase(charset) || null == charset;
+        if (DynamicConfig.getInstance().isCompatibleCharsetVariables()) {
+            // 先尝试设置字符集, 再尝试设置字符集编号
+            if (!isDefaultOrNull && !c.setResultSetCharset(charset)) {
+                try {
+                    if (!c.setResultSetCharsetIndex(Integer.parseInt(charset))) {
+                        c.writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset :" + charset);
+                        return false;
+                    }
+                } catch (RuntimeException e) {
                     c.writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset :" + charset);
                     return false;
                 }
-            } catch (RuntimeException e) {
-                c.writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset :" + charset);
-                return false;
             }
+
+            c.getExtraServerVariables().put("CHARACTER_SET_RESULTS".toLowerCase(), charset);
+            return true;
         }
 
+        return setCharsets(charset, c);
+    }
+
+    private static boolean setConnectionCharset(String charset, ServerConnection c) {
+        // 忽略字符集为null的属性设置
+        if (DynamicConfig.getInstance().isCompatibleCharsetVariables()) {
+            boolean isDefaultOrNull =
+                "default".equalsIgnoreCase(charset) || "null".equalsIgnoreCase(charset) || null == charset;
+            // 先尝试设置字符集, 再尝试设置字符集编号
+            if (!isDefaultOrNull && !c.setConnectionCharset(charset)) {
+                try {
+                    if (!c.setConnectionCharsetIndex(Integer.parseInt(charset))) {
+                        c.writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset :" + charset);
+                        return false;
+                    }
+                } catch (RuntimeException e) {
+                    c.writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset :" + charset);
+                    return false;
+                }
+            }
+
+            c.getExtraServerVariables().put("CHARACTER_SET_CONNECTION".toLowerCase(), charset);
+            return true;
+        }
+
+        return setCharsets(charset, c);
+    }
+
+    /**
+     * old behavior of set CHARACTER_SET_RESULTS or CHARACTER_SET_CONNECTION
+     * for backward compatibility
+     */
+    private static boolean setCharsets(String charset, ServerConnection c) {
+        boolean isDefaultOrNull =
+            "default".equalsIgnoreCase(charset) || "null".equalsIgnoreCase(charset) || null == charset;
+        if (!isDefaultOrNull) {
+            if (!c.setCharset(charset)) {
+                // 先尝试设置字符集, 再尝试设置字符集编号
+                try {
+                    if (!c.setCharsetIndex(Integer.parseInt(charset))) {
+                        c.writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset :" + charset);
+                        return false;
+                    }
+                } catch (RuntimeException e) {
+                    c.writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset :" + charset);
+                    return false;
+                }
+            }
+        }
+        c.getExtraServerVariables().put("CHARACTER_SET_RESULTS".toLowerCase(), charset);
+        c.getExtraServerVariables().put("CHARACTER_SET_CONNECTION".toLowerCase(), charset);
         return true;
     }
 
@@ -1458,14 +1630,11 @@ public final class SetHandler {
 
         PolarAccountInfo currentUser = manager.getAndCheckById(c.getMatchPolarUserInfo().getAccountId());
 
-        ActiveRoles.ActiveRoleSpec activeRoleSpec =
-            ActiveRoles.ActiveRoleSpec.from(sqlNode.getRoleSpec());
+        ActiveRoles.ActiveRoleSpec activeRoleSpec = ActiveRoles.ActiveRoleSpec.from(sqlNode.getRoleSpec());
 
-        List<PolarAccountInfo> roles = sqlNode.getUsers()
-            .stream()
-            .map(SqlUserName::toPolarAccount)
-            .map(manager::getAndCheckExactUser)
-            .collect(Collectors.toList());
+        List<PolarAccountInfo> roles =
+            sqlNode.getUsers().stream().map(SqlUserName::toPolarAccount).map(manager::getAndCheckExactUser)
+                .collect(Collectors.toList());
 
         c.setActiveRoles(currentUser.getRolePrivileges().checkAndGetActiveRoles(activeRoleSpec, roles));
     }
@@ -1478,8 +1647,8 @@ public final class SetHandler {
         return r;
     }
 
-    private static boolean checkResultSuccess(ServerConnection c, UserDefVarProcessingResult r,
-                                              boolean inProcedureCall, boolean throwException) {
+    private static boolean checkResultSuccess(ServerConnection c, UserDefVarProcessingResult r, boolean inProcedureCall,
+                                              boolean throwException) {
         if (r == null) {
             if (throwException) {
                 if (inProcedureCall) {
@@ -1493,8 +1662,7 @@ public final class SetHandler {
                 if (inProcedureCall) {
                     throw new RuntimeException("ER_WRONG_VALUE_FOR_VAR: Operand should contain 1 column(s)");
                 }
-                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
-                    "Operand should contain 1 column(s)");
+                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR, "Operand should contain 1 column(s)");
             }
             return false;
         } else if (r.moreThanOneRow && !(ConfigDataMode.isFastMock())) {
@@ -1549,6 +1717,10 @@ public final class SetHandler {
         }
     }
 
+    /**
+     * Check whether the {@param systemVarValue} is valid for {@param systemVarName}.
+     * If it is not valid, an exception will be thrown.
+     */
     private static void extraCheck(String systemVarName, String systemVarValue) {
         if (systemVarName.equalsIgnoreCase(TransactionAttribute.DRDS_TRANSACTION_POLICY)) {
             if ("2PC".equalsIgnoreCase(systemVarValue) || "FLEXIBLE".equalsIgnoreCase(systemVarValue)) {
@@ -1558,8 +1730,8 @@ public final class SetHandler {
                 ITransactionPolicy.TransactionClass.valueOf(systemVarValue.toUpperCase());
             } catch (Exception e) {
                 throw new TddlRuntimeException(com.alibaba.polardbx.common.exception.code.ErrorCode.ERR_VALIDATE,
-                    "The global variable '" + systemVarName + "' cannot be set to the value of '"
-                        + systemVarValue + "'");
+                    "The global variable '" + systemVarName + "' cannot be set to the value of '" + systemVarValue
+                        + "'");
             }
             return;
         }
@@ -1594,27 +1766,22 @@ public final class SetHandler {
             value = ((SqlNumericLiteral) oriValue).getValue();
         } else if (oriValue instanceof SqlUserDefVar) {
             value = c.getUserDefVariables().get(((SqlUserDefVar) oriValue).getName().toLowerCase());
-            if (!c.getUserDefVariables()
-                .containsKey(((SqlUserDefVar) oriValue).getName().toLowerCase())) {
-                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR, "Variable " + key.getName()
-                    + " can't be set to the value of "
-                    + RelUtils.stringValue(oriValue));
+            if (!c.getUserDefVariables().containsKey(((SqlUserDefVar) oriValue).getName().toLowerCase())) {
+                c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
+                    "Variable " + key.getName() + " can't be set to the value of " + RelUtils.stringValue(oriValue));
                 return RETURN_VALUE;
             }
         } else if (oriValue instanceof SqlSystemVar) {
             SqlSystemVar var = (SqlSystemVar) oriValue;
-            if (!ServerVariables.contains(var.getName()) && !ServerVariables
-                .isExtra(var.getName())) {
-                c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE, "Unknown system variable '"
-                    + var.getName() + "'");
+            if (!ServerVariables.contains(var.getName()) && !ServerVariables.isExtra(var.getName())) {
+                c.writeErrMessage(ErrorCode.ER_UNKNOWN_SYSTEM_VARIABLE,
+                    "Unknown system variable '" + var.getName() + "'");
                 return RETURN_VALUE;
             }
             value = c.getSysVarValue(var);
-        } else if (oriValue instanceof SqlLiteral
-            && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.NULL) {
+        } else if (oriValue instanceof SqlLiteral && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.NULL) {
             value = null;
-        } else if (oriValue instanceof SqlLiteral
-            && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.BOOLEAN) {
+        } else if (oriValue instanceof SqlLiteral && ((SqlLiteral) oriValue).getTypeName() == SqlTypeName.BOOLEAN) {
             value = ((SqlLiteral) oriValue).booleanValue();
         } else if (isDefault(oriValue)) {
             value = "default";
@@ -1627,4 +1794,50 @@ public final class SetHandler {
         }
         return value;
     }
+
+    public static void occurError(boolean inProcedureCall, String key, SqlNode oriValue, ServerConnection c) {
+        if (inProcedureCall) {
+            throw new RuntimeException(
+                "Variable " + key + " can't be set to the value of " + RelUtils.stringValue(
+                    oriValue));
+        }
+        c.writeErrMessage(ErrorCode.ER_WRONG_VALUE_FOR_VAR,
+            "Variable " + key + " can't be set to the value of " + RelUtils.stringValue(
+                oriValue));
+    }
+
+    private static boolean isIgnoreSettingNoTransaction(ServerConnection c) {
+        // Session variable.
+        Object sessionVar = c.getConnectionVariables()
+            .get(ConnectionProperties.IGNORE_TRANSACTION_POLICY_NO_TRANSACTION);
+        if (null != sessionVar) {
+            return Boolean.parseBoolean((String) sessionVar);
+        }
+
+        if (null != c.getExecutionContext()) {
+            // Hint setting or global variable.
+            return c.getExecutionContext().isIgnoreSettingNoTransaction();
+        } else {
+            // c.executionContext is null before executing any DQL/DML,
+            // so use global value.
+            return InstConfUtil.getBool(ConnectionParams.IGNORE_TRANSACTION_POLICY_NO_TRANSACTION);
+        }
+    }
+
+    private static class UserDefVarProcessingResult {
+
+        public boolean moreThanOneColumn;
+        public boolean moreThanOneRow;
+        public boolean otherError;
+        public Object value;
+
+        public UserDefVarProcessingResult(boolean moreThanOneColumn, boolean moreThanOneRow, boolean otherError,
+                                          Object value) {
+            this.moreThanOneColumn = moreThanOneColumn;
+            this.moreThanOneRow = moreThanOneRow;
+            this.otherError = otherError;
+            this.value = value;
+        }
+    }
+
 }

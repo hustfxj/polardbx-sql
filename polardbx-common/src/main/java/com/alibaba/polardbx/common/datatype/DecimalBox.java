@@ -30,14 +30,17 @@ public class DecimalBox {
     private int carry;
 
     private boolean isSumZero;
+    private int scale;
 
-    public DecimalBox() {
+    public DecimalBox(int scale) {
         sum = new DecimalStructure();
         intVal1 = 0;
         intVal2 = 0;
         fracVal = 0;
         carry = 0;
         isSumZero = true;
+
+        this.scale = scale;
     }
 
     public void add(int a1, int a2, int b) {
@@ -114,10 +117,18 @@ public class DecimalBox {
         int fractions = countFractions(b);
         Slice raw = sum.getDecimalMemorySegment();
 
-        raw.setInt(0, (int) a2);
-        raw.setInt(4, (int) a1);
-        raw.setInt(8, (int) b);
-        raw.setByte(DecimalTypeBase.INTEGERS_OFFSET, 18);
+        if (a2 >= 1000_000_000) {
+            raw.setInt(0, 1);
+            raw.setInt(4, (int) a2 - 1000_000_000);
+            raw.setInt(8, (int) a1);
+            raw.setInt(12, (int) b);
+            raw.setByte(DecimalTypeBase.INTEGERS_OFFSET, 19);
+        } else {
+            raw.setInt(0, (int) a2);
+            raw.setInt(4, (int) a1);
+            raw.setInt(8, (int) b);
+            raw.setByte(DecimalTypeBase.INTEGERS_OFFSET, 18);
+        }
         raw.setByte(DecimalTypeBase.FRACTIONS_OFFSET, fractions);
         raw.setByte(DecimalTypeBase.DERIVED_FRACTIONS_OFFSET, fractions);
         raw.setByte(DecimalTypeBase.IS_NEG_OFFSET, 0);
@@ -145,10 +156,18 @@ public class DecimalBox {
         DecimalStructure tmp = new DecimalStructure();
         Slice raw = tmp.getDecimalMemorySegment();
 
-        raw.setInt(0, (int) a2);
-        raw.setInt(4, (int) a1);
-        raw.setInt(8, (int) b);
-        raw.setByte(DecimalTypeBase.INTEGERS_OFFSET, 18);
+        if (a2 >= 1000_000_000) {
+            raw.setInt(0, 1);
+            raw.setInt(4, (int) a2 - 1000_000_000);
+            raw.setInt(8, (int) a1);
+            raw.setInt(12, (int) b);
+            raw.setByte(DecimalTypeBase.INTEGERS_OFFSET, 19);
+        } else {
+            raw.setInt(0, (int) a2);
+            raw.setInt(4, (int) a1);
+            raw.setInt(8, (int) b);
+            raw.setByte(DecimalTypeBase.INTEGERS_OFFSET, 18);
+        }
         raw.setByte(DecimalTypeBase.FRACTIONS_OFFSET, fractions);
         raw.setByte(DecimalTypeBase.DERIVED_FRACTIONS_OFFSET, fractions);
         raw.setByte(DecimalTypeBase.IS_NEG_OFFSET, 0);
@@ -157,6 +176,9 @@ public class DecimalBox {
     }
 
     private int countFractions(long b) {
+        if (scale > 0) {
+            return scale;
+        }
         if (b == 0) {
             return 0;
         }
@@ -170,5 +192,9 @@ public class DecimalBox {
             return 6;
         }
         return 9;
+    }
+
+    public void setScale(int scale) {
+        this.scale = scale;
     }
 }

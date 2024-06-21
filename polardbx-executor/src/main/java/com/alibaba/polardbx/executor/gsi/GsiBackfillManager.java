@@ -28,8 +28,9 @@ import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.thread.ExecutorUtil;
 import com.alibaba.polardbx.common.utils.thread.NamedThreadFactory;
 import com.alibaba.polardbx.config.ConfigDataMode;
-import com.alibaba.polardbx.executor.ddl.engine.AsyncDDLCache;
 import com.alibaba.polardbx.executor.gsi.utils.Transformer;
+import com.alibaba.polardbx.executor.mpp.metadata.NotNull;
+import com.alibaba.polardbx.executor.physicalbackfill.PhysicalBackfillUtils;
 import com.alibaba.polardbx.gms.metadb.GmsSystemTables;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
 import com.alibaba.polardbx.gms.metadb.record.SystemTableRecord;
@@ -49,9 +50,6 @@ import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 
 import javax.sql.DataSource;
-
-import com.alibaba.polardbx.executor.mpp.metadata.NotNull;
-
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.sql.Connection;
@@ -87,9 +85,10 @@ import static com.alibaba.polardbx.executor.gsi.GsiUtils.DEFAULT_PARAMETER_METHO
 public class GsiBackfillManager {
 
     private static final String SYSTABLE_BACKFILL_OBJECTS = GmsSystemTables.BACKFILL_OBJECTS;
-
     private static final String SYSTABLE_FILE_STORAGE_BACKFILL_OBJECTS =
         GmsSystemTables.FILE_STORAGE_BACKFILL_OBJECTS;
+
+    private static final String SYSTABLE_PHYSICAL_BACKFILL_OBJECTS = GmsSystemTables.PHYSICAL_BACKFILL_OBJECTS;
 
     public static final String CREATE_GSI_BACKFILL_OBJECTS_TABLE = "CREATE TABLE IF NOT EXISTS `"
         + SYSTABLE_BACKFILL_OBJECTS
@@ -160,6 +159,11 @@ public class GsiBackfillManager {
                                 try (PreparedStatement ps = conn.prepareStatement(SQL_CLEAN_OUTDATED_FILESTORAGE_LOG)) {
                                     ps.execute();
                                 }
+                                try (PreparedStatement ps = conn.prepareStatement(
+                                    SQL_CLEAN_OUTDATED_PHYSICAL_BACKFILL_LOG)) {
+                                    ps.execute();
+                                }
+                                PhysicalBackfillUtils.destroyDataSources();
                             } catch (SQLException e) {
                                 throw new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_EXECUTE,
                                     e,
@@ -289,6 +293,15 @@ public class GsiBackfillManager {
             }
         }
         return BackfillBean.create(br, physicalBfoList, progress);
+    }
+
+    public boolean allReadyHasBackfillObject(long backfillId, String sourceTableName, String targetTableName) {
+        BackfillBean backfillBean = loadBackfillMeta(backfillId);
+        if (backfillBean == BackfillBean.EMPTY) {
+            return false;
+        } else {
+            return isSameTask(sourceTableName, targetTableName, backfillBean);
+        }
     }
 
     public Integer updateBackfillObject(List<BackfillObjectBean> backfillObject, List<ParameterContext> lastPk,
@@ -503,6 +516,11 @@ public class GsiBackfillManager {
             && StringUtils.equalsIgnoreCase(backfillBean.indexName, record.indexName);
     }
 
+    private boolean isSameTask(String sourceTableName, String targetTableName, BackfillBean backfillBean) {
+        return StringUtils.equalsIgnoreCase(backfillBean.tableName, sourceTableName)
+            && StringUtils.equalsIgnoreCase(backfillBean.indexName, targetTableName);
+    }
+
     private List<BackfillObjectRecord> queryBackfillObject(long backfillId) {
         return queryByJobId(SQL_SELECT_BACKFILL_OBJECT, backfillId, BackfillObjectRecord.ORM);
     }
@@ -522,6 +540,20 @@ public class GsiBackfillManager {
         } catch (Exception e) {
             throw new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_EXECUTE,
                 e, "queryBackFillAggInfo failed!");
+        }
+    }
+
+    public List<BackFillAggInfo> queryCreateDatabaseBackFillAggInfoById(List<Long> backFillIdList) {
+        if (CollectionUtils.isEmpty(backFillIdList)) {
+            return new ArrayList<>();
+        }
+        try (Connection connection = dataSource.getConnection()) {
+            String ids = Joiner.on(",").join(backFillIdList);
+            String sql = String.format(SQL_CREATE_DATABASE_AS_BACKFILL_VIEW_BY_ID, ids);
+            return MetaDbUtil.query(sql, BackFillAggInfo.class, connection);
+        } catch (Exception e) {
+            throw new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_EXECUTE,
+                e, "queryCreateDatabaseBackFillAggInfo failed!");
         }
     }
 
@@ -619,9 +651,17 @@ public class GsiBackfillManager {
         "SELECT ID,JOB_ID,TABLE_SCHEMA,TABLE_NAME,INDEX_SCHEMA,INDEX_NAME,PHYSICAL_DB,PHYSICAL_TABLE,COLUMN_INDEX,PARAMETER_METHOD,`LAST_VALUE`,MAX_VALUE,STATUS,MESSAGE,SUCCESS_ROW_COUNT,START_TIME,END_TIME,EXTRA FROM "
             + SYSTABLE_BACKFILL_OBJECTS + " WHERE JOB_ID = ? AND PHYSICAL_DB IS NULL AND PHYSICAL_TABLE IS NULL";
 
+    private static final String SQL_SELECT_BACKFILL_VIEW =
+        "SELECT JOB_ID,TABLE_SCHEMA,TABLE_NAME,`STATUS`,SUM(SUCCESS_ROW_COUNT) as SUCCESS_ROW_COUNT, START_TIME, TIMESTAMPDIFF(SECOND, START_TIME, END_TIME) AS DURATION FROM "
+            + SYSTABLE_BACKFILL_OBJECTS + " WHERE `STATUS` IN (0,1) AND COLUMN_INDEX=0 GROUP BY JOB_ID";
+
     private static final String SQL_SELECT_BACKFILL_VIEW_BY_ID =
         "select job_id, table_schema, table_name, `status`, success_row_count, start_time, duration from ( SELECT JOB_ID,TABLE_SCHEMA,TABLE_NAME,`STATUS`,SUM(SUCCESS_ROW_COUNT) as SUCCESS_ROW_COUNT, START_TIME, TIMESTAMPDIFF(SECOND, START_TIME, END_TIME) AS DURATION FROM "
             + SYSTABLE_BACKFILL_OBJECTS + " WHERE JOB_ID IN (%s) GROUP BY JOB_ID, COLUMN_INDEX) t group by job_id";
+
+    private static final String SQL_CREATE_DATABASE_AS_BACKFILL_VIEW_BY_ID =
+        "SELECT JOB_ID,TABLE_SCHEMA,TABLE_NAME,`STATUS`,SUM(SUCCESS_ROW_COUNT) as SUCCESS_ROW_COUNT, START_TIME, TIMESTAMPDIFF(SECOND, START_TIME, END_TIME) AS DURATION FROM "
+            + SYSTABLE_BACKFILL_OBJECTS + " WHERE JOB_ID IN (%s) GROUP BY JOB_ID";
 
     private static final String SQL_UPDATE_BACKFILL_PROGRESS = "UPDATE "
         + SYSTABLE_BACKFILL_OBJECTS
@@ -653,6 +693,11 @@ public class GsiBackfillManager {
     private static final String SQL_CLEAN_OUTDATED_FILESTORAGE_LOG = "DELETE FROM "
         + SYSTABLE_FILE_STORAGE_BACKFILL_OBJECTS
         + " WHERE DATE(END_TIME) < DATE_SUB( CURDATE(), INTERVAL 60 DAY ) AND DATE(START_TIME) < DATE_SUB( CURDATE(), INTERVAL 60 DAY )";
+
+    private static final String SQL_CLEAN_OUTDATED_PHYSICAL_BACKFILL_LOG = "DELETE FROM "
+        + SYSTABLE_PHYSICAL_BACKFILL_OBJECTS
+        + " WHERE DATE(END_TIME) < DATE_SUB( CURDATE(), INTERVAL 60 DAY ) AND DATE(START_TIME) < DATE_SUB( CURDATE(), INTERVAL 60 DAY )";
+
     private static final String SQL_CLEAN_ALL = "DELETE FROM " + SYSTABLE_BACKFILL_OBJECTS + " WHERE TABLE_SCHEMA = ?";
 
     private static final String SQL_CLEAN_ALL_FILE_STORAGE =

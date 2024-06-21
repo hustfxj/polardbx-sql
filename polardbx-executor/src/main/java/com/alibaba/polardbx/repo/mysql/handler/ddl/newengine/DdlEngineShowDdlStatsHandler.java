@@ -20,11 +20,15 @@ import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.executor.cursor.Cursor;
 import com.alibaba.polardbx.executor.cursor.impl.ArrayResultCursor;
 import com.alibaba.polardbx.executor.ddl.newengine.DdlEngineStats;
+import com.alibaba.polardbx.executor.ddl.workqueue.ChangeSetThreadPool;
+import com.alibaba.polardbx.executor.ddl.workqueue.FastCheckerThreadPool;
 import com.alibaba.polardbx.executor.spi.IRepository;
-import com.alibaba.polardbx.executor.workqueue.PriorityWorkQueue;
+import com.alibaba.polardbx.executor.ddl.workqueue.BackFillThreadPool;
+import com.alibaba.polardbx.executor.utils.ExecUtils;
 import com.alibaba.polardbx.gms.node.GmsNodeManager.GmsNode;
 import com.alibaba.polardbx.gms.sync.GmsSyncManagerHelper;
 import com.alibaba.polardbx.gms.sync.IGmsSyncAction;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.dal.LogicalDal;
 import org.apache.commons.collections.CollectionUtils;
@@ -52,8 +56,12 @@ public class DdlEngineShowDdlStatsHandler extends DdlEngineJobsHandler {
         DdlStatsSyncAction sync = new DdlStatsSyncAction();
         Map<String, DdlEngineStats.Metric> metrics = new TreeMap<>();
 
+        // backfill parallelism
+        BackFillThreadPool.updateStats();
+        ChangeSetThreadPool.updateStats();
+
         // Merge stats from all nodes
-        GmsSyncManagerHelper.sync(sync, executionContext.getSchemaName(), results -> {
+        GmsSyncManagerHelper.sync(sync, executionContext.getSchemaName(), SyncScope.MASTER_ONLY, results -> {
             if (results == null) {
                 return;
             }
@@ -84,7 +92,16 @@ public class DdlEngineShowDdlStatsHandler extends DdlEngineJobsHandler {
         public Object sync() {
             ArrayResultCursor result = DdlEngineStats.Metric.buildCursor();
             // backfill parallelism
-            PriorityWorkQueue.updateStats();
+            BackFillThreadPool.updateStats();
+            ChangeSetThreadPool.updateStats();
+
+            //only leader update the fastchecker stats
+            if (ExecUtils.hasLeadership(null)) {
+                FastCheckerThreadPool.getInstance().updateStats();
+            } else {
+                FastCheckerThreadPool.getInstance().clearStats();
+            }
+
             for (DdlEngineStats.Metric metric : DdlEngineStats.getAllMetrics().values()) {
                 result.addRow(metric.toRow());
             }

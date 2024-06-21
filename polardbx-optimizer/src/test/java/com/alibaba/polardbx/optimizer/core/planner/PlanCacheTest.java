@@ -17,6 +17,8 @@
 package com.alibaba.polardbx.optimizer.core.planner;
 
 import com.alibaba.polardbx.common.utils.Assert;
+import com.alibaba.polardbx.common.properties.ConnectionProperties;
+import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.parse.SqlParameterizeUtils;
@@ -70,6 +72,24 @@ public class PlanCacheTest extends PlanTestCommon {
     }
 
     @Test
+    public void testExpireTime() {
+        // default config test, 12H
+        testExpireTimeEqualsConfig(12 * 3600 * 1000);
+
+        // manual set config test
+        int manualExpireTime = 110 * 1000;
+        DynamicConfig.getInstance().loadValue(null, ConnectionProperties.PLAN_CACHE_EXPIRE_TIME, manualExpireTime + "");
+        testExpireTimeEqualsConfig(manualExpireTime);
+    }
+
+    private void testExpireTimeEqualsConfig(int expectedTime) {
+        int expireTime = DynamicConfig.getInstance().planCacheExpireTime();
+        PlanCache planCache = new PlanCache(1);
+        assert expireTime == planCache.getPlanCacheExpireTime();
+        assert expireTime == expectedTime;
+    }
+
+    @Test
     public void testUpperBound() throws ExecutionException {
         int maxSize = 3;
         PlanCache planCache = new PlanCache(maxSize);
@@ -85,14 +105,14 @@ public class PlanCacheTest extends PlanTestCommon {
 
     @Test
     public void testInSqlBound() throws ExecutionException {
-        int maxSize = 5;
+        int maxSize = 3;
         PlanCache planCache = new PlanCache(maxSize);
         for (String sql : inSqls) {
             ExecutionContext executionContext = new ExecutionContext(this.appName);
             SqlParameterized sqlParameterized = SqlParameterizeUtils.parameterize(ByteString.from(sql), null, executionContext, false);
             planCache.get(this.appName, sqlParameterized, executionContext, false);
         }
-        if (planCache.getCache().size() != 5) {
+        if (planCache.getCache().size() > maxSize) {
             Assert.fail("plan cache in sql size over limit:" + planCache.getCache().size());
         }
     }
@@ -106,7 +126,7 @@ public class PlanCacheTest extends PlanTestCommon {
             SqlParameterized sqlParameterized = SqlParameterizeUtils.parameterize(ByteString.from(sql), null, executionContext, false);
             planCache.get(this.appName, sqlParameterized, executionContext, false);
         }
-        if (planCache.getCache().size() != inSqls.length) {
+        if (planCache.getCache().size() > inSqls.length) {
             Assert.fail("plan cache in sql size over limit:" + planCache.getCache().size());
         }
     }

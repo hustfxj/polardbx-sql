@@ -17,6 +17,7 @@
 package com.alibaba.polardbx.executor.ddl.job.task.basic;
 
 import com.alibaba.fastjson.annotation.JSONCreator;
+import com.alibaba.polardbx.common.exception.PhysicalDdlException;
 import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
 import com.alibaba.polardbx.executor.ddl.job.task.BasePhyDdlTask;
 import com.alibaba.polardbx.executor.ddl.job.task.util.TaskName;
@@ -33,6 +34,7 @@ public class DropTablePhyDdlTask extends BasePhyDdlTask {
     @Override
     public void executeImpl(ExecutionContext executionContext) {
         updateSupportedCommands(true, false, null);
+        // 元数据已经清理，肯定不支持回滚的
         super.executeImpl(executionContext);
     }
 }

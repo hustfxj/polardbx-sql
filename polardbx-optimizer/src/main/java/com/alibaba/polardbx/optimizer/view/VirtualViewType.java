@@ -55,6 +55,10 @@ public enum VirtualViewType {
 
     ROUTINES,
 
+    CHECK_ROUTINES,
+
+    JAVA_FUNCTIONS,
+
     COLUMN_PRIVILEGES,
 
     FILES,
@@ -67,9 +71,13 @@ public enum VirtualViewType {
 
     OPTIMIZER_TRACE,
 
+    TRACE,
+
     PARAMETERS,
 
     PARTITIONS,
+
+    PARTITIONS_META,
 
     LOCAL_PARTITIONS,
 
@@ -165,9 +173,21 @@ public enum VirtualViewType {
 
     GLOBAL_INDEXES,
 
+    /**
+     * 物理空间占用
+     */
+    COLUMNAR_INDEX_STATUS,
+
+    /**
+     * 列存索引有效数据统计
+     */
+    COLUMNAR_STATUS,
+
     METADATA_LOCK,
 
     STORAGE,
+
+    STORAGE_STATUS,
 
     STORAGE_REPLICAS,
 
@@ -176,6 +196,8 @@ public enum VirtualViewType {
     TABLE_GROUP,
 
     FULL_TABLE_GROUP,
+
+    STORAGE_POOL_INFO,
 
     TABLE_DETAIL,
 
@@ -200,6 +222,7 @@ public enum VirtualViewType {
     // DRDS virtual table
     VIRTUAL_STATISTIC,
     STATISTICS,
+    STATISTICS_DATA,
     COLUMN_STATISTICS,
 
     /**
@@ -224,19 +247,23 @@ public enum VirtualViewType {
 
     REBALANCE_BACKFILL,
 
-    FILE_STORAGE,
+    CREATE_DATABASE_AS_BACKFILL,
 
-    FILE_STORAGE_FILES_META,
+    CREATE_DATABASE,
 
     STATEMENTS_SUMMARY,
 
     STATEMENTS_SUMMARY_HISTORY,
 
-    AFFINITY_TABLES,
+    FILE_STORAGE,
+
+    FILE_STORAGE_FILES_META,
 
     JOIN_GROUP,
 
     ARCHIVE,
+
+    AFFINITY_TABLES,
 
     PROCEDURE_CACHE,
 
@@ -246,5 +273,24 @@ public enum VirtualViewType {
 
     FUNCTION_CACHE_CAPACITY,
 
-    PUSHED_FUNCTION
+    PUSHED_FUNCTION,
+
+    TABLE_ACCESS,
+
+    TABLE_JOIN_CLOSURE,
+
+    POLARDBX_TRX,
+
+    OPTIMIZER_ALERT,
+
+    STORAGE_PROPERTIES,
+
+    PREPARED_TRX_BRANCH,
+
+    REPLICA_STAT,
+
+    REBALANCE_PROGRESS,
+
+    SHOW_HELP
+
 }

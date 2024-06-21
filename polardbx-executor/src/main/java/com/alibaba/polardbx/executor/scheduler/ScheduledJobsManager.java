@@ -22,9 +22,6 @@ import com.alibaba.polardbx.common.async.AsyncTask;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.scheduler.FiredScheduledJobState;
 import com.alibaba.polardbx.common.scheduler.SchedulePolicy;
-import com.alibaba.polardbx.gms.module.ModuleInfo;
-import com.alibaba.polardbx.gms.node.LeaderStatusBridge;
-import com.alibaba.polardbx.gms.scheduler.ScheduledJobExecutorType;
 import com.alibaba.polardbx.common.scheduler.SchedulerJobStatus;
 import com.alibaba.polardbx.common.scheduler.SchedulerType;
 import com.alibaba.polardbx.common.utils.logger.Logger;
@@ -32,16 +29,20 @@ import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.common.utils.thread.ExecutorUtil;
 import com.alibaba.polardbx.common.utils.thread.NamedThreadFactory;
 import com.alibaba.polardbx.executor.scheduler.executor.ScheduleJobStarter;
-import com.alibaba.polardbx.executor.ddl.newengine.DdlPlanScheduler;
+import com.alibaba.polardbx.executor.scheduler.executor.ScheduleJobStarter;
 import com.alibaba.polardbx.executor.ddl.newengine.utils.DdlHelper;
 import com.alibaba.polardbx.executor.scheduler.executor.SchedulerExecutor;
 import com.alibaba.polardbx.executor.sync.FetchRunningScheduleJobsSyncAction;
 import com.alibaba.polardbx.executor.sync.SyncManagerHelper;
 import com.alibaba.polardbx.executor.utils.ExecUtils;
 import com.alibaba.polardbx.gms.config.impl.InstConfUtil;
+import com.alibaba.polardbx.gms.module.ModuleInfo;
+import com.alibaba.polardbx.gms.node.LeaderStatusBridge;
 import com.alibaba.polardbx.gms.scheduler.ExecutableScheduledJob;
+import com.alibaba.polardbx.gms.scheduler.ScheduledJobExecutorType;
 import com.alibaba.polardbx.gms.scheduler.ScheduledJobsAccessorDelegate;
 import com.alibaba.polardbx.gms.scheduler.ScheduledJobsRecord;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.optimizer.view.VirtualViewType;
 import com.cronutils.descriptor.CronDescriptor;
 import com.cronutils.model.Cron;
@@ -68,8 +69,8 @@ import java.util.concurrent.TimeUnit;
 
 import static com.alibaba.polardbx.common.properties.ConnectionParams.SCHEDULER_CLEAN_UP_INTERVAL_HOURS;
 import static com.alibaba.polardbx.common.properties.ConnectionParams.SCHEDULER_MAX_WORKER_COUNT;
-import static com.alibaba.polardbx.common.properties.ConnectionParams.SCHEDULER_SCAN_INTERVAL_SECONDS;
 import static com.alibaba.polardbx.common.properties.ConnectionParams.SCHEDULER_MIN_WORKER_COUNT;
+import static com.alibaba.polardbx.common.properties.ConnectionParams.SCHEDULER_SCAN_INTERVAL_SECONDS;
 import static com.alibaba.polardbx.common.scheduler.FiredScheduledJobState.INTERRUPTED;
 import static com.alibaba.polardbx.common.scheduler.FiredScheduledJobState.QUEUED;
 import static com.alibaba.polardbx.common.scheduler.FiredScheduledJobState.SKIPPED;
@@ -90,7 +91,7 @@ public final class ScheduledJobsManager implements ModuleInfo {
 
     private final static ScheduledJobsManager INSTANCE = new ScheduledJobsManager();
 
-    public static ScheduledJobsManager getINSTANCE() {
+    public static ScheduledJobsManager getInstance() {
         return INSTANCE;
     }
 
@@ -121,6 +122,14 @@ public final class ScheduledJobsManager implements ModuleInfo {
     private final ScheduledThreadPoolExecutor safeExitThread =
         ExecutorUtil.createScheduler(1,
             new NamedThreadFactory("Scheduled-Jobs-SafeExit-Thread", true),
+            new ThreadPoolExecutor.DiscardPolicy());
+
+    /**
+     * periodically interrupt JOBs out of maintenance window
+     */
+    private final ScheduledThreadPoolExecutor autoInterruptThread =
+        ExecutorUtil.createScheduler(1,
+            new NamedThreadFactory("Scheduled-Jobs-AutoInterrupt-Thread", true),
             new ThreadPoolExecutor.DiscardPolicy());
 
     /**
@@ -161,6 +170,13 @@ public final class ScheduledJobsManager implements ModuleInfo {
 
         safeExitThread.scheduleWithFixedDelay(
             AsyncTask.build(new ScheduledJobsSafeExitChecker()),
+            0L,
+            InstConfUtil.getLong(SCHEDULER_SCAN_INTERVAL_SECONDS),
+            TimeUnit.SECONDS
+        );
+
+        autoInterruptThread.scheduleWithFixedDelay(
+            AsyncTask.build(new ScheduledJobsAutoInterruptChecker()),
             0L,
             InstConfUtil.getLong(SCHEDULER_SCAN_INTERVAL_SECONDS),
             TimeUnit.SECONDS
@@ -210,7 +226,7 @@ public final class ScheduledJobsManager implements ModuleInfo {
         if (!LeaderStatusBridge.getInstance().hasLeadership()) {
             return "";
         }
-        List<ScheduledJobsRecord> jobs = this.queryScheduledJobsRecord();
+        List<ScheduledJobsRecord> jobs = queryScheduledJobsRecord();
         StringBuilder stringBuilder = new StringBuilder();
         jobs.stream().forEach(j -> stringBuilder.append(j.toString()).append(";"));
         return stringBuilder.toString();
@@ -258,6 +274,64 @@ public final class ScheduledJobsManager implements ModuleInfo {
     }
 
     /**
+     * auto interrupt
+     */
+    private static class ScheduledJobsAutoInterruptChecker implements Runnable {
+
+        @Override
+        public void run() {
+            if (!hasLeadership()) {
+                return;
+            }
+            try {
+                logger.info("start scan jobs out of maintenance window");
+                ScheduledJobsAccessorDelegate<Integer> delegate = new ScheduledJobsAccessorDelegate<Integer>() {
+                    @Override
+                    protected Integer invoke() {
+                        List<ExecutableScheduledJob> runningJobs = firedScheduledJobsAccessor.getRunningJobs();
+                        if (!hasLeadership()) {
+                            return -1;
+                        }
+
+                        int count = 0;
+                        for (ExecutableScheduledJob job : runningJobs) {
+                            if (!hasLeadership()) {
+                                return -1;
+                            }
+
+                            SchedulerExecutor esj = SchedulerExecutor.createSchedulerExecutor(job);
+
+                            // might be an expired tasks
+                            if (esj == null) {
+                                continue;
+                            }
+                            if (!esj.needInterrupted().getKey()) {
+                                continue;
+                            }
+
+                            // Out of maintenance, try soft interruption
+                            // This interruption is not forced, if the job refuses or fails to interrupt, ignore it
+                            try {
+                                if (esj.interrupt()) {
+                                    count++;
+                                }
+                            } catch (Throwable t) {
+                                // ignore
+                            }
+                        }
+                        return count;
+                    }
+
+                };
+                int count = delegate.execute();
+                logger.info("Auto interrupt jobs out of maintenance window count: " + count);
+            } catch (Throwable t) {
+                logger.error("Auto interrupt jobs out of maintenance window error", t);
+            }
+        }
+    }
+
+    /**
      * safe exit
      */
     private static class ScheduledJobsSafeExitChecker implements Runnable {
@@ -276,7 +350,7 @@ public final class ScheduledJobsManager implements ModuleInfo {
                         // TODO timeout control?
                         List<List<Map<String, Object>>> results =
                             SyncManagerHelper.sync(new FetchRunningScheduleJobsSyncAction(),
-                                TddlConstants.INFORMATION_SCHEMA);
+                                TddlConstants.INFORMATION_SCHEMA, SyncScope.ALL);
                         Map<Long, Set<Long>> executingJobs = merge(results);
                         if (!hasLeadership()) {
                             return -1;
@@ -300,6 +374,10 @@ public final class ScheduledJobsManager implements ModuleInfo {
                              * try safe exit
                              */
                             SchedulerExecutor esj = SchedulerExecutor.createSchedulerExecutor(job);
+                            // might be an expired tasks
+                            if (esj == null) {
+                                continue;
+                            }
                             if (esj.needInterrupted().getKey() && esj.safeExit()) {
                                 //mark as fail
                                 ScheduledJobsManager.updateState(scheduleId, fireTime, INTERRUPTED,
@@ -385,8 +463,8 @@ public final class ScheduledJobsManager implements ModuleInfo {
                                     continue;
                                 }
                                 if (trigger.fire()) {
-                                    ScheduledJobsManager.getINSTANCE().firedJobNum++;
-                                    ScheduledJobsManager.getINSTANCE().lastFireTimestamp = System.currentTimeMillis();
+                                    ScheduledJobsManager.getInstance().firedJobNum++;
+                                    ScheduledJobsManager.getInstance().lastFireTimestamp = System.currentTimeMillis();
                                     fireCount++;
                                 }
                             } catch (Throwable t) {
@@ -494,8 +572,8 @@ public final class ScheduledJobsManager implements ModuleInfo {
                 if (schedulerExecutor.needInterrupted().getKey()) {
                     return false;
                 }
-                ScheduledJobsManager.getINSTANCE().triggerJobNum++;
-                ScheduledJobsManager.getINSTANCE().lastTriggerTimestamp = System.currentTimeMillis();
+                ScheduledJobsManager.getInstance().triggerJobNum++;
+                ScheduledJobsManager.getInstance().lastTriggerTimestamp = System.currentTimeMillis();
 
                 return schedulerExecutor.execute();
             } finally {
@@ -533,8 +611,8 @@ public final class ScheduledJobsManager implements ModuleInfo {
                 if (schedulerExecutor.needInterrupted().getKey()) {
                     return false;
                 }
-                ScheduledJobsManager.getINSTANCE().triggerJobNum++;
-                ScheduledJobsManager.getINSTANCE().lastTriggerTimestamp = System.currentTimeMillis();
+                ScheduledJobsManager.getInstance().triggerJobNum++;
+                ScheduledJobsManager.getInstance().lastTriggerTimestamp = System.currentTimeMillis();
 
                 return schedulerExecutor.execute();
             } finally {
@@ -584,6 +662,20 @@ public final class ScheduledJobsManager implements ModuleInfo {
                                       FiredScheduledJobState newState,
                                       String remark,
                                       String result) {
+        return new ScheduledJobsAccessorDelegate<Boolean>() {
+            @Override
+            protected Boolean invoke() {
+                return firedScheduledJobsAccessor.updateState(schedulerId, fireTime, newState, remark, result);
+            }
+        }.execute();
+    }
+
+    public static boolean casState(long schedulerId,
+                                   long fireTime,
+                                   FiredScheduledJobState currentState,
+                                   FiredScheduledJobState newState,
+                                   String remark,
+                                   String result) {
         return new ScheduledJobsAccessorDelegate<Boolean>() {
             @Override
             protected Boolean invoke() {
@@ -709,7 +801,7 @@ public final class ScheduledJobsManager implements ModuleInfo {
                     return 0;
                 }
                 if (trigger.fireOnceNow()) {
-                    ScheduledJobsManager.getINSTANCE().fireAtOnce();
+                    ScheduledJobsManager.getInstance().fireAtOnce();
                     return 1;
                 }
                 return 0;

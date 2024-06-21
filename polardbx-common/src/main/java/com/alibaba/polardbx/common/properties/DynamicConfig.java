@@ -16,7 +16,10 @@
 
 package com.alibaba.polardbx.common.properties;
 
+import com.alibaba.polardbx.common.constants.IsolationLevel;
 import com.alibaba.polardbx.common.statementsummary.StatementSummaryManager;
+import com.alibaba.polardbx.common.utils.version.InstanceVersion;
+import com.alibaba.polardbx.config.ConfigDataMode;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 
@@ -59,12 +62,32 @@ public class DynamicConfig {
                 xprotoGalaxyPrepare = parseValue(value, Boolean.class, xprotoGalaxyPrepareDefault);
                 break;
 
+            case ConnectionProperties.XPROTO_FLOW_CONTROL_SIZE_KB:
+                xprotoFlowControlSizeKb = parseValue(value, Integer.class, xprotoFlowControlSizeKbDefault);
+                break;
+
+            case ConnectionProperties.XPROTO_TCP_AGING:
+                xprotoTcpAging = parseValue(value, Integer.class, xprotoTcpAgingDefault);
+                break;
+
             case ConnectionProperties.AUTO_PARTITION_PARTITIONS:
                 autoPartitionPartitions = parseValue(value, Long.class, autoPartitionPartitionsDefault);
                 break;
 
             case ConnectionProperties.STORAGE_DELAY_THRESHOLD:
                 delayThreshold = parseValue(value, Integer.class, 3);
+                break;
+            case ConnectionProperties.ENABLE_OPTIMIZER_ALERT:
+                enableOptimizerAlert = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.ENABLE_OPTIMIZER_ALERT_LOG:
+                enableOptimizerAlertLog = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.OPTIMIZER_ALERT_LOG_INTERVAL:
+                optimizerAlertLogInterval = parseValue(value, Long.class, 600000L);
+                break;
+            case ConnectionProperties.ENABLE_TP_SLOW_ALERT_THRESHOLD:
+                tpSlowAlertThreshold = parseValue(value, Integer.class, 10);
                 break;
             case ConnectionProperties.STORAGE_BUSY_THRESHOLD:
                 busyThreshold = parseValue(value, Integer.class, 100);
@@ -76,7 +99,7 @@ public class DynamicConfig {
                 groupingThread = parseValue(value, Integer.class, 4);
                 break;
             case ConnectionProperties.GROUPING_LSN_TIMEOUT:
-                groupingTimeout = parseValue(value, Integer.class, 1000);
+                groupingTimeout = parseValue(value, Integer.class, 3000);
                 break;
             case ConnectionProperties.FORCE_RECREATE_GROUP_DATASOURCE:
                 enableCreateGroupDataSource = parseValue(value, Boolean.class, false);
@@ -84,9 +107,33 @@ public class DynamicConfig {
             case ConnectionProperties.ENABLE_PLAN_TYPE_DIGEST:
                 enablePlanTypeDigest = parseValue(value, Boolean.class, true);
                 break;
+            case ConnectionProperties.ENABLE_PLAN_TYPE_DIGEST_STRICT_MODE:
+                enablePlanTypeDigestStrictMode = parseValue(value, Boolean.class, false);
+                break;
             case ConnectionProperties.ENABLE_FOLLOWER_READ:
                 supportFollowRead = parseValue(value, Boolean.class, false);
                 break;
+            case ConnectionProperties.ENABLE_REMOTE_CONSUME_LOG:
+                enableRemoteConsumeLog = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.REMOTE_CONSUME_LOG_BATCH_SIZE:
+                consumeLogBatchSize = parseValue(value, Integer.class, 100);
+                break;
+            case ConnectionProperties.RECORD_SQL:
+                enableRecordSql = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.LEARNER_LEVEL:
+                ConfigDataMode.LearnerMode tempLearnerMode = parseValue(
+                    value, ConfigDataMode.LearnerMode.class, ConfigDataMode.LearnerMode.ONLY_READ);
+                if (tempLearnerMode != null) {
+                    learnerMode = tempLearnerMode;
+                }
+                break;
+
+            case ConnectionProperties.BLOCK_CACHE_MEMORY_SIZE_FACTOR:
+                blockCacheMemoryFactor = parseValue(value, Float.class, 0.6f);
+                break;
+
             case ConnectionProperties.PURGE_HISTORY_MS: {
                 long tempPurgeHistoryMs = parseValue(value, Long.class, 600 * 1000L);
                 if (tempPurgeHistoryMs > 0 && tempPurgeHistoryMs < purgeHistoryMs) {
@@ -104,9 +151,20 @@ public class DynamicConfig {
             case ConnectionProperties.MAX_SESSION_PREPARED_STMT_COUNT:
                 maxSessionPreparedStmtCount = parseValue(value, Integer.class, maxSessionPreparedStmtCountDefault);
                 break;
+            case ConnectionProperties.STATISTIC_IN_DEGRADATION_NUMBER:
+                inDegradationNum = parseValue(value, Integer.class, 100);
+                break;
+
+            case ConnectionProperties.ENABLE_AUTO_USE_RANGE_FOR_TIME_INDEX:
+                enableAutoUseRangeForTimeIndex = parseValue(value, Boolean.class, true);
+                break;
 
             case ConnectionProperties.ENABLE_TRANS_LOG:
                 enableTransLog = parseValue(value, Boolean.class, true);
+                break;
+
+            case ConnectionProperties.ENABLE_TRANSACTION_STATISTICS:
+                enableTransactionStatistics = parseValue(value, Boolean.class, true);
                 break;
 
             case ConnectionProperties.PLAN_CACHE_EXPIRE_TIME:
@@ -118,6 +176,9 @@ public class DynamicConfig {
             case ConnectionProperties.ENBALE_BIND_PARAM_TYPE:
                 enableBindType = parseValue(value, Boolean.class, true);
                 break;
+            case ConnectionProperties.ENBALE_BIND_COLLATE:
+                enableBindCollate = parseValue(value, Boolean.class, true);
+                break;
             case ConnectionProperties.ENABLE_CLEAN_FAILED_PLAN:
                 enableClearFailedPlan = parseValue(value, Boolean.class, true);
                 break;
@@ -126,6 +187,36 @@ public class DynamicConfig {
                 break;
             case ConnectionProperties.USE_JDK_DEFAULT_SER:
                 useJdkDefaultSer = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.ENABLE_OR_OPT:
+                enableOrOpt = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.TX_ISOLATION:
+            case ConnectionProperties.TRANSACTION_ISOLATION:
+                String ret = parseValue(value, String.class, "REPEATABLE-READ");
+                try {
+                    isolation = IsolationLevel.parse(ret).getCode();
+                } catch (Throwable t) {
+                    //ignore
+                }
+                break;
+            case ConnectionProperties.FOREIGN_KEY_CHECKS:
+                foreignKeyChecks = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.ENABLE_XPROTO_RESULT_DECIMAL64:
+                enableXResultDecimal64 = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.ENABLE_COLUMNAR_DECIMAL64:
+                enableColumnarDecimal64 = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.MAX_CONNECTIONS:
+                maxConnections = parseValue(value, Integer.class, 20000);
+                break;
+            case ConnectionProperties.MAX_ALLOWED_PACKET:
+                maxAllowedPacket = parseValue(value, Integer.class, 16 * 1024 * 1024);
+                break;
+            case ConnectionProperties.PHYSICAL_DDL_MDL_WAITING_TIMEOUT:
+                phyiscalMdlWaitTimeout = parseValue(value, Integer.class, 15);
                 break;
             case ConnectionProperties.ENABLE_STATEMENTS_SUMMARY:
                 int enableStatementsSummary = parseValue(value, Boolean.class, true) ? 1 : 0;
@@ -175,7 +266,93 @@ public class DynamicConfig {
                 }
                 this.passwordCheckPattern = pattern;
                 break;
+            case ConnectionProperties.DEPRECATE_EOF:
+                deprecateEof = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.SLOW_TRANS_THRESHOLD:
+                slowTransThreshold = parseValue(value, Integer.class, 3000);
+                break;
+            case ConnectionProperties.TRANSACTION_STATISTICS_TASK_INTERVAL:
+                transactionStatisticsTaskInterval = parseValue(value, Integer.class, 5000);
+                break;
+            case ConnectionProperties.MAX_CACHED_SLOW_TRANS_STATS:
+                maxCachedSlowTransStats = parseValue(value, Integer.class, 1024 * 1024 / 10);
+                break;
+            case ConnectionProperties.ENABLE_X_PROTO_OPT_FOR_AUTO_SP:
+                xProtoOptForAutoSp = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.DATABASE_DEFAULT_SINGLE:
+                databaseDefaultSingle = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.ENABLE_2PC_OPT:
+                enable2pcOpt = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.COMPATIBLE_CHARSET_VARIABLES:
+                compatibleCharsetVariables = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.VERSION_PREFIX:
+                String versionPrefix = parseValue(value, String.class, null);
+                InstanceVersion.reloadVersion(versionPrefix);
+                break;
+            case ConnectionProperties.TRX_LOG_METHOD:
+                trxLogMethod = parseValue(value, Integer.class, 0);
+                break;
+            case ConnectionProperties.TRX_LOG_CLEAN_INTERVAL:
+                trxLogCleanInterval = parseValue(value, Integer.class, 30);
+                break;
+            case ConnectionProperties.SKIP_LEGACY_LOG_TABLE_CLEAN:
+                skipLegacyLogTableClean = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.WARM_UP_DB_PARALLELISM:
+                warmUpDbParallelism = parseValue(value, Integer.class, 1);
+                break;
+            case ConnectionProperties.WARM_UP_DB_INTERVAL:
+                warmUpDbInterval = parseValue(value, Long.class, 60L);
+                break;
+            case ConnectionProperties.MAX_PARTITION_NAME_LENGTH: {
+                int newPartNameLength = parseValue(value, Integer.class,
+                    Integer.valueOf(ConnectionParams.MAX_PARTITION_NAME_LENGTH.getDefault()));
+                /**
+                 * For protect partition meta. The max allowed length of (sub)partition name in metadb is 64
+                 * , but subpartName = partName+subpartTempName, so the max allowed length of partition name
+                 * should be 32.
+                 */
+                if (newPartNameLength > 32) {
+                    newPartNameLength = 32;
+                }
+                if (newPartNameLength < 0) {
+                    newPartNameLength = Integer.valueOf(ConnectionParams.MAX_PARTITION_NAME_LENGTH.getDefault());
+                }
+                maxPartitionNameLength = newPartNameLength;
+
+            }
+            break;
+            case ConnectionProperties.ENABLE_HLL:
+                enableHll = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.ENABLE_TRX_EVENT_LOG:
+                enableTrxEventLog = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.ENABLE_TRX_DEBUG_MODE:
+                enableTrxDebugMode = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.ENABLE_MQ_CACHE_COST_BY_THREAD:
+                enableMQCacheByThread = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.INSTANCE_READ_ONLY:
+                instanceReadOnly = parseValue(value, Boolean.class, false);
+                break;
+            case ConnectionProperties.ENABLE_1PC_OPT:
+                enable1PcOpt = parseValue(value, Boolean.class, true);
+                break;
+            case ConnectionProperties.MIN_SNAPSHOT_KEEP_TIME:
+                minSnapshotKeepTime = parseValue(value, Integer.class, 5 * 60 * 1000);
+                break;
+            case ConnectionProperties.FORBID_AUTO_COMMIT_TRX:
+                forbidAutoCommitTrx = parseValue(value, Boolean.class, false);
+                break;
             default:
+                FileConfig.getInstance().loadValue(logger, key, value);
                 break;
             }
         }
@@ -198,7 +375,7 @@ public class DynamicConfig {
     }
 
     private static final long xprotoMaxDnWaitConnectionDefault =
-        parseValue(ConnectionParams.XPROTO_MAX_DN_WAIT_CONNECTION.getDefault(), Long.class, 32L);
+        parseValue(ConnectionParams.XPROTO_MAX_DN_WAIT_CONNECTION.getDefault(), Long.class, 100L);
     private volatile long xprotoMaxDnWaitConnection = xprotoMaxDnWaitConnectionDefault;
 
     public long getXprotoMaxDnWaitConnection() {
@@ -231,12 +408,44 @@ public class DynamicConfig {
         return xprotoGalaxyPrepare;
     }
 
+    private static final int xprotoFlowControlSizeKbDefault =
+        parseValue(ConnectionParams.XPROTO_FLOW_CONTROL_SIZE_KB.getDefault(), Integer.class, 10240);
+    private volatile int xprotoFlowControlSizeKb = xprotoFlowControlSizeKbDefault;
+
+    public int getXprotoFlowControlSizeKb() {
+        return xprotoFlowControlSizeKb;
+    }
+
+    private static final int xprotoTcpAgingDefault =
+        parseValue(ConnectionParams.XPROTO_TCP_AGING.getDefault(), Integer.class, 28800);
+    private volatile int xprotoTcpAging = xprotoTcpAgingDefault;
+
+    public int getXprotoTcpAging() {
+        return xprotoTcpAging;
+    }
+
     private static final long autoPartitionPartitionsDefault =
         parseValue(ConnectionParams.AUTO_PARTITION_PARTITIONS.getDefault(), Long.class, 64L);
     private volatile long autoPartitionPartitions = autoPartitionPartitionsDefault;
 
-    public long getAutoPartitionPartitions() {
-        return autoPartitionPartitions;
+    private static final long autoPartitionCciPartitionsDefault =
+        parseValue(ConnectionParams.COLUMNAR_DEFAULT_PARTITIONS.getDefault(), Long.class, 64L);
+    private volatile long autoPartitionCciPartitions = autoPartitionCciPartitionsDefault;
+
+    private static final float blockCacheMemoryFactorDefault =
+        parseValue(ConnectionParams.BLOCK_CACHE_MEMORY_SIZE_FACTOR.getDefault(), Float.class, 0.6f);
+    private volatile float blockCacheMemoryFactor = blockCacheMemoryFactorDefault;
+
+    public float getBlockCacheMemoryFactor() {
+        return blockCacheMemoryFactor;
+    }
+
+    public long getAutoPartitionPartitions(boolean isColumnar) {
+        return isColumnar ? autoPartitionCciPartitions : autoPartitionPartitions;
+    }
+
+    public long getAutoPartitionCciPartitions() {
+        return autoPartitionCciPartitions;
     }
 
     private volatile int delayThreshold = 3;
@@ -245,13 +454,38 @@ public class DynamicConfig {
         return delayThreshold;
     }
 
+    private volatile boolean enableOptimizerAlert = true;
+
+    public boolean optimizerAlert() {
+        return enableOptimizerAlert;
+    }
+
+    private volatile boolean enableOptimizerAlertLog = true;
+
+    public boolean optimizerAlertLog() {
+        return enableOptimizerAlertLog;
+    }
+
+    // default 10 min
+    private volatile long optimizerAlertLogInterval = 10 * 60 * 1000;
+
+    public long getOptimizerAlertLogInterval() {
+        return optimizerAlertLogInterval;
+    }
+
+    private volatile int tpSlowAlertThreshold = 10;
+
+    public int getTpSlowAlertThreshold() {
+        return tpSlowAlertThreshold;
+    }
+
     private volatile int busyThreshold = 100;
 
     public int getBusyThreshold() {
         return busyThreshold;
     }
 
-    private volatile int groupingTimeout = 1000;
+    private volatile int groupingTimeout = 3000;
 
     public int getGroupingTimeout() {
         return groupingTimeout;
@@ -271,8 +505,14 @@ public class DynamicConfig {
 
     private volatile boolean enableTransLog = true;
 
+    private volatile boolean enableTransactionStatistics = true;
+
     public boolean isEnableTransLog() {
         return enableTransLog;
+    }
+
+    public boolean isEnableTransactionStatistics() {
+        return enableTransactionStatistics;
     }
 
     private volatile boolean enableCreateGroupDataSource = false;
@@ -285,6 +525,12 @@ public class DynamicConfig {
 
     public boolean enablePlanTypeDigest() {
         return enablePlanTypeDigest;
+    }
+
+    private volatile boolean enablePlanTypeDigestStrictMode = false;
+
+    public boolean enablePlanTypeDigestStrictMode() {
+        return enablePlanTypeDigestStrictMode;
     }
 
     private volatile long purgeHistoryMs = 10 * 60 * 1000L;
@@ -319,6 +565,12 @@ public class DynamicConfig {
         return enableBindType;
     }
 
+    private volatile boolean enableBindCollate = false;
+
+    public boolean enableBindCollate() {
+        return enableBindCollate;
+    }
+
     private volatile boolean enableClearFailedPlan = true;
 
     public boolean enableClearFailedPlan() {
@@ -337,13 +589,58 @@ public class DynamicConfig {
         return useJdkDefaultSer;
     }
 
+    private volatile boolean enableXResultDecimal64 = false;
+
+    public boolean enableXResultDecimal64() {
+        return enableXResultDecimal64;
+    }
+
+    private volatile boolean enableColumnarDecimal64 = true;
+
+    public boolean enableColumnarDecimal64() {
+        return enableColumnarDecimal64;
+    }
+
+    private volatile boolean enableOrOpt = true;
+
+    public boolean useOrOpt() {
+        return enableOrOpt;
+    }
+
+    private volatile boolean enableHll = true;
+
+    public boolean enableHll() {
+        return enableHll;
+    }
+
+    private volatile boolean enableMQCacheByThread = true;
+
+    public boolean isEnableMQCacheByThread() {
+        return enableMQCacheByThread;
+    }
+
+    private volatile int inDegradationNum =
+        parseValue(ConnectionParams.STATISTIC_IN_DEGRADATION_NUMBER.getDefault(), Integer.class, 100);
+
+    public int getInDegradationNum() {
+        return inDegradationNum;
+    }
+
     private static final int maxSessionPreparedStmtCountDefault =
-        parseValue(ConnectionParams.MAX_SESSION_PREPARED_STMT_COUNT.getDefault(), Integer.class, 100);
+        parseValue(ConnectionParams.MAX_SESSION_PREPARED_STMT_COUNT.getDefault(), Integer.class, 256);
 
     private volatile int maxSessionPreparedStmtCount = maxSessionPreparedStmtCountDefault;
 
     public int getMaxSessionPreparedStmtCount() {
         return maxSessionPreparedStmtCount;
+    }
+
+    private static final boolean enableAutoUseRangeForTimeIndexDefault =
+        parseValue(ConnectionParams.ENABLE_AUTO_USE_RANGE_FOR_TIME_INDEX.getDefault(), Boolean.class, true);
+    private volatile boolean enableAutoUseRangeForTimeIndex = enableAutoUseRangeForTimeIndexDefault;
+
+    public boolean isEnableAutoUseRangeForTimeIndex() {
+        return enableAutoUseRangeForTimeIndex;
     }
 
     private static final String DEFAULT_PASSWORD_CHECK_PATTERN_STR = "^[0-9A-Za-z!@#$%^&*()_+=-]{6,32}$";
@@ -359,10 +656,248 @@ public class DynamicConfig {
         return DEFAULT_PASSWORD_CHECK_PATTERN_STR.equals(passwordCheckPattern.pattern());
     }
 
+    private volatile boolean deprecateEof = true;
+
+    public boolean enableDeprecateEof() {
+        return deprecateEof;
+    }
+
     private volatile boolean supportFollowRead = false;
 
     public boolean enableFollowReadForPolarDBX() {
         return supportFollowRead;
+    }
+
+    /**
+     * Slow transaction threshold, unit: microsecond, default 3s.
+     */
+    private volatile long slowTransThreshold = 3000;
+
+    public long getSlowTransThreshold() {
+        return slowTransThreshold;
+    }
+
+    /**
+     * Foreign key checks, default true.
+     */
+    private volatile boolean foreignKeyChecks = true;
+
+    public boolean getForeignKeyChecks() {
+        return foreignKeyChecks;
+    }
+
+    /**
+     * Interval of task collecting slow transaction statistics, default 5s.
+     */
+    private volatile long transactionStatisticsTaskInterval = 5000;
+
+    public long getTransactionStatisticsTaskInterval() {
+        return transactionStatisticsTaskInterval;
+    }
+
+    /**
+     * Consume at most 16 MB memory. (approximate 160 Bytes per object.)
+     */
+    private volatile long maxCachedSlowTransStats = 1024 * 1024 / 10;
+
+    public long getMaxCachedSlowTransStats() {
+        return maxCachedSlowTransStats;
+    }
+
+    private volatile int isolation = 4;
+
+    public int getTxIsolation() {
+        return isolation;
+    }
+
+    private volatile boolean xProtoOptForAutoSp = false;
+
+    public boolean enableXProtoOptForAutoSp() {
+        return xProtoOptForAutoSp;
+    }
+
+    private volatile boolean enableRemoteConsumeLog = false;
+
+    public boolean enableRemoteConsumeLog() {
+        return enableRemoteConsumeLog;
+    }
+
+    private volatile int consumeLogBatchSize = 1000;
+
+    public int consumeLogBatchSize() {
+        return consumeLogBatchSize;
+    }
+
+    private volatile boolean enableRecordSql = true;
+
+    public boolean enableRecordSql() {
+        return enableRecordSql;
+    }
+
+    private volatile boolean databaseDefaultSingle = false;
+
+    public boolean isDatabaseDefaultSingle() {
+        return databaseDefaultSingle;
+    }
+
+    private volatile boolean compatibleCharsetVariables = false;
+
+    public boolean isCompatibleCharsetVariables() {
+        return compatibleCharsetVariables;
+    }
+
+    private volatile ConfigDataMode.LearnerMode learnerMode = ConfigDataMode.LearnerMode.ONLY_READ;
+
+    public ConfigDataMode.LearnerMode learnerMode() {
+        return learnerMode;
+    }
+
+    private volatile boolean enable2pcOpt = false;
+
+    public boolean isEnable2pcOpt() {
+        return enable2pcOpt;
+    }
+
+    //---------------  the followed setting is for test -------------------
+    private boolean supportSingleDbMultiTbs = false;
+    private boolean supportRemoveDdl = false;
+    private boolean supportDropAutoSeq = false;
+    private boolean allowSimpleSequence = false;
+
+    public boolean isSupportSingleDbMultiTbs() {
+        return supportSingleDbMultiTbs;
+    }
+
+    public void setSupportSingleDbMultiTbs(boolean supportSingleDbMultiTbs) {
+        this.supportSingleDbMultiTbs = supportSingleDbMultiTbs;
+    }
+
+    public boolean isSupportRemoveDdl() {
+        return supportRemoveDdl;
+    }
+
+    public void setSupportRemoveDdl(boolean supportRemoveDdl) {
+        this.supportRemoveDdl = supportRemoveDdl;
+    }
+
+    public boolean isSupportDropAutoSeq() {
+        return supportDropAutoSeq;
+    }
+
+    public void setSupportDropAutoSeq(boolean supportDropAutoSeq) {
+        this.supportDropAutoSeq = supportDropAutoSeq;
+    }
+
+    public boolean isAllowSimpleSequence() {
+        return allowSimpleSequence;
+    }
+
+    public void setAllowSimpleSequence(boolean allowSimpleSequence) {
+        this.allowSimpleSequence = allowSimpleSequence;
+    }
+
+    private volatile int trxLogMethod = 0;
+
+    public int getTrxLogMethod() {
+        return trxLogMethod;
+    }
+
+    private volatile long trxLogCleanInterval = 30;
+
+    public long getTrxLogCleanInterval() {
+        return trxLogCleanInterval;
+    }
+
+    private volatile boolean skipLegacyLogTableClean = false;
+
+    public boolean isSkipLegacyLogTableClean() {
+        return skipLegacyLogTableClean;
+    }
+
+    private volatile int warmUpDbParallelism = 1;
+
+    public int getWarmUpDbParallelism() {
+        return warmUpDbParallelism < 0 ? 1 : warmUpDbParallelism;
+    }
+
+    private String columnarOssDirectory;
+
+    public String getColumnarOssDirectory() {
+        return columnarOssDirectory;
+    }
+
+    public void setColumnarOssDirectory(String columnarOssDirectory) {
+        this.columnarOssDirectory = columnarOssDirectory;
+    }
+
+    /**
+     * Default 60s.
+     */
+    private volatile long warmUpDbInterval = 60;
+
+    public long getWarmUpDbInterval() {
+        return warmUpDbInterval;
+    }
+
+    public int maxPartitionNameLength = Integer.valueOf(ConnectionParams.MAX_PARTITION_NAME_LENGTH.getDefault());
+
+    public int getMaxPartitionNameLength() {
+        return maxPartitionNameLength;
+    }
+
+    private volatile int maxConnections = 20000;
+
+    public int getMaxConnections() {
+        return maxConnections;
+    }
+
+    private volatile int maxAllowedPacket = 16 * 1024 * 1024;
+
+    public int getMaxAllowedPacket() {
+        return maxAllowedPacket;
+    }
+
+    private volatile boolean enableTrxEventLog = true;
+
+    public boolean isEnableTrxEventLog() {
+        return enableTrxEventLog;
+    }
+
+    private volatile boolean enableTrxDebugMode = false;
+
+    public boolean isEnableTrxDebugMode() {
+        return enableTrxDebugMode;
+    }
+
+    private volatile int phyiscalMdlWaitTimeout = 15;
+
+    public int getPhyiscalMdlWaitTimeout() {
+        return phyiscalMdlWaitTimeout;
+    }
+
+    private volatile boolean instanceReadOnly = false;
+
+    public boolean isInstanceReadOnly() {
+        return instanceReadOnly;
+    }
+
+    private volatile boolean enable1PcOpt = true;
+
+    public boolean isEnable1PcOpt() {
+        return enable1PcOpt;
+    }
+
+    // 5 min.
+    private volatile long minSnapshotKeepTime = 5 * 60 * 1000;
+
+    public long getMinSnapshotKeepTime() {
+        return minSnapshotKeepTime;
+    }
+
+    private volatile boolean forbidAutoCommitTrx = false;
+
+    public boolean isForbidAutoCommitTrx() {
+        return forbidAutoCommitTrx;
     }
 
     public static <T> T parseValue(String value, Class<T> type, T defaultValue) {
@@ -380,6 +915,8 @@ public class DynamicConfig {
             return (T) (Double.valueOf(value));
         } else if (type == Boolean.class) {
             return (T) (Boolean.valueOf(value));
+        } else if (type == ConfigDataMode.LearnerMode.class) {
+            return (T) (ConfigDataMode.LearnerMode.nameOf(value));
         } else {
             return defaultValue;
         }

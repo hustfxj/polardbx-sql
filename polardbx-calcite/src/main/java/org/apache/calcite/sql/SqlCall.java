@@ -16,10 +16,6 @@
  */
 package org.apache.calcite.sql;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
@@ -30,7 +26,12 @@ import org.apache.calcite.sql.validate.SqlMonotonicity;
 import org.apache.calcite.sql.validate.SqlValidator;
 import org.apache.calcite.sql.validate.SqlValidatorImpl;
 import org.apache.calcite.sql.validate.SqlValidatorScope;
+import org.apache.calcite.util.EqualsContext;
 import org.apache.calcite.util.Litmus;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 
 /**
  * A <code>SqlCall</code> is a call to an {@link SqlOperator operator}.
@@ -190,7 +191,7 @@ public abstract class SqlCall extends SqlNode {
     return visitor.visit(this);
   }
 
-  public boolean equalsDeep(SqlNode node, Litmus litmus) {
+  public boolean equalsDeep(SqlNode node, Litmus litmus, EqualsContext context) {
     if (node == this) {
       return true;
     }
@@ -205,7 +206,7 @@ public abstract class SqlCall extends SqlNode {
     if (!this.getOperator().getName().equalsIgnoreCase(that.getOperator().getName())) {
       return litmus.fail("{} != {}", this, node);
     }
-    return equalDeep(this.getOperandList(), that.getOperandList(), litmus);
+    return equalDeep(this.getOperandList(), that.getOperandList(), litmus, context);
   }
 
   /**
@@ -252,6 +253,17 @@ public abstract class SqlCall extends SqlNode {
     return false;
   }
 
+  public boolean isCountLiteral() {
+    if (getOperator().isName("COUNT") && operandCount() == 1) {
+      final SqlNode parm = operand(0);
+      if (parm instanceof SqlNumericLiteral) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   /**
    * Test to see if it is the function CHECK_SUM(*)
    *
@@ -259,6 +271,24 @@ public abstract class SqlCall extends SqlNode {
    */
   public boolean isCheckSumStar() {
     if (getOperator().isName("CHECK_SUM") && operandCount() == 1) {
+      final SqlNode parm = operand(0);
+      if (parm instanceof SqlIdentifier) {
+        SqlIdentifier id = (SqlIdentifier) parm;
+        if (id.isStar() && id.names.size() == 1) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Test to see if it is the function CHECK_SUM_V2(*)
+   *
+   * @return boolean true if function call to CHECK_SUM_V2(*)
+   */
+  public boolean isCheckSumV2Star() {
+    if (getOperator().isName("CHECK_SUM_V2") && operandCount() == 1) {
       final SqlNode parm = operand(0);
       if (parm instanceof SqlIdentifier) {
         SqlIdentifier id = (SqlIdentifier) parm;

@@ -23,7 +23,6 @@ import com.alibaba.polardbx.common.utils.time.core.TimeStorage;
 import com.alibaba.polardbx.executor.chunk.LongBlock;
 import com.alibaba.polardbx.executor.chunk.MutableChunk;
 import com.alibaba.polardbx.executor.chunk.RandomAccessBlock;
-import com.alibaba.polardbx.executor.vectorized.EvaluationContext;
 import com.google.common.base.Preconditions;
 import org.apache.commons.lang.StringUtils;
 
@@ -191,6 +190,27 @@ public class VectorizedExpressionUtils {
         }
     }
 
+    public static int intersect(int[] sel1, int sel1Size, int[] sel2, int sel2Size, int[] result) {
+        Preconditions.checkArgument(sel1 != null && sel1Size >= 0);
+        Preconditions.checkArgument(sel2 != null && sel2Size >= 0);
+
+        int sel1Index = 0, sel2Index = 0, resultIndex = 0;
+        while (sel1Index < sel1Size && sel2Index < sel2Size) {
+            if (sel1[sel1Index] < sel2[sel2Index]) {
+                sel1Index++;
+            } else if (sel1[sel1Index] > sel2[sel2Index]) {
+                sel2Index++;
+            } else {
+                result[resultIndex] = sel2[sel2Index];
+                resultIndex++;
+                sel2Index++;
+                sel1Index++;
+            }
+        }
+
+        return resultIndex;
+    }
+
     /**
      * Remove (subtract) members from an array and produce the results into
      * a difference array.
@@ -252,6 +272,10 @@ public class VectorizedExpressionUtils {
         return builder.toString();
     }
 
+    public static boolean isConstantExpression(VectorizedExpression vectorizedExpression) {
+        return VectorizedExpressionConstantFinder.INSTANCE.visit(vectorizedExpression, 0);
+    }
+
     private static class VectorizedExpressionPrinter {
         private static String PREFIX = StringUtils.repeat(" ", 3);
 
@@ -274,6 +298,7 @@ public class VectorizedExpressionUtils {
                 builder.append("└ ");
             }
 
+            VectorizedExpression folded = null;
             if (expression instanceof BuiltInFunctionVectorizedExpression) {
                 builder
                     .append("[BuiltIn].")
@@ -284,14 +309,57 @@ public class VectorizedExpressionUtils {
             } else {
                 builder.append(expression.getClass().getSimpleName());
             }
+
+            if (expression instanceof LiteralVectorizedExpression) {
+                folded = ((LiteralVectorizedExpression) expression).getFolded();
+            }
+
             builder.append(", { ");
             String outputDataType = expression.getOutputDataType() == null ? "[Filter]" :
                 expression.getOutputDataType().getClass().getSimpleName();
             builder
-                .append(outputDataType).append(", ")
-                .append(expression.getOutputIndex()).append(" }\n");
+                .append(outputDataType)
+                .append(", ")
+                .append(expression.getOutputIndex())
+                .append(" }")
+                .append(folded != null ? "[constant fold]" : "")
+                .append("\n");
+
+            if (folded != null) {
+                visit(folded, level + 1, builder);
+            }
 
             return builder.toString();
+        }
+    }
+
+    private static class VectorizedExpressionConstantFinder {
+        static final VectorizedExpressionConstantFinder INSTANCE = new VectorizedExpressionConstantFinder();
+
+        private static final int MAX_LEVEL = 1 << 10;
+
+        public boolean visit(VectorizedExpression expression, int level) {
+            if (level >= MAX_LEVEL) {
+                // prevent from stack overflow.
+                return false;
+            }
+            boolean hasNoInputRef = true;
+
+            VectorizedExpression[] children = expression.getChildren();
+
+            if (children == null || children.length == 0) {
+                // leaf node.
+                return !(expression instanceof InputRefVectorizedExpression);
+            }
+
+            for (int i = 0; i < children.length; i++) {
+                hasNoInputRef &= visit(children[i], level + 1);
+                if (!hasNoInputRef) {
+                    // short-circuit
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
@@ -300,12 +368,14 @@ public class VectorizedExpressionUtils {
         getInputIndex(vectorizedExpression, inputIndex);
         return inputIndex;
     }
+
     public static void getInputIndex(VectorizedExpression vectorizedExpression, List<Integer> inputIndex) {
         VectorizedExpression[] children = vectorizedExpression.getChildren();
         if (children == null || children.length == 0) {
             inputIndex.add(vectorizedExpression.getOutputIndex());
             return;
         }
+
         for (int i = 0; i < children.length; i++) {
             getInputIndex(children[i], inputIndex);
         }

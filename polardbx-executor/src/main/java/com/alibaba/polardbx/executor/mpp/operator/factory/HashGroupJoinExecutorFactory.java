@@ -21,7 +21,7 @@ import com.alibaba.polardbx.executor.operator.HashGroupJoinExec;
 import com.alibaba.polardbx.executor.operator.util.AggregateUtils;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
-import com.alibaba.polardbx.executor.calc.Aggregator;
+import com.alibaba.polardbx.optimizer.core.expression.calc.Aggregator;
 import com.alibaba.polardbx.optimizer.core.expression.calc.IExpression;
 import com.alibaba.polardbx.optimizer.core.join.EquiJoinKey;
 import com.alibaba.polardbx.optimizer.core.join.EquiJoinUtils;
@@ -30,19 +30,12 @@ import com.alibaba.polardbx.optimizer.memory.MemoryAllocatorCtx;
 import com.alibaba.polardbx.optimizer.utils.CalciteUtils;
 import com.alibaba.polardbx.optimizer.utils.RexUtils;
 import com.alibaba.polardbx.statistics.RuntimeStatHelper;
-import org.apache.calcite.rel.core.AggregateCall;
-import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.util.ImmutableBitSet;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
-
-import static com.alibaba.polardbx.executor.mpp.operator.factory.HashAggExecutorFactory.MAX_HASH_TABLE_SIZE;
-import static com.alibaba.polardbx.executor.mpp.operator.factory.HashAggExecutorFactory.MIN_HASH_TABLE_SIZE;
-import static com.alibaba.polardbx.executor.mpp.operator.factory.HashAggExecutorFactory.convertFrom;
 
 public class HashGroupJoinExecutorFactory extends ExecutorFactory {
 
@@ -90,47 +83,24 @@ public class HashGroupJoinExecutorFactory extends ExecutorFactory {
     private synchronized List<Executor> createAllExecutor(ExecutionContext context) {
         if (executors.isEmpty()) {
 
-            Integer expectedOutputRowCount = rowCount / (taskNumber * parallelism);
-            if (expectedOutputRowCount == null) {
-                expectedOutputRowCount = MIN_HASH_TABLE_SIZE;
-            } else if (expectedOutputRowCount > MAX_HASH_TABLE_SIZE) {
-                expectedOutputRowCount = MAX_HASH_TABLE_SIZE;
-            } else if (expectedOutputRowCount < MIN_HASH_TABLE_SIZE) {
-                expectedOutputRowCount = MIN_HASH_TABLE_SIZE;
-            }
+            int expectedOutputRowCount = rowCount / (taskNumber * parallelism);
+            int estimateHashTableSize = AggregateUtils.estimateHashTableSize(expectedOutputRowCount, context);
 
             ImmutableBitSet gp = hashAggJoin.getGroupSet();
-            int[] groups = convertFrom(gp);
+            int[] groups = AggregateUtils.convertBitSet(gp);
 
             for (int i = 0; i < parallelism; i++) {
                 final Executor outerInput = getInputs().get(0).createExecutor(context, i);
                 final Executor innerInput = getInputs().get(1).createExecutor(context, i);
                 IExpression otherCondition = convertExpression(otherCond, context);
 
-                List<AggregateCall> aggCalls = new ArrayList<>(hashAggJoin.getAggCallList());
-                if (hashAggJoin.getJoinType() != JoinRelType.RIGHT) {
-                    int offset = outerInput.getDataTypes().size();
-                    for (int j = 0; j < aggCalls.size(); ++j) {
-                        List<Integer> aggIndexInProbeChunk =
-                            aggCalls.get(j).getArgList().stream().map(t -> t - offset).collect(Collectors.toList());
-                        aggCalls.set(j, aggCalls.get(j).copy(aggIndexInProbeChunk));
-                    }
-                }
-
                 List<EquiJoinKey> joinKeys = EquiJoinUtils
                     .buildEquiJoinKeys(hashAggJoin, hashAggJoin.getOuter(), hashAggJoin.getInner(), (RexCall) equalCond,
                         hashAggJoin.getJoinType());
 
                 MemoryAllocatorCtx memoryAllocator = context.getMemoryPool().getMemoryAllocatorCtx();
-                List<DataType> dataTypes = new ArrayList<DataType>() {
-                    {
-                        addAll(innerInput.getDataTypes());
-                    }
-                };
                 List<Aggregator> aggregators =
-                    AggregateUtils.convertAggregators(dataTypes,
-                        outputDataTypes.subList(groups.length, groups.length + aggCalls.size()),
-                        aggCalls, context, memoryAllocator);
+                    AggregateUtils.convertAggregators(hashAggJoin.getAggCallList(), context, memoryAllocator);
 
                 Executor exec =
                     new HashGroupJoinExec(outerInput, innerInput, hashAggJoin.getJoinType(),
@@ -139,12 +109,9 @@ public class HashGroupJoinExecutorFactory extends ExecutorFactory {
                         maxOneRow,
                         joinKeys, otherCondition, null, groups, aggregators,
                         context,
-                        expectedOutputRowCount
+                        estimateHashTableSize
                     );
-                exec.setId(hashAggJoin.getRelatedId());
-                if (context.getRuntimeStatistics() != null) {
-                    RuntimeStatHelper.registerStatForExec(hashAggJoin, exec, context);
-                }
+                registerRuntimeStat(exec, hashAggJoin, context);
                 executors.add(exec);
             }
         }

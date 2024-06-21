@@ -23,12 +23,10 @@ import com.alibaba.polardbx.executor.ddl.job.task.util.TaskName;
 import com.alibaba.polardbx.executor.sync.SyncManagerHelper;
 import com.alibaba.polardbx.executor.sync.TableMetaChangeSyncAction;
 import com.alibaba.polardbx.executor.utils.failpoint.FailPoint;
-import com.alibaba.polardbx.gms.metadb.record.SystemTableRecord;
 import com.alibaba.polardbx.gms.metadb.seq.SequenceBaseRecord;
 import com.alibaba.polardbx.gms.metadb.table.TableInfoManager;
-import com.alibaba.polardbx.optimizer.OptimizerContext;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
-import com.alibaba.polardbx.optimizer.planmanager.PlanManager;
 import lombok.Getter;
 
 import java.sql.Connection;
@@ -58,7 +56,6 @@ public class ShowTableMetaTask extends BaseGmsTask {
 
         FailPoint.injectRandomExceptionFromHint(executionContext);
         FailPoint.injectRandomSuspendFromHint(executionContext);
-        PlanManager.getInstance().invalidateCacheBySchema(schemaName);
     }
 
     @Override
@@ -73,7 +70,7 @@ public class ShowTableMetaTask extends BaseGmsTask {
         FailPoint.injectRandomExceptionFromHint(executionContext);
         FailPoint.injectRandomSuspendFromHint(executionContext);
         //sync have to be successful to continue
-        SyncManagerHelper.sync(new TableMetaChangeSyncAction(schemaName, logicalTableName));
+        SyncManagerHelper.sync(new TableMetaChangeSyncAction(schemaName, logicalTableName), SyncScope.ALL);
     }
 }
 

@@ -170,7 +170,7 @@ public class SequenceAccessor extends AbstractAccessor {
 
     public int update(SequenceRecord record) {
         try {
-            String value = record.value > 0 ? "'" + record.value + "'" : "value";
+            String value = record.value >= 0 ? "'" + record.value + "'" : "value";
             Map<Integer, ParameterContext> params =
                 MetaDbUtil.buildStringParameters(new String[] {record.schemaName, record.name});
             return MetaDbUtil.update(String.format(UPDATE_SEQ_TABLE_VALUE, value), params, connection);
@@ -196,6 +196,11 @@ public class SequenceAccessor extends AbstractAccessor {
                 SEQ_TABLE,
                 e.getMessage());
         }
+    }
+
+    public boolean checkIfExists(String schemaName, String name) {
+        SequenceRecord record = query(schemaName, name);
+        return record != null;
     }
 
     public int updateStatus(SequenceRecord record) {

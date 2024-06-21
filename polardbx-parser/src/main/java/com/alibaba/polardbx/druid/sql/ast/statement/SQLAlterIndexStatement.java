@@ -37,7 +37,10 @@ public class SQLAlterIndexStatement extends SQLStatementImpl implements SQLAlter
     private Rebuild rebuild;
     private SQLExpr parallel;
     private List<SQLAssignItem> partitions = new ArrayList<SQLAssignItem>();
-    protected SQLPartitionBy    dbPartitionBy;
+    protected SQLPartitionBy dbPartitionBy;
+    protected SQLPartitionBy partitionBy;
+    //implicit tablegroup
+    private SQLName tableGroup;
 
     @Override
     public void accept0(SQLASTVisitor visitor) {
@@ -166,5 +169,21 @@ public class SQLAlterIndexStatement extends SQLStatementImpl implements SQLAlter
             x.setParent(this);
         }
         this.dbPartitionBy = x;
+    }
+
+    public SQLPartitionBy getPartitionBy() {
+        return partitionBy;
+    }
+
+    public void setPartitionBy(SQLPartitionBy partitionBy) {
+        this.partitionBy = partitionBy;
+    }
+
+    public SQLName getTableGroup() {
+        return tableGroup;
+    }
+
+    public void setTableGroup(SQLName tableGroup) {
+        this.tableGroup = tableGroup;
     }
 }

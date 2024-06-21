@@ -17,7 +17,6 @@
 package com.alibaba.polardbx.executor.sync;
 
 import com.alibaba.polardbx.atom.CacheVariables;
-import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.executor.cursor.ResultCursor;
 import com.alibaba.polardbx.executor.pl.ProcedureManager;
@@ -29,7 +28,11 @@ import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager;
 import com.alibaba.polardbx.optimizer.config.table.statistic.inf.SystemTableColumnStatistic;
 import com.alibaba.polardbx.optimizer.config.table.statistic.inf.SystemTableTableStatistic;
+import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
+import com.alibaba.polardbx.optimizer.core.expression.JavaFunctionManager;
 import com.alibaba.polardbx.optimizer.view.SystemTableView;
+
+import java.util.Optional;
 
 public class ReloadSyncAction implements ISyncAction {
 
@@ -52,9 +55,8 @@ public class ReloadSyncAction implements ISyncAction {
             switch (type) {
             case SCHEMA:
                 OptimizerContext.getContext(schemaName).getLatestSchemaManager().invalidateAll();
+                GsiMetaManager.invalidateCache(schemaName);
                 SystemTableTableStatistic.invalidateAll();
-                // TODO yuehan check this
-//                SystemTableColumnStatistic.invalidateAll();
                 SystemTableView.invalidateAll();
                 OptimizerContext.getContext(schemaName).getVariableManager().invalidateAll();
                 CacheVariables.invalidateAll();
@@ -65,18 +67,28 @@ public class ReloadSyncAction implements ISyncAction {
                 CacheVariables.invalidateAll();
                 break;
             case USERS:
-                // 触发一次刷新
-                ConfigDataMode.setRefreshConfigTimestamp(System.currentTimeMillis() + 5 * 1000);
-                break;
-            case PROCEDURES:
-                ProcedureManager.getInstance().reload();
                 break;
             case FILESTORAGE:
                 // reset rate-limiter of oss file system
                 FileSystemManager.resetRate();
                 break;
+            case PROCEDURES:
+                ProcedureManager.getInstance().reload();
+                break;
             case FUNCTIONS:
                 StoredFunctionManager.getInstance().reload();
+                break;
+            case JAVA_FUNCTIONS:
+                JavaFunctionManager.getInstance().reload();
+                break;
+            case STATISTICS:
+                StatisticManager.getInstance().clearAndReloadData();
+                break;
+
+            case COLUMNARMANAGER:
+                Optional
+                    .ofNullable(ExecutorContext.getContext(schemaName))
+                    .ifPresent(ExecutorContext::reloadColumnarManager);
                 break;
             default:
                 break;

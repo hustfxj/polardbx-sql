@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.executor.ddl.job.factory;
 
+import com.alibaba.polardbx.common.ddl.foreignkey.ForeignKeyData;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.properties.ConnectionProperties;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
@@ -23,29 +24,40 @@ import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
 import com.alibaba.polardbx.executor.ddl.job.factory.util.FactoryUtils;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateArchiveTableEventLogTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateEntitySecurityAttrTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreatePartitionTableValidateTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableAddTablesMetaTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableAddTablesPartitionInfoMetaTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableGroupAddMetaTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableGroupValidateTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTablePhyDdlTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableShowTableMetaTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.InsertIntoTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.SubJobTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.TableSyncTask;
 import com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcDdlMarkTask;
+import com.alibaba.polardbx.executor.ddl.job.task.tablegroup.TableGroupsSyncTask;
+import com.alibaba.polardbx.executor.ddl.newengine.job.DdlExceptionAction;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
 import com.alibaba.polardbx.executor.ddl.newengine.job.wrapper.ExecutableDdlJob4CreatePartitionTable;
+import com.alibaba.polardbx.executor.ddl.newengine.job.wrapper.ExecutableDdlJob4CreateSelect;
 import com.alibaba.polardbx.gms.partition.TablePartRecordInfoContext;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupConfig;
+import com.alibaba.polardbx.gms.tablegroup.TableGroupDetailConfig;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupRecord;
 import com.alibaba.polardbx.gms.util.TableGroupNameUtil;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.CreateTablePreparedData;
-import com.alibaba.polardbx.optimizer.partition.LocalPartitionDefinitionInfo;
+import com.alibaba.polardbx.optimizer.core.rel.ddl.data.LikeTableInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
+import com.alibaba.polardbx.optimizer.partition.common.LocalPartitionDefinitionInfo;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.statistics.SQLRecorderLogger;
 import com.google.common.collect.Lists;
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 
 import java.util.ArrayList;
@@ -70,10 +82,14 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
     private PartitionInfo partitionInfo;
 
     public CreatePartitionTableJobFactory(boolean autoPartition, boolean hasTimestampColumnDefault,
-                                          Map<String, String> binaryColumnDefaultValues,
+                                          Map<String, String> specialDefaultValues,
+                                          Map<String, Long> specialDefaultValueFlags,
+                                          List<ForeignKeyData> addedForeignKeys,
                                           PhysicalPlanData physicalPlanData, ExecutionContext executionContext,
-                                          CreateTablePreparedData preparedData, PartitionInfo partitionInfo) {
-        super(autoPartition, hasTimestampColumnDefault, binaryColumnDefaultValues, physicalPlanData, executionContext);
+                                          CreateTablePreparedData preparedData, PartitionInfo partitionInfo,
+                                          LikeTableInfo likeTableInfo) {
+        super(autoPartition, hasTimestampColumnDefault, specialDefaultValues, specialDefaultValueFlags,
+            addedForeignKeys, physicalPlanData, preparedData.getDdlVersionId(), executionContext, likeTableInfo);
         this.preparedData = preparedData;
         this.partitionInfo = partitionInfo;
     }
@@ -84,55 +100,70 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
 
     @Override
     protected void excludeResources(Set<String> resources) {
-        if (isNeedToGetCreateTableGroupLock(true)) {
+        if (!preparedData.isWithImplicitTableGroup() && isNeedToGetCreateTableGroupLock(true)) {
             resources.add(concatWithDot(schemaName, ConnectionProperties.ACQUIRE_CREATE_TABLE_GROUP_LOCK));
             executionContext.getExtraCmds().put(ConnectionParams.ACQUIRE_CREATE_TABLE_GROUP_LOCK.getName(), false);
-        } else {
-            super.excludeResources(resources);
-            boolean isSigleTable = false;
-            boolean isBroadCastTable = false;
-            if (partitionInfo != null) {
-                isSigleTable = partitionInfo.isGsiSingleOrSingleTable();
-                isBroadCastTable = partitionInfo.isGsiBroadcastOrBroadcast();
-            }
-
-            boolean matchTg = false;
-            TableGroupConfig tgConfig = physicalPlanData.getTableGroupConfig();
-            for (TablePartRecordInfoContext entry : tgConfig.getTables()) {
-                Long tableGroupId = entry.getLogTbRec().getGroupId();
-                if (tableGroupId != null && tableGroupId != -1) {
-                    OptimizerContext oc =
-                        Objects.requireNonNull(OptimizerContext.getContext(schemaName), schemaName + " corrupted");
-                    TableGroupConfig tableGroupConfig =
-                        oc.getTableGroupInfoManager().getTableGroupConfigById(tableGroupId);
-                    TableGroupRecord record = tableGroupConfig.getTableGroupRecord();
-                    String tgName = record.getTg_name();
-                    resources.add(concatWithDot(schemaName, tgName));
-                    tableGroupIds.add(tableGroupId);
-                    matchTg = true;
-                }
-            }
-
-            if (preparedData.getTableGroupName() == null) {
-                if (isSigleTable && !matchTg) {
-                    resources.add(concatWithDot(schemaName, TableGroupNameUtil.SINGLE_DEFAULT_TG_NAME_TEMPLATE));
-                } else if (isBroadCastTable) {
-                    resources.add(concatWithDot(schemaName, TableGroupNameUtil.BROADCAST_TG_NAME_TEMPLATE));
-                }
-            }
-
+        } else if (preparedData.isWithImplicitTableGroup()) {
             if (preparedData != null && preparedData.getTableGroupName() != null) {
                 String tgName = RelUtils.stringValue(preparedData.getTableGroupName());
-                if (TStringUtil.isNotBlank(tgName)) {
+                TableGroupConfig tgConfig =
+                    OptimizerContext.getContext(preparedData.getSchemaName()).getTableGroupInfoManager()
+                        .getTableGroupConfigByName(tgName);
+                if (tgConfig == null) {
                     resources.add(concatWithDot(schemaName, tgName));
                 }
             }
+            super.excludeResources(resources);
+        } else {
+            super.excludeResources(resources);
+        }
+    }
 
-            if (preparedData != null && preparedData.getJoinGroupName() != null) {
-                String jgName = RelUtils.stringValue(preparedData.getJoinGroupName());
-                if (TStringUtil.isNotBlank(jgName)) {
-                    resources.add(concatWithDot(schemaName, jgName));
-                }
+    @Override
+    protected void sharedResources(Set<String> resources) {
+        boolean isSigleTable = false;
+        boolean isBroadCastTable = false;
+        if (partitionInfo != null) {
+            isSigleTable = partitionInfo.isGsiSingleOrSingleTable();
+            isBroadCastTable = partitionInfo.isGsiBroadcastOrBroadcast();
+        }
+
+        boolean matchTg = false;
+        TableGroupDetailConfig tgConfig = physicalPlanData.getTableGroupConfig();
+        for (TablePartRecordInfoContext entry : tgConfig.getTablesPartRecordInfoContext()) {
+            Long tableGroupId = entry.getLogTbRec().getGroupId();
+            if (tableGroupId != null && tableGroupId != -1) {
+                OptimizerContext oc =
+                    Objects.requireNonNull(OptimizerContext.getContext(schemaName), schemaName + " corrupted");
+                TableGroupConfig tableGroupConfig =
+                    oc.getTableGroupInfoManager().getTableGroupConfigById(tableGroupId);
+                TableGroupRecord record = tableGroupConfig.getTableGroupRecord();
+                String tgName = record.getTg_name();
+                resources.add(concatWithDot(schemaName, tgName));
+                tableGroupIds.add(tableGroupId);
+                matchTg = true;
+            }
+        }
+
+        if (preparedData.getTableGroupName() == null) {
+            if (isSigleTable && !matchTg) {
+                resources.add(concatWithDot(schemaName, TableGroupNameUtil.SINGLE_DEFAULT_TG_NAME_TEMPLATE));
+            } else if (isBroadCastTable) {
+                resources.add(concatWithDot(schemaName, TableGroupNameUtil.BROADCAST_TG_NAME_TEMPLATE));
+            }
+        }
+
+        if (preparedData != null && preparedData.getTableGroupName() != null) {
+            String tgName = RelUtils.stringValue(preparedData.getTableGroupName());
+            if (TStringUtil.isNotBlank(tgName)) {
+                resources.add(concatWithDot(schemaName, tgName));
+            }
+        }
+
+        if (preparedData != null && preparedData.getJoinGroupName() != null) {
+            String jgName = RelUtils.stringValue(preparedData.getJoinGroupName());
+            if (TStringUtil.isNotBlank(jgName)) {
+                resources.add(concatWithDot(schemaName, jgName));
             }
         }
     }
@@ -140,7 +171,37 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
     @Override
     protected ExecutableDdlJob doCreate() {
         String schemaName = physicalPlanData.getSchemaName();
-        if (isNeedToGetCreateTableGroupLock(false)) {
+
+        List<String> tableGroups = new ArrayList<>();
+        if (needCreateImplicitTableGroup(tableGroups)) {
+            DdlTask subJobTask = generateCreateTableJob();
+            List<DdlTask> taskList = new ArrayList<>();
+            ExecutableDdlJob job = new ExecutableDdlJob();
+            CreateTableGroupValidateTask createTableGroupValidateTask =
+                new CreateTableGroupValidateTask(preparedData.getSchemaName(),
+                    tableGroups);
+            taskList.add(createTableGroupValidateTask);
+            List<DdlTask> createTableGroupAddMetaTasks = new ArrayList<>();
+            for (int i = 0; i < tableGroups.size(); i++) {
+                String tableGroupName = tableGroups.get(i);
+                CreateTableGroupAddMetaTask createTableGroupAddMetaTask = new CreateTableGroupAddMetaTask(
+                    preparedData.getSchemaName(), tableGroupName, null,
+                    null, false, true);
+                createTableGroupAddMetaTasks.add(createTableGroupAddMetaTask);
+            }
+
+            TableGroupsSyncTask tableGroupsSyncTask =
+                new TableGroupsSyncTask(preparedData.getSchemaName(), tableGroups);
+            taskList.add(tableGroupsSyncTask);
+            taskList.add(subJobTask);
+            job.addSequentialTasks(taskList);
+            for (int i = 0; i < createTableGroupAddMetaTasks.size(); i++) {
+                job.addTaskRelationship(createTableGroupValidateTask, createTableGroupAddMetaTasks.get(i));
+                job.addTaskRelationship(createTableGroupAddMetaTasks.get(i), tableGroupsSyncTask);
+            }
+            preparedData.setNeedToGetTableGroupLock(true);
+            return job;
+        } else if (!preparedData.isWithImplicitTableGroup() && isNeedToGetCreateTableGroupLock(false)) {
             DdlTask ddl = generateCreateTableJob();
             ExecutableDdlJob job = new ExecutableDdlJob();
             job.addSequentialTasks(Lists.newArrayList(ddl));
@@ -173,10 +234,6 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
             if (preparedData != null && preparedData.getJoinGroupName() != null) {
                 joinGroup = RelUtils.stringValue(preparedData.getJoinGroupName());
             }
-            String tableGroup = null;
-            if (preparedData != null && preparedData.getTableGroupName() != null) {
-                tableGroup = RelUtils.stringValue(preparedData.getTableGroupName());
-            }
             CreatePartitionTableValidateTask validateTask =
                 new CreatePartitionTableValidateTask(schemaName, logicalTableName,
                     physicalPlanData.isIfNotExists(), physicalPlanData.getTableGroupConfig(),
@@ -184,11 +241,14 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
                     joinGroup, checkSingleTgNotExists, checkBroadcastTgNotExists);
 
             LocalPartitionDefinitionInfo localPartitionDefinitionInfo = preparedData.getLocalPartitionDefinitionInfo();
+            boolean autoCreateTg =
+                executionContext.getParamManager().getBoolean(ConnectionParams.ALLOW_AUTO_CREATE_TABLEGROUP);
+
             CreateTableAddTablesPartitionInfoMetaTask addPartitionInfoTask =
                 new CreateTableAddTablesPartitionInfoMetaTask(schemaName, logicalTableName,
                     physicalPlanData.isTemporary(),
-                    physicalPlanData.getTableGroupConfig(), localPartitionDefinitionInfo, false, null,
-                    joinGroup);
+                    physicalPlanData.getTableGroupConfig(), localPartitionDefinitionInfo, null, null,
+                    joinGroup, false, preparedData.isWithImplicitTableGroup(), autoCreateTg);
 
             CreateTablePhyDdlTask phyDdlTask =
                 new CreateTablePhyDdlTask(schemaName, logicalTableName, physicalPlanData);
@@ -197,26 +257,73 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
                 new CreateTableAddTablesMetaTask(schemaName, logicalTableName, physicalPlanData.getDefaultDbIndex(),
                     physicalPlanData.getDefaultPhyTableName(), physicalPlanData.getSequence(),
                     physicalPlanData.getTablesExtRecord(), physicalPlanData.isPartitioned(),
-                    physicalPlanData.isIfNotExists(), physicalPlanData.getKind(), hasTimestampColumnDefault,
-                    binaryColumnDefaultValues);
+                    physicalPlanData.isIfNotExists(), physicalPlanData.getKind(), preparedData.getAddedForeignKeys(),
+                    hasTimestampColumnDefault, specialDefaultValues, specialDefaultValueFlags, null, null);
 
             CreateTableShowTableMetaTask showTableMetaTask =
                 new CreateTableShowTableMetaTask(schemaName, logicalTableName);
 
-            CdcDdlMarkTask cdcDdlMarkTask = new CdcDdlMarkTask(schemaName, physicalPlanData);
+            CreateEntitySecurityAttrTask cesaTask = createCESATask();
+
+            CdcDdlMarkTask cdcDdlMarkTask = new CdcDdlMarkTask(schemaName, physicalPlanData, false,
+                CollectionUtils.isNotEmpty(addedForeignKeys), versionId);
+
+            CreateArchiveTableEventLogTask createArchiveTableEventLogTask = null;
+            // TTL table
+            if (localPartitionDefinitionInfo != null) {
+                createArchiveTableEventLogTask =
+                    new CreateArchiveTableEventLogTask(schemaName, logicalTableName, localPartitionDefinitionInfo);
+            }
 
             TableSyncTask tableSyncTask = new TableSyncTask(schemaName, logicalTableName);
 
+            if (executionContext.getParamManager().getBoolean(ConnectionParams.CREATE_TABLE_SKIP_CDC)) {
+                cdcDdlMarkTask = null;
+            }
             ExecutableDdlJob4CreatePartitionTable result = new ExecutableDdlJob4CreatePartitionTable();
-            result.addSequentialTasks(Lists.newArrayList(
-                validateTask,
-                addPartitionInfoTask,
-                phyDdlTask,
-                createTableAddTablesMetaTask,
-                cdcDdlMarkTask,
-                showTableMetaTask,
-                tableSyncTask
-            ).stream().filter(Objects::nonNull).collect(Collectors.toList()));
+
+            List<DdlTask> taskList = new ArrayList<>();
+            if (preparedData.isImportTable()) {
+                taskList.addAll(
+                    Lists.newArrayList(
+                        validateTask,
+                        addPartitionInfoTask,
+                        createTableAddTablesMetaTask,
+                        cdcDdlMarkTask,
+                        showTableMetaTask,
+                        createArchiveTableEventLogTask,
+                        cesaTask,
+                        tableSyncTask
+                    ).stream().filter(Objects::nonNull).collect(Collectors.toList())
+                );
+            } else {
+                taskList.addAll(
+                    Lists.newArrayList(
+                        validateTask,
+                        addPartitionInfoTask,
+                        phyDdlTask,
+                        createTableAddTablesMetaTask,
+                        cdcDdlMarkTask,
+                        showTableMetaTask,
+                        createArchiveTableEventLogTask,
+                        cesaTask,
+                        tableSyncTask
+                    ).stream().filter(Objects::nonNull).collect(Collectors.toList())
+                );
+            }
+
+            if (!GeneralUtil.isEmpty(preparedData.getAddedForeignKeys())) {
+                // sync foreign key table meta
+                for (ForeignKeyData addedForeignKey : addedForeignKeys) {
+                    if (schemaName.equalsIgnoreCase(addedForeignKey.refSchema) &&
+                        logicalTableName.equalsIgnoreCase(addedForeignKey.refTableName)) {
+                        continue;
+                    }
+                    taskList.add(new TableSyncTask(addedForeignKey.refSchema, addedForeignKey.refTableName));
+                }
+            }
+
+            result.addSequentialTasks(taskList.stream().filter(Objects::nonNull).collect(Collectors.toList()));
 
             //todo delete me
             result.labelAsHead(validateTask);
@@ -231,7 +338,22 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
             result.setCreateTableAddTablesMetaTask(createTableAddTablesMetaTask);
             result.setCdcDdlMarkTask(cdcDdlMarkTask);
             result.setCreateTableShowTableMetaTask(showTableMetaTask);
+            result.setCreateArchiveTableEventLogTask(createArchiveTableEventLogTask);
             result.setTableSyncTask(tableSyncTask);
+
+            if (selectSql != null) {
+                InsertIntoTask
+                    insertIntoTask = new InsertIntoTask(schemaName, logicalTableName, selectSql, null, 0);
+                ExecutableDdlJob insertJob = new ExecutableDdlJob();
+                insertJob.addTask(insertIntoTask);
+                ExecutableDdlJob4CreateSelect ans = new ExecutableDdlJob4CreateSelect();
+                ans.appendJob2(result);
+                ans.appendJob2(insertJob);
+                ans.setInsertTask(insertIntoTask);
+                //insert 只能rollback，无法重试
+                insertIntoTask.setExceptionAction(DdlExceptionAction.ROLLBACK);
+                return ans;
+            }
 
             return result;
         }
@@ -245,11 +367,7 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
     }
 
     private String genSubJobSql() {
-        List<String> params = Lists.newArrayList(
-            ConnectionParams.ACQUIRE_CREATE_TABLE_GROUP_LOCK.getName() + "=false"
-        );
-        String hint = String.format("/*+TDDL:CMD_EXTRA(%s)*/", StringUtils.join(params, ","));
-        return String.format(preparedData.getSourceSql());
+        return preparedData.getSourceSql();
     }
 
     private boolean isNeedToGetCreateTableGroupLock(boolean printLog) {
@@ -299,6 +417,17 @@ public class CreatePartitionTableJobFactory extends CreateTableJobFactory {
             SQLRecorderLogger.ddlMetaLogger.warn(sb.toString());
         }
         return lock;
+    }
+
+    private boolean needCreateImplicitTableGroup(List<String> tableGroups) {
+        boolean ret = false;
+        for (Map.Entry<String, Boolean> entry : preparedData.getRelatedTableGroupInfo().entrySet()) {
+            if (entry.getValue()) {
+                tableGroups.add(entry.getKey());
+                ret = true;
+            }
+        }
+        return ret;
     }
 
 }

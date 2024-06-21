@@ -16,8 +16,8 @@
 
 package com.alibaba.polardbx.manager.response;
 
-import com.alibaba.polardbx.ErrorCode;
 import com.alibaba.polardbx.Fields;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.config.SchemaConfig;
 import com.alibaba.polardbx.net.buffer.ByteBufferHolder;
 import com.alibaba.polardbx.net.compress.IPacketOutputProxy;
@@ -100,7 +100,7 @@ public final class ShowPhysicalSQLSlow {
         SQLRecord[] records = schema.getDataSource().getRecorder().getRecords();
         for (int i = records.length - 1; i >= 0; i--) {
             if (records[i] != null) {
-                RowDataPacket row = getRow(records[i], c.getCharset());
+                RowDataPacket row = getRow(records[i], c.getResultSetCharset());
                 row.packetId = ++packetId;
                 proxy = row.write(proxy);
             }

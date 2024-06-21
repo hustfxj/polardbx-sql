@@ -55,12 +55,16 @@ public class DataOperator {
             preparedStatement.execute();
             Assert.fail(sql);
         } catch (Exception e) {
-            // log.error(e.getMessage(), e);
+            Throwable t = e;
+            if (e.getMessage().equals(JdbcUtil.READ_ONLY_EXCEPTION_MSG)) {
+                t = e.getCause();
+            }
             try {
-                assertThat(e.getMessage()).contains(expectErrorMess);
+                assertThat(t.getMessage()).contains(expectErrorMess);
             } catch (Throwable e2) {
+                e2.printStackTrace();
                 // 统一大小写，再检查一次
-                assertThat(e.getMessage().toUpperCase()).contains(expectErrorMess.toUpperCase());
+                assertThat(t.getMessage().toUpperCase()).contains(expectErrorMess.toUpperCase());
             }
         } finally {
             JdbcUtil.close(preparedStatement);
@@ -135,6 +139,58 @@ public class DataOperator {
         int mysqlEffectCount = JdbcUtil.updateData(mysqlConnection, mysqlSql, param);
         // int tddlEffectCount = JdbcUtil.updateDataTddl(tddlConnection, sql,
         int tddlEffectCount = JdbcUtil.updateData(tddlConnection, tddlSql, param);
+        if (isAssertCount) {
+            Assert.assertEquals("sql 为 " + tddlSql + " 更新条数结果不一致", mysqlEffectCount, tddlEffectCount);
+        }
+
+    }
+
+    private static int updateDataGetEffectCount(Connection conn, String sql, List<Object> params) throws SQLException {
+        PreparedStatement ps = conn.prepareStatement(sql);
+        if (params != null) {
+            for (int i = 0; i < params.size(); i++) {
+                ps.setObject(i + 1, params.get(i));
+            }
+        }
+        ps.executeUpdate();
+        return ps.getUpdateCount();
+    }
+
+    public static void executeOnMysqlAndTddlAssertErrorAtomic(Connection mysqlConnection, Connection tddlConnection,
+                                                              String mysqlSql, String tddlSql, List<Object> param,
+                                                              boolean isAssertCount) {
+        int mysqlEffectCount = -1;
+        boolean mysqlErr = false;
+        boolean tddlErr = false;
+        try {
+            JdbcUtil.executeUpdateSuccess(mysqlConnection, "begin");
+            mysqlEffectCount = updateDataGetEffectCount(mysqlConnection, mysqlSql, param);
+        } catch (Throwable e) {
+            // System.out.println(e);
+            mysqlErr = true;
+            JdbcUtil.executeUpdateSuccess(mysqlConnection, "rollback");
+        }
+
+        if (!mysqlErr) {
+            JdbcUtil.executeUpdateSuccess(mysqlConnection, "commit");
+        }
+
+        int tddlEffectCount = -1;
+        try {
+            JdbcUtil.executeUpdateSuccess(tddlConnection, "begin");
+            tddlEffectCount = updateDataGetEffectCount(tddlConnection, tddlSql, param);
+        } catch (Throwable e) {
+            // System.out.println(e);
+            tddlErr = true;
+            JdbcUtil.executeUpdateSuccess(tddlConnection, "rollback");
+        }
+
+        if (!tddlErr) {
+            JdbcUtil.executeUpdateSuccess(tddlConnection, "commit");
+        }
+
+        Assert.assertEquals("sql 为 " + tddlSql + " 执行结果不一致", mysqlErr, tddlErr);
+
         if (isAssertCount) {
             Assert.assertEquals("sql 为 " + tddlSql + " 更新条数结果不一致", mysqlEffectCount, tddlEffectCount);
         }
@@ -264,10 +320,10 @@ public class DataOperator {
             }
             sqlBuffer.deleteCharAt(sqlBuffer.length() - 1);
         }
-
+        String execSql = sqlBuffer.toString();
         try {
-            mysqlEffectCount = JdbcUtil.executeUpdateAndGetEffectCount(mysqlConnection, sqlBuffer.toString());
-            tddlEffectCount = JdbcUtil.executeUpdateAndGetEffectCount(tddlConnection, sqlBuffer.toString());
+            mysqlEffectCount = JdbcUtil.executeUpdateAndGetEffectCount(mysqlConnection, execSql);
+            tddlEffectCount = JdbcUtil.executeUpdateAndGetEffectCount(tddlConnection, execSql);
         } catch (Exception e) {
             log.error(e.getMessage(), e);
             log.error("sql: " + sql + ", params: " + outputParams(params));
@@ -275,7 +331,7 @@ public class DataOperator {
         }
 
         if (isAssertCount) {
-            assertWithMessage(" 顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql).that(mysqlEffectCount)
+            assertWithMessage(" 顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + execSql).that(mysqlEffectCount)
                 .isEqualTo(tddlEffectCount);
         }
     }
@@ -298,7 +354,6 @@ public class DataOperator {
     public static void executeOnMysqlOrTddl(Connection tddlConnection, String sql, List<Object> param) {
         JdbcUtil.updateData(tddlConnection, sql, param);
     }
-
 
     public static void queryOnMysqlOrTddl(Connection conn, String sql) {
         JdbcUtil.executeQuery(sql, conn);

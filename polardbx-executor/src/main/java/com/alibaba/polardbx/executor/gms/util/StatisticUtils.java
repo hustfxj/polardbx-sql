@@ -17,21 +17,27 @@
 package com.alibaba.polardbx.executor.gms.util;
 
 import com.alibaba.druid.util.JdbcUtils;
+import com.alibaba.druid.util.StringUtils;
 import com.alibaba.polardbx.common.Engine;
 import com.alibaba.polardbx.common.datatype.Decimal;
+import com.alibaba.polardbx.common.exception.TddlRuntimeException;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.jdbc.ITransactionPolicy;
 import com.alibaba.polardbx.common.jdbc.Parameters;
 import com.alibaba.polardbx.common.oss.OSSMetaLifeCycle;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
+import com.alibaba.polardbx.common.utils.LoggerUtil;
+import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.logger.Logger;
-import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.common.utils.thread.ExecutorUtil;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.executor.ExecutorHelper;
 import com.alibaba.polardbx.executor.PlanExecutor;
 import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.executor.cursor.Cursor;
 import com.alibaba.polardbx.executor.cursor.ResultCursor;
+import com.alibaba.polardbx.executor.ddl.newengine.cross.CrossEngineValidator;
 import com.alibaba.polardbx.executor.spi.ITransactionManager;
 import com.alibaba.polardbx.executor.sync.SyncManagerHelper;
 import com.alibaba.polardbx.executor.sync.UpdateStatisticSyncAction;
@@ -42,14 +48,17 @@ import com.alibaba.polardbx.gms.metadb.table.TablesAccessor;
 import com.alibaba.polardbx.gms.module.LogLevel;
 import com.alibaba.polardbx.gms.module.Module;
 import com.alibaba.polardbx.gms.module.ModuleLogInfo;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupLocation;
 import com.alibaba.polardbx.gms.topology.DbTopologyManager;
 import com.alibaba.polardbx.gms.topology.GroupDetailInfoExRecord;
+import com.alibaba.polardbx.gms.topology.SystemDbHelper;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.config.table.ColumnMeta;
 import com.alibaba.polardbx.optimizer.config.table.FileMeta;
 import com.alibaba.polardbx.optimizer.config.table.GlobalIndexMeta;
+import com.alibaba.polardbx.optimizer.config.table.IndexMeta;
 import com.alibaba.polardbx.optimizer.config.table.OSSOrcFileMeta;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.config.table.statistic.Histogram;
@@ -59,11 +68,13 @@ import com.alibaba.polardbx.optimizer.config.table.statistic.inf.SystemTableColu
 import com.alibaba.polardbx.optimizer.config.table.statistic.inf.SystemTableTableStatistic;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
+import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
 import com.alibaba.polardbx.optimizer.core.planner.ExecutionPlan;
 import com.alibaba.polardbx.optimizer.core.planner.Planner;
 import com.alibaba.polardbx.optimizer.core.planner.SqlConverter;
 import com.alibaba.polardbx.optimizer.core.row.ArrayRow;
 import com.alibaba.polardbx.optimizer.core.row.Row;
+import com.alibaba.polardbx.optimizer.optimizeralert.OptimizerAlertUtil;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
 import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
@@ -75,15 +86,16 @@ import com.alibaba.polardbx.optimizer.view.InformationSchemaTables;
 import com.alibaba.polardbx.rule.TableRule;
 import com.alibaba.polardbx.statistics.RuntimeStatHelper;
 import com.alibaba.polardbx.stats.MatrixStatistics;
+import com.clearspring.analytics.stream.StreamSummary;
 import com.clearspring.analytics.stream.cardinality.HyperLogLog;
 import com.clearspring.analytics.stream.membership.BloomFilter;
-import com.clearspring.analytics.stream.membership.BloomFilter;
+import com.clearspring.analytics.util.Lists;
 import com.google.common.collect.Maps;
-import io.airlift.slice.Slice;
 import io.airlift.slice.Slice;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.commons.collections.CollectionUtils;
 import org.glassfish.jersey.internal.guava.Sets;
@@ -95,6 +107,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -102,31 +115,36 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 import static com.alibaba.polardbx.common.properties.ConnectionParams.STATISTIC_VISIT_DN_TIMEOUT;
 import static com.alibaba.polardbx.common.utils.GeneralUtil.unixTimeStamp;
-import static com.alibaba.polardbx.executor.scheduler.executor.statistic.StatisticSampleCollectionScheduledJob.DATA_MAX_LEN;
 import static com.alibaba.polardbx.gms.module.LogLevel.CRITICAL;
 import static com.alibaba.polardbx.gms.module.LogLevel.NORMAL;
 import static com.alibaba.polardbx.gms.module.LogLevel.WARNING;
+import static com.alibaba.polardbx.gms.module.LogPattern.INTERRUPTED;
 import static com.alibaba.polardbx.gms.module.LogPattern.PROCESS_END;
 import static com.alibaba.polardbx.gms.module.LogPattern.PROCESS_START;
 import static com.alibaba.polardbx.gms.module.LogPattern.UNEXPECTED;
 import static com.alibaba.polardbx.gms.scheduler.ScheduledJobExecutorType.STATISTIC_ROWCOUNT_COLLECTION;
+import static com.alibaba.polardbx.optimizer.config.table.statistic.StatisticUtils.DATA_MAX_LEN;
 import static com.alibaba.polardbx.optimizer.config.table.statistic.StatisticUtils.DEFAULT_SAMPLE_SIZE;
 import static com.alibaba.polardbx.optimizer.config.table.statistic.StatisticUtils.buildColumnsName;
 import static com.alibaba.polardbx.optimizer.config.table.statistic.StatisticUtils.getColumnMetas;
+import static com.alibaba.polardbx.optimizer.config.table.statistic.StatisticUtils.packDateTypeToLong;
 
 /**
  * @author fangwu
  */
 public class StatisticUtils {
 
-    private static final Logger logger = LoggerFactory.getLogger("statistics");
+    // Statistics logger
+    public final static Logger logger = LoggerUtil.statisticsLogger;
 
     private static String PRESENT_SQL = "select sum(extent_size) as size from files where "
         + "logical_schema_name = '%s' and logical_table_name = '%s' and remove_ts is null and " +
@@ -143,10 +161,36 @@ public class StatisticUtils {
         "SELECT table_schema, table_name, table_rows FROM information_schema.tables";
 
     public static boolean forceAnalyzeColumns(String schema, String logicalTableName) {
+        return forceAnalyzeColumnsDdl(schema, logicalTableName, new ArrayList<>(), null);
+    }
+
+    public static boolean forceAnalyzeColumnsDdl(String schema, String logicalTableName, List<String> errMsg,
+                                                 ExecutionContext ec) {
         try {
+            long startNanos = System.nanoTime();
+            // check table if exists
+            if (OptimizerContext.getContext(schema).getLatestSchemaManager()
+                .getTableWithNull(logicalTableName) == null) {
+                errMsg.add("FAIL skip tables that not exists:" + schema + "," + logicalTableName);
+                return false;
+            }
+
             collectRowCount(schema, logicalTableName);
-            sampleTable(schema, logicalTableName);
-//            sketchTable(schema, logicalTableName, true);
+            long endNanos = System.nanoTime();
+            logger.info(String.format("Collecting row count of %s.%s consumed %.2fs",
+                schema, logicalTableName, (endNanos - startNanos) / 1_000_000_000D));
+
+            startNanos = endNanos;
+            sampleTableDdl(schema, logicalTableName, ec);
+            endNanos = System.nanoTime();
+            logger.info(String.format("Sampling %s.%s consumed %.2fs",
+                schema, logicalTableName, (endNanos - startNanos) / 1_000_000_000D));
+
+            startNanos = endNanos;
+            sketchTableDdl(schema, logicalTableName, true, ec);
+            endNanos = System.nanoTime();
+            logger.info(String.format("HLL sketch of %s.%s consumed %.2fs",
+                schema, logicalTableName, (endNanos - startNanos) / 1_000_000_000D));
 
             /** persist */
             persistStatistic(schema, logicalTableName, true);
@@ -156,24 +200,19 @@ public class StatisticUtils {
                     schema,
                     logicalTableName,
                     StatisticManager.getInstance().getCacheLine(schema, logicalTableName)),
-                schema);
+                schema,
+                SyncScope.ALL);
+
         } catch (Exception e) {
             logger.error(e);
+            errMsg.add("FAIL " + e.getMessage());
             return false;
         }
+        errMsg.add("OK");
         return true;
     }
 
     public static void collectRowCount(String schema, String logicalTableName) throws SQLException {
-        ModuleLogInfo.getInstance()
-            .logRecord(
-                Module.STATISTICS,
-                PROCESS_START,
-                new String[] {
-                    STATISTIC_ROWCOUNT_COLLECTION + " FROM ANALYZE",
-                    schema + "," + logicalTableName
-                },
-                NORMAL);
         long sum = 0;
         if (isFileStore(schema, logicalTableName)) {
             try {
@@ -189,11 +228,13 @@ public class StatisticUtils {
                             STATISTIC_ROWCOUNT_COLLECTION + " FROM ANALYZE",
                             schema + "," + logicalTableName + ":" + remark
                         },
-                        WARNING);
+                        WARNING,
+                        e);
                 throw e;
             }
         } else {
             Map<String, Set<String>> topologyMap = getTopology(schema, logicalTableName);
+            Collection<String> tbls = Sets.newHashSet();
             if (topologyMap == null) {
                 ModuleLogInfo.getInstance()
                     .logRecord(
@@ -204,9 +245,9 @@ public class StatisticUtils {
                             schema + "," + logicalTableName + " topology is null"
                         },
                         WARNING);
+            } else {
+                topologyMap.values().stream().forEach(names -> tbls.addAll(names));
             }
-            Collection<String> tbls = Sets.newHashSet();
-            topologyMap.values().stream().forEach(names -> tbls.addAll(names));
 
             Set<String> dnIds =
                 StorageHaManager.getInstance().getMasterStorageList().stream().filter(s -> !s.isMetaDb())
@@ -230,14 +271,16 @@ public class StatisticUtils {
                                 STATISTIC_ROWCOUNT_COLLECTION + " FROM ANALYZE",
                                 schema + "," + logicalTableName + ":" + remark
                             },
-                            WARNING);
+                            WARNING,
+                            e);
                     throw e;
                 }
             }
 
             sum = sumRowCount(topologyMap, rowCountMap);
         }
-        StatisticManager.CacheLine cacheLine = StatisticManager.getInstance().getCacheLine(schema, logicalTableName);
+        StatisticManager.CacheLine cacheLine
+            = StatisticManager.getInstance().getCacheLine(schema, logicalTableName);
         cacheLine.setRowCount(sum);
         ModuleLogInfo.getInstance()
             .logRecord(
@@ -250,20 +293,30 @@ public class StatisticUtils {
                 NORMAL);
     }
 
-    public static boolean sampleColumns(String schema, String logicalTableName) {
+    public static boolean sampleOneTable(String schema, String logicalTableName) {
         try {
+            // check table if exists
+            if (OptimizerContext.getContext(schema).getLatestSchemaManager()
+                .getTableWithNull(logicalTableName) == null) {
+                return false;
+            }
+            // don't sample oss table
+            if (StatisticUtils.isFileStore(schema, logicalTableName)) {
+                return false;
+            }
+
             collectRowCount(schema, logicalTableName);
-            sampleTable(schema, logicalTableName);
+            sampleTableDdl(schema, logicalTableName, null);
 
             /** persist */
             persistStatistic(schema, logicalTableName, true);
             /** sync other nodes */
-            SyncManagerHelper.sync(
+            SyncManagerHelper.syncWithDefaultDB(
                 new UpdateStatisticSyncAction(
                     schema,
                     logicalTableName,
                     StatisticManager.getInstance().getCacheLine(schema, logicalTableName)),
-                schema);
+                SyncScope.ALL);
 
         } catch (Exception e) {
             logger.error(e);
@@ -292,7 +345,8 @@ public class StatisticUtils {
                     cacheLine.getTopN(columnName),
                     cacheLine.getNullCountMap().get(columnName),
                     cacheLine.getSampleRate(),
-                    cacheLine.getLastModifyTime()));
+                    cacheLine.getLastModifyTime(),
+                    cacheLine.getExtend()));
             }
         }
         StatisticManager.getInstance().getSds().batchReplace(columnRowList);
@@ -319,11 +373,11 @@ public class StatisticUtils {
             new InformationSchemaTables(relOptCluster, relOptCluster.getPlanner().emptyTraitSet());
         RexBuilder rexBuilder = relOptCluster.getRexBuilder();
         RexNode filterCondition = rexBuilder.makeCall(SqlStdOperatorTable.EQUALS,
-            rexBuilder.makeInputRef(informationSchemaTables, informationSchemaTables.getTableSchemaIndex()),
+            rexBuilder.makeInputRef(informationSchemaTables, InformationSchemaTables.getTableSchemaIndex()),
             rexBuilder.makeLiteral(schemaName));
         if (logicalTableName != null) {
             RexNode tableNameFilterCondition = rexBuilder.makeCall(SqlStdOperatorTable.EQUALS,
-                rexBuilder.makeInputRef(informationSchemaTables, informationSchemaTables.getTableNameIndex()),
+                rexBuilder.makeInputRef(informationSchemaTables, InformationSchemaTables.getTableNameIndex()),
                 rexBuilder.makeLiteral(logicalTableName));
             filterCondition = rexBuilder.makeCall(SqlStdOperatorTable.AND, filterCondition,
                 tableNameFilterCondition);
@@ -366,107 +420,143 @@ public class StatisticUtils {
         }
     }
 
+    public static void sketchTable(String schema, String logicalTableName, boolean needRebuild) {
+        sketchTableDdl(schema, logicalTableName, needRebuild, null);
+    }
+
     /**
      * hyper loglog process
      */
-    public static void sketchTable(String schema, String logicalTableName, boolean needRebuild) {
+    public static void sketchTableDdl(String schema, String logicalTableName, boolean needRebuild,
+                                      ExecutionContext ec) {
         // don't sketch archive table
         if (isFileStore(schema, logicalTableName)) {
             return;
         }
 
-        List<ColumnMeta> columnMetaList = getColumnMetas(false, schema, logicalTableName);
-
-        if (columnMetaList == null || columnMetaList.isEmpty()) {
-            ModuleLogInfo.getInstance().logRecord(Module.STATISTICS, UNEXPECTED,
-                new String[] {
-                    "statistic sketch",
-                    "column meta is empty :" + schema + "," + logicalTableName
-                }, LogLevel.NORMAL);
-            return;
+        int hllParallelism = ec.getParamManager().getInt(ConnectionParams.HLL_PARALLELISM);
+        logger.info(String.format("Sketch table %s.%s with parallelism: %d", schema, logicalTableName, hllParallelism));
+        ThreadPoolExecutor sketchHllExecutor = null;
+        if (hllParallelism > 1) {
+            sketchHllExecutor = ExecutorUtil.createExecutor("SketchHllExecutor", hllParallelism);
         }
 
-        Map<String, Set<String>> colMap = PlanManager.getInstance().columnsInvolvedByPlan().get(schema);
+        try {
+            List<ColumnMeta> columnMetaList = getColumnMetas(false, schema, logicalTableName);
 
-        if (colMap == null) {
-            colMap = Maps.newHashMap();
-        }
-
-        Set<String> colSet = colMap.get(logicalTableName);
-        Set<String> colDoneSet = Sets.newHashSet();
-
-        /**
-         * handle columns needed by plan
-         */
-        for (ColumnMeta columnMeta : columnMetaList) {
-            String columnName = columnMeta.getOriginColumnName();
-            if (colSet == null || !colSet.contains(columnName)) {
-                continue;
+            if (columnMetaList == null || columnMetaList.isEmpty()) {
+                ModuleLogInfo.getInstance().logRecord(Module.STATISTICS, UNEXPECTED,
+                    new String[] {
+                        "statistic sketch",
+                        "column meta is empty :" + schema + "," + logicalTableName
+                    }, LogLevel.NORMAL);
+                return;
             }
 
-            if (needRebuild) {
-                // analyze table would rebuild full ndv sketch info
-                StatisticManager.getInstance().rebuildShardParts(schema, logicalTableName, columnName);
-            } else {
-                // schedule job only update ndv sketch info
-                StatisticManager.getInstance().updateAllShardParts(schema, logicalTableName, columnName);
+            Map<String, Set<String>> colMap = PlanManager.getInstance().columnsInvolvedByPlan().get(schema);
+
+            if (colMap == null) {
+                colMap = Maps.newHashMap();
             }
-            colDoneSet.add(columnName);
-        }
 
-        /**
-         * handle columns inside index
-         */
-        TableMeta tableMeta = OptimizerContext.getContext(schema).getLatestSchemaManager().getTable(logicalTableName);
-        Map<String, Map<String, List<String>>> indexColsMap = GlobalIndexMeta.getTableIndexMap(tableMeta, null);
+            Set<String> colSet = colMap.get(logicalTableName);
+            Set<String> colDoneSet = Sets.newHashSet();
 
-        for (String tblName : indexColsMap.keySet()) {
-            // index key -> columns
-            Map<String, List<String>> indexColumnMap = indexColsMap.get(tblName);
-            for (List<String> cols : indexColumnMap.values()) {
-                if (cols != null && cols.size() == 1 && colMap.get(tblName) != null && colMap.get(tblName)
-                    .contains(cols.iterator().next())) {
+            /**
+             * handle columns needed by plan
+             */
+            for (ColumnMeta columnMeta : columnMetaList) {
+                if (ec != null && CrossEngineValidator.isJobInterrupted(ec)) {
+                    long jobId = ec.getDdlJobId();
+                    throw new TddlRuntimeException(ErrorCode.ERR_DDL_JOB_ERROR,
+                        "The job '" + jobId + "' has been cancelled");
+                }
+
+                String columnName = columnMeta.getOriginColumnName();
+                if (!needRebuild && (colSet == null || !colSet.contains(columnName))) {
                     continue;
                 }
-                for (int i = 0; i < cols.size() - 1; i++) {
-                    String colsName = buildColumnsName(cols, i + 1);
-                    if (colDoneSet.contains(colsName)) {
+
+                if (needRebuild) {
+                    // analyze table would rebuild full ndv sketch info
+                    StatisticManager.getInstance()
+                        .rebuildShardParts(schema, logicalTableName, columnName, ec, sketchHllExecutor);
+                } else {
+                    // schedule job only update ndv sketch info
+                    StatisticManager.getInstance()
+                        .updateAllShardParts(schema, logicalTableName, columnName, ec, sketchHllExecutor);
+                }
+                colDoneSet.add(columnName);
+            }
+
+            /**
+             * handle columns inside index
+             */
+            TableMeta tableMeta =
+                OptimizerContext.getContext(schema).getLatestSchemaManager().getTable(logicalTableName);
+            Map<String, Map<String, List<String>>> indexColsMap = GlobalIndexMeta.getTableIndexMap(tableMeta, null);
+
+            for (String tblName : indexColsMap.keySet()) {
+                if (ec != null && CrossEngineValidator.isJobInterrupted(ec)) {
+                    long jobId = ec.getDdlJobId();
+                    throw new TddlRuntimeException(ErrorCode.ERR_DDL_JOB_ERROR,
+                        "The job '" + jobId + "' has been cancelled");
+                }
+                // index key -> columns
+                Map<String, List<String>> indexColumnMap = indexColsMap.get(tblName);
+                for (List<String> cols : indexColumnMap.values()) {
+                    if (cols != null && cols.size() == 1 && colMap.get(tblName) != null && colMap.get(tblName)
+                        .contains(cols.iterator().next())) {
                         continue;
                     }
-                    if (needRebuild) {
-                        // analyze table would rebuild full ndv sketch info
-                        StatisticManager.getInstance().rebuildShardParts(schema, logicalTableName, colsName);
-                    } else {
-                        // schedule job only update ndv sketch info
-                        StatisticManager.getInstance().updateAllShardParts(schema, tblName, colsName);
+                    for (int i = 0; i < cols.size() - 1; i++) {
+                        String colsName = buildColumnsName(cols, i + 1);
+                        if (colDoneSet.contains(colsName)) {
+                            continue;
+                        }
+                        if (needRebuild) {
+                            // analyze table would rebuild full ndv sketch info
+                            StatisticManager.getInstance().rebuildShardParts(schema, logicalTableName, colsName, ec,
+                                sketchHllExecutor);
+                        } else {
+                            // schedule job only update ndv sketch info
+                            StatisticManager.getInstance().updateAllShardParts(schema, tblName, colsName, ec,
+                                sketchHllExecutor);
+                        }
+                        colDoneSet.add(colsName);
                     }
-                    colDoneSet.add(colsName);
-                }
 
-                String columnsName = buildColumnsName(cols);
-                if (!colDoneSet.contains(columnsName)) {
-                    if (needRebuild) {
-                        // analyze table would rebuild full ndv sketch info
-                        StatisticManager.getInstance().rebuildShardParts(schema, logicalTableName, columnsName);
-                    } else {
-                        // schedule job only update ndv sketch info
-                        StatisticManager.getInstance().updateAllShardParts(schema, tblName, columnsName);
+                    String columnsName = buildColumnsName(cols);
+                    if (!colDoneSet.contains(columnsName)) {
+                        if (needRebuild) {
+                            // analyze table would rebuild full ndv sketch info
+                            StatisticManager.getInstance().rebuildShardParts(schema, logicalTableName, columnsName, ec,
+                                sketchHllExecutor);
+                        } else {
+                            // schedule job only update ndv sketch info
+                            StatisticManager.getInstance().updateAllShardParts(schema, tblName, columnsName, ec,
+                                sketchHllExecutor);
+                        }
+                        colDoneSet.add(columnsName);
                     }
-                    colDoneSet.add(columnsName);
-                }
 
+                }
+            }
+
+            ModuleLogInfo.getInstance().logRecord(Module.STATISTICS, PROCESS_END,
+                new String[] {
+                    "statistic sketch table ",
+                    schema + "," + logicalTableName + ",is force:" + needRebuild + ",cols:" + String.join(";",
+                        colDoneSet)
+                }, LogLevel.NORMAL);
+        } finally {
+            if (sketchHllExecutor != null) {
+                sketchHllExecutor.shutdown();
             }
         }
-
-        ModuleLogInfo.getInstance().logRecord(Module.STATISTICS, PROCESS_END,
-            new String[] {
-                "statistic sketch table ",
-                schema + "," + logicalTableName + ",is force:" + needRebuild + ",cols:" + String.join(";", colDoneSet)
-            }, LogLevel.NORMAL);
-        return;
     }
 
-    public static void sampleTable(String schemaName, String logicalTableName) {
+    public static void sampleTableDdl(String schemaName, String logicalTableName, ExecutionContext ec) {
         ModuleLogInfo.getInstance().logRecord(Module.STATISTICS, PROCESS_START,
             new String[] {
                 "statistic sample",
@@ -484,11 +574,12 @@ public class StatisticUtils {
             return;
         }
 
+        // delete cols statistic that not exists
+        cacheLine.remainColumns(analyzeColumnList);
+
         /**
          * prepare
          */
-        int topNSize = InstConfUtil.getInt(ConnectionParams.TOPN_SIZE);
-        int topNMinNum = InstConfUtil.getInt(ConnectionParams.TOPN_MIN_NUM);
         float sampleRate = 1;
         long rowCount = cacheLine.getRowCount();
         if (rowCount > 0) {
@@ -532,6 +623,12 @@ public class StatisticUtils {
         double sampleRateUp =
             scanAnalyze(schemaName, logicalTableName, analyzeColumnList, sampleRate, maxSampleSize, rows);
         for (int i = 0; i < analyzeColumnList.size(); i++) {
+            if (ec != null && CrossEngineValidator.isJobInterrupted(ec)) {
+                long jobId = ec.getDdlJobId();
+                throw new TddlRuntimeException(ErrorCode.ERR_DDL_JOB_ERROR,
+                    "The job '" + jobId + "' has been cancelled");
+            }
+
             String colName = analyzeColumnList.get(i).getField().getOriginColumnName();
 
             HyperLogLog hyperLogLog = new HyperLogLog(16);
@@ -581,10 +678,19 @@ public class StatisticUtils {
             cacheLine.setNullCount(colName, nullCount);
         }
 
+        buildSkew(schemaName, logicalTableName, analyzeColumnList, rows, sampleRate);
         for (int i = 0; i < analyzeColumnList.size(); i++) {
+            if (ec != null && CrossEngineValidator.isJobInterrupted(ec)) {
+                long jobId = ec.getDdlJobId();
+                throw new TddlRuntimeException(ErrorCode.ERR_DDL_JOB_ERROR,
+                    "The job '" + jobId + "' has been cancelled");
+            }
             int finalI = i;
             List<Object> objs =
                 rows.stream().map(r -> r.getObject(finalI)).filter(o -> o != null).collect(Collectors.toList());
+            String colName = analyzeColumnList.get(i).getField().getOriginColumnName();
+            assert colName != null;
+            colName = colName.toLowerCase();
             if (!CollectionUtils.isEmpty(objs)) {
                 if (objs.get(0) instanceof Slice) {
                     objs = objs.stream().map(o -> ((Slice) o).toStringUtf8()).collect(Collectors.toList());
@@ -593,13 +699,21 @@ public class StatisticUtils {
                         objs = objs.stream().map(o -> ((Decimal) o).toBigDecimal()).collect(Collectors.toList());
                     }
                 }
+            } else {
+                if (rows.size() > 0) {
+                    cacheLine.getAllNullCols().add(colName);
+                }
             }
             DataType dataType = analyzeColumnList.get(i).getField().getDataType();
-            String colName = analyzeColumnList.get(i).getField().getOriginColumnName();
             TopN topN = new TopN(dataType, sampleRateUp);
             objs.forEach(obj -> topN.offer(obj));
 
-            boolean isReady = topN.build(topNSize, topNMinNum);
+            boolean isReady = topN.build(
+                canUseNewTopN(schemaName, logicalTableName, colName),
+                (long) (rows.size() / sampleRate / sampleRateUp),
+                sampleRate * sampleRateUp
+            );
+
             if (isReady) {
                 cacheLine.setTopN(colName, topN);
             } else {
@@ -618,6 +732,211 @@ public class StatisticUtils {
                 "statistic sample",
                 schemaName + "," + logicalTableName
             }, LogLevel.NORMAL);
+    }
+
+    public static List<List<Integer>> buildColumnBitSet(
+        String schemaName,
+        String logicalTableName,
+        List<ColumnMeta> analyzeColumnList) {
+        TableMeta tableMeta =
+            OptimizerContext.getContext(schemaName).getLatestSchemaManager().getTable(logicalTableName);
+
+        // sample is derived from B+tree leaf of primary key.
+        // if primary key is compound, the prefix column is biased,
+        // don't check skewness of the column in this case
+        ColumnMeta biasedColumn = null;
+        IndexMeta primaryKey = tableMeta.getPrimaryIndex();
+        if (primaryKey != null && primaryKey.getKeyColumns().size() > 1) {
+            biasedColumn = primaryKey.getKeyColumns().get(0);
+        }
+
+        // map column to SN in select list
+        Map<ColumnMeta, Integer> columnIdMap = Maps.newHashMap();
+        for (int i = 0; i < analyzeColumnList.size(); i++) {
+            columnIdMap.put(analyzeColumnList.get(i), i);
+        }
+
+        // find candidate hot column set
+        Set<BitSet> columnBitSet = Sets.newHashSet();
+        for (IndexMeta indexMeta : tableMeta.getIndexes()) {
+            BitSet bit = new BitSet();
+            for (ColumnMeta column : indexMeta.getKeyColumns()) {
+                // skip any index start with biasedColumn
+                if (column == biasedColumn) {
+                    break;
+                }
+                if (!supportSkewCheck(column)) {
+                    break;
+                }
+                Integer id = columnIdMap.get(column);
+                bit.set(id);
+                if (!columnBitSet.contains(bit)) {
+                    columnBitSet.add((BitSet) bit.clone());
+                }
+            }
+        }
+
+        // sort according to cardinality
+        List<BitSet> orderedColumns = columnBitSet.stream().sorted((x, y) -> {
+            if (x.cardinality() > y.cardinality()) {
+                return -1;
+            }
+            if (x.cardinality() < y.cardinality()) {
+                return 1;
+            }
+            return x.toString().compareTo(y.toString());
+        }).collect(Collectors.toList());
+        List<List<Integer>> columnSns = Lists.newArrayList();
+        for (BitSet bitSet : orderedColumns) {
+
+            List<Integer> columnSn = Lists.newArrayList();
+            for (int i = bitSet.nextSetBit(0); i >= 0; i = bitSet.nextSetBit(i + 1)) {
+                columnSn.add(i);
+            }
+            columnSns.add(columnSn);
+        }
+        return columnSns;
+    }
+
+    static class ColumnListCounter {
+        List<Integer> columnSn;
+        Row row;
+        List<ColumnMeta> analyzeColumnList;
+
+        public ColumnListCounter(List<Integer> columnSn, Row row, List<ColumnMeta> analyzeColumnList) {
+            this.columnSn = columnSn;
+            this.row = row;
+            this.analyzeColumnList = analyzeColumnList;
+        }
+
+        @Override
+        public int hashCode() {
+            int hashCode = 1;
+            for (int sn : columnSn) {
+                hashCode = 31 * hashCode + Objects.hashCode(row.getObject(sn));
+            }
+            return hashCode;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (obj == null || getClass() != obj.getClass()) {
+                return false;
+            }
+            ColumnListCounter other = (ColumnListCounter) obj;
+            for (int sn : columnSn) {
+                if (analyzeColumnList.get(sn).getDataType().compare(row.getObject(sn), other.row.getObject(sn)) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    private static boolean orderedContain(List<Integer> source, List<Integer> target) {
+        int tLoc = 0;
+        for (int cur : source) {
+            if (cur > target.get(tLoc)) {
+                return false;
+            }
+            if (cur == target.get(tLoc)) {
+                tLoc++;
+            }
+            if (tLoc == target.size()) {
+                return true;
+            }
+        }
+        return tLoc == target.size();
+    }
+
+    public static void buildSkew(
+        String schemaName,
+        String logicalTableName,
+        List<ColumnMeta> analyzeColumnList,
+        List<Row> rows,
+        float sampleRate) {
+
+        if (rows.size() == 0) {
+            return;
+        }
+        List<List<Integer>> columnSns = buildColumnBitSet(schemaName, logicalTableName, analyzeColumnList);
+
+        // check skew
+        List<Set<String>> skewCols = Lists.newArrayList();
+        List<List<Integer>> ansColumnSns = Lists.newArrayList();
+        for (List<Integer> columnSn : columnSns) {
+
+            // check where super set is marked as hot
+            boolean covered = false;
+            for (List<Integer> ansColumnSn : ansColumnSns) {
+                if (orderedContain(ansColumnSn, columnSn)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) {
+                continue;
+            }
+
+            StreamSummary<ColumnListCounter> summary = new StreamSummary<>(10000);
+            for (Row r : rows) {
+                summary.offer(new ColumnListCounter(columnSn, r, analyzeColumnList));
+            }
+            long count = summary.topK(1).get(0).getCount();
+            // The criterion for skewness is temporarily set as having the same quantity of sample values greater than 5
+            // and estimated values exceeding 10,000.
+            if (count > 5 && (count / sampleRate) > 10000) {
+                ansColumnSns.add(columnSn);
+            }
+        }
+
+        for (List<Integer> ansColumnSn : ansColumnSns) {
+            Set<String> columnSet = Sets.newHashSet();
+            for (int sn : ansColumnSn) {
+                columnSet.add(analyzeColumnList.get(sn).getName().toLowerCase());
+            }
+            skewCols.add(columnSet);
+        }
+
+        StatisticManager.getInstance().getCacheLine(schemaName, logicalTableName).setSkewCols(skewCols);
+    }
+
+    private static boolean supportSkewCheck(ColumnMeta columnMeta) {
+        DataType dataType = columnMeta.getDataType();
+        return DataTypeUtil.isStringType(dataType) ||
+            DataTypeUtil.isUnderLongType(dataType) ||
+            DataTypeUtil.isDateType(dataType);
+    }
+
+    /**
+     * check whether to use new topN for specific column
+     *
+     * @return true if can use new topN
+     */
+    public static boolean canUseNewTopN(String schemaName, String logicalTableName, String columnName) {
+        // don't use new
+        if (!InstConfUtil.getBool(ConnectionParams.NEW_TOPN)) {
+            return false;
+        }
+        if (StringUtils.isEmpty(columnName)) {
+            return false;
+        }
+        TableMeta tableMeta =
+            OptimizerContext.getContext(schemaName).getLatestSchemaManager().getTable(logicalTableName);
+
+        // check prefix of primary key
+        IndexMeta primaryKey = tableMeta.getPrimaryIndex();
+        if (primaryKey != null) {
+            for (ColumnMeta column : primaryKey.getKeyColumns()) {
+                if (columnName.equalsIgnoreCase(column.getName())) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private static Row purgeRowForHistogram(Row r, int size) {
@@ -642,7 +961,13 @@ public class StatisticUtils {
                         columnValue = Arrays.copyOfRange(byteArray, 0, DATA_MAX_LEN);
                     }
                 }
-                tmpRow.setObject(i, columnValue);
+                DataType dt = r.getParentCursorMeta().getColumnMeta(i).getDataType();
+                if (DataTypeUtil.isMysqlTimeType(dt)) {
+                    byte[] bytes = r.getBytes(i);
+                    tmpRow.setObject(i, packDateTypeToLong(dt, bytes));
+                } else {
+                    tmpRow.setObject(i, columnValue);
+                }
             } catch (Throwable e) {
                 // deal with TResultSet getObject error
                 continue;
@@ -672,6 +997,7 @@ public class StatisticUtils {
             ec.setTransaction(trx);
             ec.setStats(new MatrixStatistics());
             ec.setPhysicalRecorder(new SQLRecorder(100));
+            ec.getParamManager().getProps().put(ConnectionParams.CHOOSE_STREAMING.getName(), "true");
             ExecutionPlan plan = Planner.getInstance().plan(ByteString.from(sql), ec);
             rc = PlanExecutor.execute(plan, ec);
 
@@ -724,10 +1050,10 @@ public class StatisticUtils {
             } else {
                 sql.append(",");
             }
-            sql.append("`" + columnMeta.getName() + "`");
+            sql.append(SqlIdentifier.surroundWithBacktick(columnMeta.getName()));
         }
         sql.append(" from ");
-        sql.append("`" + logicalTableName + "`");
+        sql.append(SqlIdentifier.surroundWithBacktick(logicalTableName));
         return sql.toString();
     }
 
@@ -735,7 +1061,8 @@ public class StatisticUtils {
                                                          float sampleRate) {
         StringBuilder sql = new StringBuilder();
 
-        sql.append("/*+TDDL:cmd_extra(MERGE_UNION=false,ENABLE_DIRECT_PLAN=false) */ ")
+        sql.append(
+                "/*+TDDL:cmd_extra(MERGE_CONCURRENT=true,ENABLE_DIRECT_PLAN=false,ENABLE_COLUMNAR_SCAN_EXEC=false) */ ")
             .append("select ");
         boolean first = true;
         for (ColumnMeta columnMeta : columnMetaList) {
@@ -744,9 +1071,9 @@ public class StatisticUtils {
             } else {
                 sql.append(",");
             }
-            sql.append("`").append(columnMeta.getName()).append("`");
+            sql.append(SqlIdentifier.surroundWithBacktick(columnMeta.getName()));
         }
-        sql.append(" from ").append("`").append(logicalTableName).append("`");
+        sql.append(" from ").append(SqlIdentifier.surroundWithBacktick(logicalTableName));
 
         if (sampleRate > 0f && sampleRate < 1f) {
             sql.append(" where rand() < ");
@@ -992,19 +1319,15 @@ public class StatisticUtils {
         Map<String, Set<String>> topology;
         if (partitionInfoManager.isNewPartDbTable(tableName)) {
             PartitionInfo partitionInfo = partitionInfoManager.getPartitionInfo(tableName);
-            if (partitionInfo.getSubPartitionBy() != null) {
-                return null;
-//                throw new AssertionError("do not support subpartition for statistic collector");
-            } else {
-                List<PartitionSpec> partitionSpecs = partitionInfo.getPartitionBy().getPartitions();
-                topology = new HashMap<>();
-                for (PartitionSpec partitionSpec : partitionSpecs) {
-                    String groupKey = partitionSpec.getLocation().getGroupKey();
-                    String physicalTableName = partitionSpec.getLocation().getPhyTableName();
-                    Set<String> physicalTableNames = topology.computeIfAbsent(groupKey, k -> new HashSet<>());
-                    physicalTableNames.add(physicalTableName);
-                }
+            List<PartitionSpec> partitionSpecs = partitionInfo.getPartitionBy().getPhysicalPartitions();
+            topology = new HashMap<>();
+            for (PartitionSpec partitionSpec : partitionSpecs) {
+                String groupKey = partitionSpec.getLocation().getGroupKey();
+                String physicalTableName = partitionSpec.getLocation().getPhyTableName();
+                Set<String> physicalTableNames = topology.computeIfAbsent(groupKey, k -> new HashSet<>());
+                physicalTableNames.add(physicalTableName);
             }
+
         } else {
             TddlRuleManager tddlRuleManager = op.getRuleManager();
             TableRule tableRule = tddlRuleManager.getTableRule(tableName);
@@ -1046,6 +1369,100 @@ public class StatisticUtils {
         }
 
         return rs;
+    }
+
+    /**
+     * full rowcount collection
+     */
+    public static void collectRowCountAll() throws SQLException {
+        long start = System.currentTimeMillis();
+        Set<String> dnIds =
+            StorageHaManager.getInstance().getMasterStorageList().stream().filter(s -> !s.isMetaDb())
+                .map(StorageInstHaContext::getStorageInstId).collect(
+                    Collectors.toSet());
+        Map<String, Map<String, Long>> rowCountMap = Maps.newHashMap();
+        for (String dnId : dnIds) {
+            try {
+                Map<String, Map<String, Long>> rowRs = collectRowCountAll(dnId, null);
+                if (rowRs != null) {
+                    rowCountMap.putAll(rowRs);
+                }
+            } catch (Throwable e) {
+                throw e;
+            }
+        }
+
+        int count = 0;
+        for (Map.Entry<String, Map<String, StatisticManager.CacheLine>> entry : StatisticManager.getInstance()
+            .getStatisticCache().entrySet()) {
+            String schema = entry.getKey();
+            if (SystemDbHelper.isDBBuildIn(schema)) {
+                continue;
+            }
+            Map<String, StatisticManager.CacheLine> tbCacheLine = entry.getValue();
+            for (Map.Entry<String, StatisticManager.CacheLine> entry1 : tbCacheLine.entrySet()) {
+                String tbName = entry1.getKey();
+                StatisticManager.CacheLine cl = entry1.getValue();
+                Map<String, Set<String>> topologyMap = getTopology(schema, tbName);
+                if (topologyMap == null || isFileStore(schema, tbName)) {
+                    // skip file store
+                    continue;
+                }
+
+                long sum = sumRowCount(topologyMap, rowCountMap);
+                cl.setRowCount(sum);
+                count++;
+            }
+        }
+
+        long end = System.currentTimeMillis();
+        ModuleLogInfo.getInstance()
+            .logRecord(
+                Module.STATISTICS,
+                PROCESS_END,
+                new String[] {
+                    STATISTIC_ROWCOUNT_COLLECTION.name(),
+                    "collectRowCount :" + dnIds.size() + "," + count + " tables statistics consuming "
+                        + (end - start) / 1000.0 + " seconds"
+                },
+                NORMAL
+            );
+        persistRowCountStatistic();
+    }
+
+    /**
+     * persist rowcount info to meta
+     */
+    public static void persistRowCountStatistic() {
+        long start = System.currentTimeMillis();
+        ArrayList<SystemTableTableStatistic.Row> rowList = new ArrayList<>();
+
+        for (Map.Entry<String, Map<String, StatisticManager.CacheLine>> entry : StatisticManager.getInstance()
+            .getStatisticCache().entrySet()) {
+            String schema = entry.getKey();
+            Map<String, StatisticManager.CacheLine> tbCacheLine = entry.getValue();
+            for (Map.Entry<String, StatisticManager.CacheLine> entry1 : tbCacheLine.entrySet()) {
+                String tbName = entry1.getKey();
+                StatisticManager.CacheLine cl = entry1.getValue();
+                if (cl.getRowCount() > 0) {
+                    rowList.add(new SystemTableTableStatistic.Row(schema, tbName.toLowerCase(), cl.getRowCount(),
+                        cl.getLastModifyTime()));
+                }
+            }
+        }
+
+        StatisticManager.getInstance().getSds().batchReplace(rowList);
+        long end = System.currentTimeMillis();
+        ModuleLogInfo.getInstance()
+            .logRecord(
+                Module.STATISTICS,
+                PROCESS_END,
+                new String[] {
+                    "persist tables statistics",
+                    rowList.size() + " tables consuming " + (end - start) / 1000.0 + " seconds"
+                },
+                NORMAL
+            );
     }
 
     public static long sumRowCount(Map<String, Set<String>> topologyMap, Map<String, Map<String, Long>> rowCountMap) {

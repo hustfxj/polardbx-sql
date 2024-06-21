@@ -20,6 +20,7 @@ import com.alibaba.polardbx.common.CrcAccumulator;
 import com.alibaba.polardbx.common.charset.MySQLUnicodeUtils;
 import com.alibaba.polardbx.common.datatype.DecimalConverter;
 import com.alibaba.polardbx.common.datatype.DecimalStructure;
+import com.alibaba.polardbx.common.datatype.UInt64;
 import com.alibaba.polardbx.common.datatype.UInt64Utils;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
@@ -30,10 +31,12 @@ import com.alibaba.polardbx.executor.archive.pruning.OssAggPruner;
 import com.alibaba.polardbx.executor.archive.pruning.OssOrcFilePruner;
 import com.alibaba.polardbx.executor.archive.pruning.PruningResult;
 import com.alibaba.polardbx.executor.chunk.BlockBuilder;
+import com.alibaba.polardbx.executor.columnar.CSVRow;
 import com.alibaba.polardbx.optimizer.config.table.StripeColumnMeta;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
 import com.alibaba.polardbx.optimizer.core.field.SessionProperties;
 import com.alibaba.polardbx.optimizer.core.row.Row;
+import com.google.common.base.Preconditions;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.hadoop.hive.ql.exec.vector.ColumnVector;
 import org.apache.hadoop.hive.ql.exec.vector.LongColumnVector;
@@ -42,6 +45,7 @@ import org.apache.orc.IntegerColumnStatistics;
 import org.apache.orc.TypeDescription;
 import org.apache.orc.sarg.PredicateLeaf;
 
+import java.math.BigInteger;
 import java.time.ZoneId;
 import java.util.Map;
 import java.util.Optional;
@@ -54,7 +58,8 @@ class UnsignedLongColumnProvider implements ColumnProvider<Long> {
     }
 
     @Override
-    public void transform(ColumnVector vector, BlockBuilder blockBuilder, int startIndex, int endIndex, SessionProperties sessionProperties) {
+    public void transform(ColumnVector vector, BlockBuilder blockBuilder, int startIndex, int endIndex,
+                          SessionProperties sessionProperties) {
         long[] array = ((LongColumnVector) vector).vector;
         for (int i = startIndex; i < endIndex; i++) {
             int idx = i;
@@ -70,7 +75,8 @@ class UnsignedLongColumnProvider implements ColumnProvider<Long> {
     }
 
     @Override
-    public void transform(ColumnVector vector, BlockBuilder blockBuilder, int[] selection, int selSize, SessionProperties sessionProperties) {
+    public void transform(ColumnVector vector, BlockBuilder blockBuilder, int[] selection, int selSize,
+                          SessionProperties sessionProperties) {
         long[] array = ((LongColumnVector) vector).vector;
         for (int i = 0; i < selSize; i++) {
             int idx = selection[i];
@@ -102,29 +108,47 @@ class UnsignedLongColumnProvider implements ColumnProvider<Long> {
     }
 
     @Override
-    public void putRow(ColumnVector columnVector, int rowNumber, Row row, int columnId, DataType dataType, ZoneId timezone, Optional<CrcAccumulator> accumulator) {
+    public void putRow(ColumnVector columnVector, int rowNumber, Row row, int columnId, DataType dataType,
+                       ZoneId timezone, Optional<CrcAccumulator> accumulator) {
         if (row instanceof XRowSet) {
             try {
-                ((XRowSet) row).fastParseToColumnVector(columnId, ColumnProviders.UTF_8, columnVector, rowNumber, true, accumulator);
+                ((XRowSet) row).fastParseToColumnVector(columnId, ColumnProviders.UTF_8, columnVector, rowNumber, true,
+                    accumulator);
             } catch (Exception e) {
                 throw GeneralUtil.nestedException(e);
             }
         } else {
-            Long num = row.getLong(columnId);
-            if (num == null) {
+            Object val = row.getObject(columnId);
+            if (val == null) {
                 columnVector.isNull[rowNumber] = true;
                 columnVector.noNulls = false;
                 ((LongColumnVector) columnVector).vector[rowNumber] = 0 ^ UInt64Utils.FLIP_MASK;
                 accumulator.ifPresent(CrcAccumulator::appendNull);
             } else {
-                ((LongColumnVector) columnVector).vector[rowNumber] = num ^ UInt64Utils.FLIP_MASK;
-                accumulator.ifPresent(a -> a.appendHash(Long.hashCode(num)));
+                BigInteger bigIntegerValue = BigInteger.valueOf(((Number) val).longValue());
+                UInt64 uInt64Value = UInt64.fromBigInteger(bigIntegerValue);
+                long longValue = uInt64Value.longValue();
+                ((LongColumnVector) columnVector).vector[rowNumber] = longValue ^ UInt64Utils.FLIP_MASK;
+                accumulator.ifPresent(a -> a.appendHash(Long.hashCode(longValue)));
             }
         }
     }
 
     @Override
-    public PruningResult prune(PredicateLeaf predicateLeaf, ColumnStatistics columnStatistics, Map<Long, StripeColumnMeta> stripeColumnMetaMap) {
+    public void parseRow(BlockBuilder blockBuilder, CSVRow row, int columnId, DataType dataType) {
+        if (row.isNullAt(columnId)) {
+            blockBuilder.appendNull();
+            return;
+        }
+
+        byte[] bytes = row.getBytes(columnId);
+        long result = ColumnProvider.longFromByte(bytes, bytes.length);
+        blockBuilder.writeLong(result);
+    }
+
+    @Override
+    public PruningResult prune(PredicateLeaf predicateLeaf, ColumnStatistics columnStatistics,
+                               Map<Long, StripeColumnMeta> stripeColumnMetaMap) {
         return OssOrcFilePruner.pruneLong(predicateLeaf, columnStatistics, stripeColumnMetaMap);
     }
 
@@ -135,7 +159,8 @@ class UnsignedLongColumnProvider implements ColumnProvider<Long> {
     }
 
     @Override
-    public void fetchStatistics(ColumnStatistics columnStatistics, SqlKind aggKind, BlockBuilder blockBuilder, DataType dataType, SessionProperties sessionProperties) {
+    public void fetchStatistics(ColumnStatistics columnStatistics, SqlKind aggKind, BlockBuilder blockBuilder,
+                                DataType dataType, SessionProperties sessionProperties) {
         IntegerColumnStatistics integerColumnStatistics = (IntegerColumnStatistics) columnStatistics;
         if (integerColumnStatistics.getNumberOfValues() == 0) {
             blockBuilder.appendNull();
@@ -158,7 +183,8 @@ class UnsignedLongColumnProvider implements ColumnProvider<Long> {
         }
 
         case SUM: {
-            throw new TddlRuntimeException(ErrorCode.ERR_EXECUTE_ON_OSS, new UnsupportedOperationException(), "unsupported sum type.");
+            throw new TddlRuntimeException(ErrorCode.ERR_EXECUTE_ON_OSS, new UnsupportedOperationException(),
+                "unsupported sum type.");
         }
         }
     }

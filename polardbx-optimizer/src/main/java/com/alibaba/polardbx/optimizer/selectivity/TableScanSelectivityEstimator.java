@@ -16,7 +16,6 @@
 
 package com.alibaba.polardbx.optimizer.selectivity;
 
-import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.config.meta.DrdsRelMdSelectivity;
 import com.alibaba.polardbx.optimizer.config.table.ColumnMeta;
@@ -238,7 +237,11 @@ public class TableScanSelectivityEstimator extends AbstractSelectivityEstimator 
                 if (columnMeta != null && value != null) {
                     StatisticResult statisticResult =
                         StatisticManager.getInstance().getFrequency(tableMeta.getSchemaName(),
-                            tableMeta.getTableName(), columnMeta.getName(), value.toString());
+                            tableMeta.getTableName(), columnMeta.getName(), value.toString(),
+                            plannerContext.isNeedStatisticTrace());
+                    if (plannerContext.isNeedStatisticTrace()) {
+                        plannerContext.recordStatisticTrace(statisticResult.getTrace());
+                    }
                     long count = statisticResult.getLongValue();
                     if (count >= 0) {
                         if (result == null) {
@@ -321,34 +324,40 @@ public class TableScanSelectivityEstimator extends AbstractSelectivityEstimator 
 
                     for (RexNode rexNode : ((RexCall) rightRexNode).operands) {
                         Object value = DrdsRexFolder.fold(rexNode, plannerContext);
+
                         if (value instanceof List) {
-                            for (Object o : (List) value) {
-                                StatisticResult statisticResult = StatisticManager.getInstance()
-                                    .getFrequency(tableMeta.getSchemaName(), tableMeta.getTableName(),
-                                        columnMeta.getName(), o.toString());
-                                long count = statisticResult.getLongValue();
-                                if (count >= 0) {
-                                    if (inCount == null) {
-                                        inCount = count;
-                                    } else {
-                                        inCount += count;
-                                    }
-                                } else if (CBOUtil.isIndexColumn(tableMeta, columnMeta)) {
-                                    // lack of statistics
-                                    count =
-                                        Math.min(LACK_OF_STATISTICS_INDEX_EQUAL_ROW_COUNT, tableRowCount.longValue());
-                                    if (inCount == null) {
-                                        inCount = count;
-                                    } else {
-                                        inCount += count;
-                                    }
+                            StatisticResult statisticResult = StatisticManager.getInstance()
+                                .getFrequency(tableMeta.getSchemaName(), tableMeta.getTableName(),
+                                    columnMeta.getName(), (List) value, plannerContext.isNeedStatisticTrace());
+                            if (plannerContext.isNeedStatisticTrace()) {
+                                plannerContext.recordStatisticTrace(statisticResult.getTrace());
+                            }
+                            long count = statisticResult.getLongValue();
+                            if (count >= 0) {
+                                if (inCount == null) {
+                                    inCount = count;
+                                } else {
+                                    inCount += count;
+                                }
+                            } else if (CBOUtil.isIndexColumn(tableMeta, columnMeta)) {
+                                // lack of statistics
+                                int rowSize = ((List<?>) value).size();
+                                count = rowSize * Math.min(LACK_OF_STATISTICS_INDEX_EQUAL_ROW_COUNT,
+                                    tableRowCount.longValue());
+                                if (inCount == null) {
+                                    inCount = count;
+                                } else {
+                                    inCount += count;
                                 }
                             }
                         } else if (value != null) {
                             StatisticResult statisticResult =
                                 StatisticManager.getInstance()
                                     .getFrequency(tableMeta.getSchemaName(), tableMeta.getTableName(),
-                                        columnMeta.getName(), value.toString());
+                                        columnMeta.getName(), value.toString(), plannerContext.isNeedStatisticTrace());
+                            if (plannerContext.isNeedStatisticTrace()) {
+                                plannerContext.recordStatisticTrace(statisticResult.getTrace());
+                            }
                             long count = statisticResult.getLongValue();
                             if (count >= 0) {
                                 if (inCount == null) {
@@ -611,7 +620,10 @@ public class TableScanSelectivityEstimator extends AbstractSelectivityEstimator 
             } else {
                 StatisticResult statisticResult = StatisticManager.getInstance()
                     .getRangeCount(tableMeta.getSchemaName(), tableMeta.getTableName(), columnMeta.getName(), lower,
-                        lowerInclusive, upper, upperInclusive);
+                        lowerInclusive, upper, upperInclusive, plannerContext.isNeedStatisticTrace());
+                if (plannerContext.isNeedStatisticTrace()) {
+                    plannerContext.recordStatisticTrace(statisticResult.getTrace());
+                }
                 long count = statisticResult.getLongValue();
                 if (count >= 0) {
                     if (minCount == null) {
@@ -667,7 +679,10 @@ public class TableScanSelectivityEstimator extends AbstractSelectivityEstimator 
                 if (columnMeta != null && value != null) {
                     StatisticResult countResult = StatisticManager.getInstance()
                         .getFrequency(tableMeta.getSchemaName(), tableMeta.getTableName(), columnMeta.getName(),
-                            value.toString());
+                            value.toString(), plannerContext.isNeedStatisticTrace());
+                    if (plannerContext.isNeedStatisticTrace()) {
+                        plannerContext.recordStatisticTrace(countResult.getTrace());
+                    }
                     long count = countResult.getLongValue();
                     if (count >= 0) {
                         selectivity = selectivity * (tableRowCount - count) / tableRowCount;
@@ -706,12 +721,15 @@ public class TableScanSelectivityEstimator extends AbstractSelectivityEstimator 
                         long count;
                         StatisticResult statisticResult =
                             StatisticManager.getInstance().getNullCount(tableMeta.getSchemaName(),
-                                tableMeta.getTableName(), columnMeta.getName());
+                                tableMeta.getTableName(), columnMeta.getName(), plannerContext.isNeedStatisticTrace());
+                        if (plannerContext.isNeedStatisticTrace()) {
+                            plannerContext.recordStatisticTrace(statisticResult.getTrace());
+                        }
                         long nullCount = statisticResult.getLongValue();
                         if (pred.isA(SqlKind.IS_NULL)) {
-                            count = Math.min(nullCount, (long) tableMeta.getRowCount());
+                            count = Math.min(nullCount, (long) tableMeta.getRowCount(plannerContext));
                         } else { // is not null
-                            count = Math.max((long) tableMeta.getRowCount() - nullCount, 0);
+                            count = Math.max((long) tableMeta.getRowCount(plannerContext) - nullCount, 0);
                         }
 
                         if (minCount == null) {

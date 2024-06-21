@@ -16,12 +16,13 @@
 
 package com.alibaba.polardbx.executor.sync;
 
+import com.alibaba.polardbx.executor.cursor.ResultCursor;
 import com.alibaba.polardbx.gms.module.LogLevel;
 import com.alibaba.polardbx.gms.module.Module;
-import com.alibaba.polardbx.executor.cursor.ResultCursor;
 import com.alibaba.polardbx.gms.module.ModuleLogInfo;
 import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
 import com.alibaba.polardbx.optimizer.core.planner.PlanCache;
+import com.alibaba.polardbx.optimizer.planmanager.PlanManager;
 
 import static com.alibaba.polardbx.gms.module.LogPattern.PROCESS_END;
 
@@ -76,8 +77,8 @@ public class UpdateStatisticSyncAction implements ISyncAction {
                     StatisticManager.CacheLine.deserializeFromJson(getJsonString()));
         }
 
-        // refresh plancache
-        PlanCache.getInstance().invalidate(logicalTableName);
+        // refresh plan cache
+        PlanCache.getInstance().invalidateByTable(schemaName, logicalTableName);
         // reload ndv sketch
         StatisticManager.getInstance().reloadNDVbyTableName(schemaName, logicalTableName);
         ModuleLogInfo.getInstance()

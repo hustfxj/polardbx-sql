@@ -18,9 +18,7 @@ package com.alibaba.polardbx.executor.ddl.job.task.basic.pl.udf;
 
 import com.alibaba.fastjson.annotation.JSONCreator;
 import com.alibaba.polardbx.common.ddl.newengine.DdlTaskState;
-import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
 import com.alibaba.polardbx.executor.ddl.job.task.BaseDdlTask;
-import com.alibaba.polardbx.executor.ddl.job.task.BasePhyDdlTask;
 import com.alibaba.polardbx.executor.ddl.job.task.util.TaskName;
 import com.alibaba.polardbx.executor.utils.ExecUtils;
 import com.alibaba.polardbx.gms.topology.DbTopologyManager;
@@ -44,12 +42,8 @@ public class DropFunctionOnAllDnTask extends BaseDdlTask {
     }
 
     @Override
-    protected void beforeTransaction(ExecutionContext executionContext) {
-        updateTaskStateInNewTxn(DdlTaskState.DIRTY);
-        executeImpl(executionContext);
-    }
-
-    public void executeImpl(ExecutionContext executionContext) {
+    protected void duringTransaction(Connection metaDbConnection, ExecutionContext executionContext) {
+        updateSupportedCommands(true, false, metaDbConnection);
         Set<String> allDnId = ExecUtils.getAllDnStorageId();
         for (String dnId : allDnId) {
             try (Connection conn = DbTopologyManager.getConnectionForStorage(dnId);

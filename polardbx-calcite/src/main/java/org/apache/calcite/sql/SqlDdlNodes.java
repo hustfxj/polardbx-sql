@@ -16,9 +16,11 @@
  */
 package org.apache.calcite.sql;
 
+import com.alibaba.polardbx.common.constants.SequenceAttribute.Type;
 import com.alibaba.polardbx.druid.sql.ast.SQLPartitionByRange;
 import com.google.common.collect.ImmutableList;
 import com.alibaba.polardbx.common.constants.SequenceAttribute.Type;
+import groovy.sql.Sql;
 import org.apache.calcite.jdbc.CalcitePrepare;
 import org.apache.calcite.jdbc.CalciteSchema;
 import org.apache.calcite.sql.SqlAlterTable.ColumnOpt;
@@ -42,13 +44,27 @@ public class SqlDdlNodes {
     }
 
     public static SqlCreateDatabase createDatabase(SqlParserPos pos, boolean ifNotExists, SqlIdentifier dbName,
-                                                   String charSet, String collate, String locality,
-                                                   String partitionMode) {
-        return new SqlCreateDatabase(pos, ifNotExists, dbName, charSet, collate, locality, partitionMode);
+                                                   String charSet, String collate, Boolean encryption, String locality,
+                                                   String partitionMode, Boolean defaultSingle,
+                                                   SqlIdentifier sourceDataBase, boolean like, boolean as,
+                                                   List<SqlIdentifier> includeTables, List<SqlIdentifier> excludeTables,
+                                                   boolean withLock, boolean dryRun, boolean createTables) {
+        return new SqlCreateDatabase(pos, ifNotExists, dbName, charSet, collate, encryption, locality, partitionMode,
+            defaultSingle, sourceDataBase, like, as, includeTables, excludeTables, withLock, dryRun, createTables);
     }
 
     public static SqlDropDatabase dropDatabase(SqlParserPos pos, boolean ifExists, SqlIdentifier dbName) {
         return new SqlDropDatabase(pos, ifExists, dbName);
+    }
+
+    public static SqlCreateJavaFunction createJavaFunction(SqlParserPos pos, String funcName,
+                                                           String returnType, List<String> inputTypes,
+                                                           String javaCode, boolean noState) {
+        return new SqlCreateJavaFunction(pos, funcName, returnType, inputTypes, javaCode, noState);
+    }
+
+    public static SqlDropJavaFunction dropJavaFunction(SqlParserPos pos, String funcName, boolean ifExists) {
+        return new SqlDropJavaFunction(pos, funcName, ifExists);
     }
 
     /**
@@ -92,7 +108,7 @@ public class SqlDdlNodes {
      */
     public static SqlCreateView createView(SqlParserPos pos, boolean replace,
                                            SqlIdentifier name, SqlNodeList columnList, SqlNode query) {
-        return new SqlCreateView(pos, replace, name, columnList, query);
+        return new SqlCreateView(pos, replace, false, name, columnList, query);
     }
 
     /**
@@ -112,12 +128,12 @@ public class SqlDdlNodes {
     }
 
     public static SqlDropIndex dropIndex(SqlIdentifier name, SqlIdentifier tableName, String sql, SqlParserPos pos) {
-        return new SqlDropIndex(name, tableName, sql, pos);
+        return new SqlDropIndex(name, name, tableName, sql, pos);
     }
 
-    public static SqlAlterTableDropIndex alterTabledropIndex(SqlIdentifier tableName, SqlIdentifier indexName,
+    public static SqlAlterTableDropIndex alterTableDropIndex(SqlIdentifier tableName, SqlIdentifier indexName,
                                                              String sql, SqlParserPos pos) {
-        return new SqlAlterTableDropIndex(tableName, indexName, sql, pos);
+        return new SqlAlterTableDropIndex(tableName, indexName, indexName, sql, pos);
     }
 
     public static SqlCreateSequence createSequence(SqlCharStringLiteral name, SqlIdentifier tableName, String sql,
@@ -144,11 +160,28 @@ public class SqlDdlNodes {
         return new SqlRenameTable(to, tableName, sql, pos);
     }
 
-    public static SqlAlterTable alterTable(List<SqlIdentifier> objectNames, SqlIdentifier tableName, Map<ColumnOpt, List<String>> columnOpts,
+    public static SqlRenameTables renameTables(List<Pair<SqlIdentifier, SqlIdentifier>> tableNameList, String sql,
+                                               SqlParserPos pos) {
+        return new SqlRenameTables(tableNameList, sql, pos);
+    }
+
+    public static SqlAlterTable alterTable(List<SqlIdentifier> objectNames, SqlIdentifier tableName,
+                                           Map<ColumnOpt, List<String>> columnOpts,
                                            String sql, SqlTableOptions tableOptions,
                                            List<SqlAlterSpecification> alters,
                                            SqlParserPos pos) {
-        return new SqlAlterTable(objectNames, tableName, columnOpts, sql, tableOptions, alters, pos);
+        return new SqlAlterTable(objectNames, tableName, columnOpts, sql, tableOptions, alters, false, null, pos);
+    }
+
+    public static SqlAlterTable alterTable(List<SqlIdentifier> objectNames, SqlIdentifier tableName,
+                                           Map<ColumnOpt, List<String>> columnOpts,
+                                           String sql, SqlTableOptions tableOptions,
+                                           List<SqlAlterSpecification> alters,
+                                           boolean fromAlterIndexPartition,
+                                           SqlNode alterIndexName,
+                                           SqlParserPos pos) {
+        return new SqlAlterTable(objectNames, tableName, columnOpts, sql, tableOptions, alters, fromAlterIndexPartition,
+            alterIndexName, pos);
     }
 
     public static SqlAlterRule alterRule(SqlIdentifier tableName, String sql, SqlParserPos pos) {
@@ -156,8 +189,8 @@ public class SqlDdlNodes {
     }
 
     public static SqlAlterTableSetTableGroup alterTableSetTableGroup(List<SqlIdentifier> objectNames, SqlIdentifier tableName, String targetTableGroup,
-                                                                     String sql, SqlParserPos pos, boolean force) {
-        return new SqlAlterTableSetTableGroup(objectNames, tableName, targetTableGroup, sql, pos, force);
+                                                                     String sql, SqlParserPos pos, boolean implicit, boolean force) {
+        return new SqlAlterTableSetTableGroup(objectNames, tableName, targetTableGroup, sql, pos, implicit, force);
     }
 
     /**
@@ -168,7 +201,8 @@ public class SqlDdlNodes {
                                  SpecialIndex specialIndex, SqlLiteral comment, ColumnFormat columnFormat,
                                  Storage storage, SqlReferenceDefinition referenceDefinition,
                                  boolean onUpdateCurrentTimestamp, Type autoIncrementType, int unitCount,
-                                 int unitIndex, int innerStep) {
+                                 int unitIndex, int innerStep, boolean generatedAlways, boolean generatedAlwaysLogical,
+                                 SqlCall generatedAlwaysExpr) {
         return new SqlColumnDeclaration(pos,
             name,
             dataType,
@@ -185,7 +219,10 @@ public class SqlDdlNodes {
             autoIncrementType,
             unitCount,
             unitIndex,
-            innerStep);
+            innerStep,
+            generatedAlways,
+            generatedAlwaysLogical,
+            generatedAlwaysExpr);
     }
 
     /**
@@ -232,6 +269,15 @@ public class SqlDdlNodes {
             null, null, null);
     }
 
+    public static SqlAlterTableDiscardTableSpace alterTableDiscardTableSpace(SqlIdentifier tableName,
+                                                                             String sourceSql) {
+        return (new SqlAlterTableDiscardTableSpace(SqlParserPos.ZERO, tableName, sourceSql));
+    }
+
+    public static SqlAlterTableImportTableSpace alterTableImportTableSpace(SqlIdentifier tableName,
+                                                                           String sourceSql) {
+        return (new SqlAlterTableImportTableSpace(SqlParserPos.ZERO, tableName, sourceSql));
+    }
 }
 
 // End SqlDdlNodes.java

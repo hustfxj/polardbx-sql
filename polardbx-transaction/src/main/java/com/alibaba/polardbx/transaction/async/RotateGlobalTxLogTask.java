@@ -19,11 +19,15 @@ package com.alibaba.polardbx.transaction.async;
 import com.alibaba.polardbx.common.IdGenerator;
 import com.alibaba.polardbx.common.jdbc.IDataSource;
 import com.alibaba.polardbx.common.properties.DynamicConfig;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.AsyncUtils;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.common.utils.logger.MDC;
 import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.executor.utils.ExecUtils;
+import com.alibaba.polardbx.gms.config.impl.InstConfUtil;
+import com.alibaba.polardbx.group.jdbc.TGroupDataSource;
 import com.alibaba.polardbx.transaction.TransactionExecutor;
 import com.alibaba.polardbx.transaction.TransactionLogger;
 import com.alibaba.polardbx.transaction.TransactionManager;
@@ -31,9 +35,16 @@ import com.alibaba.polardbx.transaction.log.GlobalTxLogManager;
 
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 
 public class RotateGlobalTxLogTask implements Runnable {
 
@@ -50,8 +61,11 @@ public class RotateGlobalTxLogTask implements Runnable {
 
     private int purgedCount;
 
+    private static Lock globalLock = new ReentrantLock();
+
     /**
-     * RotateGlobalTxLogTask will keep the global tx log in [now() - beforeSeconds, now() + nextSeconds].
+     * Purge trans log created before {@param beforeSeconds}, and split the last partition into
+     * [current_max, {@param nextSeconds}) and [{@param nextSeconds}, unlimited) if necessary.
      */
     public RotateGlobalTxLogTask(TransactionExecutor executor, Calendar startTime, Calendar endTime,
                                  int beforeSeconds, int nextSeconds, AsyncTaskQueue asyncQueue) {
@@ -75,45 +89,59 @@ public class RotateGlobalTxLogTask implements Runnable {
 
         final String schema = asyncQueue.getSchema();
 
-        boolean hasLeadership = ExecUtils.hasLeadership(schema);
+        final Map savedMdcContext = MDC.getCopyOfContextMap();
+        try {
+            MDC.put(MDC.MDC_KEY_APP, schema.toLowerCase());
 
-        if (!hasLeadership) {
-            TransactionLogger.info("Skip rotate task since I am not the leader");
-            return;
-        }
+            boolean hasLeadership = ExecUtils.hasLeadership(schema);
 
-        if (!isInAllowedInterval()) {
-            return;
-        }
+            if (!hasLeadership) {
+                TransactionLogger.warn("Skip rotate task since I am not the leader");
+                return;
+            }
 
-        if (TransactionManager.getInstance(schema).isFirstRecover()) {
-            // Wait until XA recover task finishes handling the trx log.
-            try {
-                Thread.sleep(30 * 1000L);
-            } catch (InterruptedException e) {
-                logger.error("Interrupted when waiting XA recover task", e);
+            if (!isInAllowedInterval()) {
+                TransactionLogger.warn("Skip rotate task since not in allowed interval");
+                return;
+            }
+
+            if (0 != DynamicConfig.getInstance().getTrxLogMethod()
+                && DynamicConfig.getInstance().isSkipLegacyLogTableClean()) {
+                TransactionLogger.warn("Skip legacy log rotate task");
+                return;
             }
 
             if (TransactionManager.getInstance(schema).isFirstRecover()) {
-                // Still not finished, skip rotating trx log.
-                logger.warn("Wait XA recover task timeout, skip this round of trx log rotating.");
-                return;
+                // Wait until XA recover task finishes handling the trx log.
+                try {
+                    Thread.sleep(30 * 1000L);
+                } catch (InterruptedException e) {
+                    logger.error("Interrupted when waiting XA recover task", e);
+                }
+
+                if (TransactionManager.getInstance(schema).isFirstRecover()) {
+                    // Still not finished, skip rotating trx log.
+                    logger.warn("Wait XA recover task timeout, skip this round of trx log rotating.");
+                    return;
+                }
             }
+
+            TransactionLogger.warn(asyncQueue.getSchema() + ": Rotate task starts");
+            long begin = System.nanoTime();
+
+            try {
+                purgedCount = doRotate();
+            } catch (Exception ex) {
+                logger.error(asyncQueue.getSchema() + ": Rotate global tx log failed", ex);
+            }
+
+            double duration = (System.nanoTime() - begin) / 1e9;
+            TransactionLogger
+                .warn(asyncQueue.getSchema() + ": Rotate tx log task completed. "
+                    + purgedCount + " trans purged. Cost " + duration + " secs");
+        } finally {
+            MDC.setContextMap(savedMdcContext);
         }
-
-        TransactionLogger.info(asyncQueue.getSchema() + ": Rotate task starts");
-        long begin = System.nanoTime();
-
-        try {
-            purgedCount = doRotate();
-        } catch (Exception ex) {
-            logger.error(asyncQueue.getSchema() + ": Rotate global tx log failed", ex);
-        }
-
-        double duration = (System.nanoTime() - begin) / 1e9;
-        TransactionLogger
-            .info(asyncQueue.getSchema() + ": Rotate tx log task completed. "
-                + purgedCount + " trans purged. Cost " + duration + " secs");
     }
 
     private boolean isInAllowedInterval() {
@@ -138,21 +166,80 @@ public class RotateGlobalTxLogTask implements Runnable {
         List<String> groups = executor.getGroupList();
         AtomicInteger purgedCount = new AtomicInteger();
 
+        ConcurrentLinkedQueue<IDataSource> reorderedQueue = new ConcurrentLinkedQueue<>();
+        int numberOfDn = ExecUtils.reorderGroupsByDnId(groups, asyncQueue.getSchema(), reorderedQueue);
+
+        // Keep parallelism >= number of DN.
+        int parallelism = InstConfUtil.getInt(ConnectionParams.TRX_LOG_CLEAN_PARALLELISM);
+        if (-1 == parallelism) {
+            // Default parallelism is number of DN.
+            parallelism = numberOfDn;
+        }
+        // Keep parallelism <= number of groups.
+        parallelism = Integer.min(reorderedQueue.size(), parallelism);
+
+        if (0 != DynamicConfig.getInstance().getTrxLogMethod()) {
+            parallelism = 1;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Ready to rotate trx log for schema ")
+            .append(asyncQueue.getSchema())
+            .append(", parallelism is ")
+            .append(parallelism)
+            .append(", rotate order is [ ");
+        reorderedQueue.forEach(ds -> sb.append(((TGroupDataSource) ds).getDbGroupKey()).append(", "));
+        sb.append(" ].");
+        logger.warn(sb.toString());
+        TransactionLogger.warn(sb.toString());
+
         if (!groups.isEmpty()) {
-            List<Future> futures = new ArrayList<>(groups.size());
-            for (String group : groups) {
-                // Rotate each group simultaneously
-                futures.add(asyncQueue.submit(() -> {
-                    try {
-                        IDataSource dataSource = executor.getGroupExecutor(group).getDataSource();
-                        int count = GlobalTxLogManager.rotate(dataSource, beforeTxid, nextTxid);
-                        purgedCount.addAndGet(count);
-                    } catch (Exception e) {
-                        logger.error("Rotate transaction log failed on group " + group, e);
+            if (0 == DynamicConfig.getInstance().getTrxLogMethod()) {
+                List<Future> futures = new ArrayList<>(parallelism);
+                for (int i = 0; i < parallelism; i++) {
+                    futures.add(asyncQueue.submitRandomBucket(() -> {
+                        while (true) {
+                            IDataSource datasource = reorderedQueue.poll();
+
+                            if (null == datasource) {
+                                // All tasks are done.
+                                break;
+                            }
+
+                            try {
+                                int count = GlobalTxLogManager.rotate(datasource, beforeTxid, nextTxid);
+                                purgedCount.addAndGet(count);
+                            } catch (Exception e) {
+                                logger.error("Rotate transaction log failed on group "
+                                    + ((TGroupDataSource) datasource).getFullDbGroupKey(), e);
+                            }
+                        }
+                    }));
+                }
+                AsyncUtils.waitAll(futures);
+            } else {
+                // Legacy method is disabled, set global parallelism to 1.
+                while (true) {
+                    IDataSource datasource = reorderedQueue.poll();
+
+                    if (null == datasource) {
+                        // All tasks are done.
+                        break;
                     }
-                }));
+
+                    globalLock.lock();
+                    try {
+                        int count = GlobalTxLogManager.rotate(datasource, beforeTxid, nextTxid);
+                        purgedCount.addAndGet(count);
+                        Thread.sleep(1000);
+                    } catch (Exception e) {
+                        logger.error("Rotate transaction log failed on group "
+                            + ((TGroupDataSource) datasource).getFullDbGroupKey(), e);
+                    } finally {
+                        globalLock.unlock();
+                    }
+                }
             }
-            AsyncUtils.waitAll(futures);
         }
 
         return purgedCount.get();

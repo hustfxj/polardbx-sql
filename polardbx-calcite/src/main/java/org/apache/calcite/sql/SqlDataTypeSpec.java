@@ -16,15 +16,16 @@
  */
 package org.apache.calcite.sql;
 
-import com.google.common.base.Preconditions;
 import com.alibaba.polardbx.common.charset.CharsetName;
 import com.alibaba.polardbx.config.ConfigDataMode;
+import com.google.common.base.Preconditions;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.sql.SqlWriter.FrameTypeEnum;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.EnumSqlType;
+import org.apache.calcite.sql.type.SetSqlType;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.sql.type.SqlTypeFamily;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -33,6 +34,7 @@ import org.apache.calcite.sql.util.SqlVisitor;
 import org.apache.calcite.sql.validate.SqlMonotonicity;
 import org.apache.calcite.sql.validate.SqlValidator;
 import org.apache.calcite.sql.validate.SqlValidatorScope;
+import org.apache.calcite.util.EqualsContext;
 import org.apache.calcite.util.Litmus;
 import org.apache.calcite.util.Util;
 
@@ -447,7 +449,11 @@ public class SqlDataTypeSpec extends SqlNode {
 
             if (charSetName != null) {
                 writer.keyword("CHARACTER SET");
-                writer.identifier(charSetName);
+                if (charSetName.equalsIgnoreCase("UTF-8")) {
+                    writer.keyword("utf8");
+                } else {
+                    writer.identifier(charSetName);
+                }
             }
 
             if (collectionsTypeName != null) {
@@ -475,20 +481,24 @@ public class SqlDataTypeSpec extends SqlNode {
     }
 
     @Override
-    public boolean equalsDeep(SqlNode node, Litmus litmus) {
+    public boolean equalsDeep(SqlNode node, Litmus litmus, EqualsContext context) {
         if (!(node instanceof SqlDataTypeSpec)) {
             return litmus.fail("{} != {}", this, node);
         }
         SqlDataTypeSpec that = (SqlDataTypeSpec) node;
         if (!SqlNode.equalDeep(
             this.collectionsTypeName,
-            that.collectionsTypeName, litmus)) {
+            that.collectionsTypeName, litmus, context)) {
             return litmus.fail(null);
         }
-        if (!this.typeName.equalsDeep(that.typeName, litmus)) {
+        if (!this.typeName.equalsDeep(that.typeName, litmus, context)) {
             return litmus.fail(null);
         }
-        if (this.precision != that.precision) {
+        // fix for 8032
+        final boolean equalInt =
+            this.typeName != null && this.typeName.toString().toLowerCase().endsWith("int") &&
+                (this.precision != 0 && 0 == that.precision || 0 == this.precision && that.precision != 0);
+        if (!equalInt && this.precision != that.precision) {
             return litmus.fail("{} != {}", this, node);
         }
         if (this.scale != that.scale) {
@@ -497,7 +507,11 @@ public class SqlDataTypeSpec extends SqlNode {
         if (!Objects.equals(this.timeZone, that.timeZone)) {
             return litmus.fail("{} != {}", this, node);
         }
-        if (!Objects.equals(this.charSetName, that.charSetName)) {
+        // fix for 8032
+        final boolean implicitUtf8mb3 =
+            (null == this.charSetName && that.charSetName != null && that.charSetName.equalsIgnoreCase("utf8mb3")) ||
+                (this.charSetName != null && this.charSetName.equalsIgnoreCase("utf8mb3") && null == that.charSetName);
+        if (!implicitUtf8mb3 && !Objects.equals(this.charSetName, that.charSetName)) {
             return litmus.fail("{} != {}", this, node);
         }
         return litmus.succeed();
@@ -583,6 +597,11 @@ public class SqlDataTypeSpec extends SqlNode {
             }
         }
 
+        //bit 类型 bit(1) length > 1， 则使用BIG_BIT，兼容DataTypeUtil.jdbcTypeToRelDataType
+        if (sqlTypeName == SqlTypeName.BIT && precision > 1) {
+            sqlTypeName = SqlTypeName.BIG_BIT;
+        }
+
         // For time/datetime/timestamp types
         if (SqlTypeFamily.DATETIME.getTypeNames().contains(sqlTypeName) && sqlTypeName != SqlTypeName.DATE) {
             // fix scale and precision of datetime type.
@@ -604,6 +623,15 @@ public class SqlDataTypeSpec extends SqlNode {
                 list.add(stringValue);
             }
             RelDataType newType = new EnumSqlType(typeFactory.getTypeSystem(), SqlTypeName.ENUM, list, null, null);
+            type = ((SqlTypeFactoryImpl) typeFactory).canonize(newType);
+        } else if (drdsTypeName == DrdsTypeName.SET) {
+            List<String> list = new ArrayList();
+            for (SqlNode sqlNode : this.collectionVals.getList()) {
+                assert sqlNode instanceof SqlLiteral;
+                final String stringValue = ((SqlLiteral) sqlNode).getStringValue();
+                list.add(stringValue);
+            }
+            RelDataType newType = new SetSqlType(typeFactory.getTypeSystem(), sqlTypeName, list);
             type = ((SqlTypeFactoryImpl) typeFactory).canonize(newType);
         } else if ((precision >= 0) && (scale >= 0)) {
             assert sqlTypeName.allowsPrecScale(true, true);
@@ -703,7 +731,8 @@ public class SqlDataTypeSpec extends SqlNode {
         MEDIUMTEXT(SqlTypeName.VARCHAR),
         LONGTEXT(SqlTypeName.VARCHAR),
         ENUM(SqlTypeName.ENUM),
-        SET(SqlTypeName.VARCHAR),
+        //metaDb中构建用的char
+        SET(SqlTypeName.CHAR),
         GEOMETRY(SqlTypeName.GEOMETRY),
         POINT(SqlTypeName.BINARY),
         LINESTRING(SqlTypeName.BINARY),
@@ -722,7 +751,7 @@ public class SqlDataTypeSpec extends SqlNode {
         ;
 
         public static final EnumSet TYPE_WITH_LENGTH =
-            EnumSet.of(TINYINT, SMALLINT, MEDIUMINT, INTEGER, BIGINT, DOUBLE, REAL, FLOAT, DECIMAL);
+            EnumSet.of(TINYINT, SMALLINT, MEDIUMINT, INTEGER, BIGINT, DOUBLE, REAL, FLOAT, DECIMAL, BIT);
 
         public static final EnumSet TYPE_WITH_LENGTH_DECIMALS =
             EnumSet.of(DOUBLE, REAL, FLOAT, DECIMAL);
@@ -789,6 +818,38 @@ public class SqlDataTypeSpec extends SqlNode {
         public boolean isA(EnumSet enumSet) {
             return enumSet.contains(this);
         }
+    }
+
+    public boolean isUnsigned() {
+        return unsigned;
+    }
+
+    public boolean isZerofill() {
+        return zerofill;
+    }
+
+    public boolean isBinary() {
+        return binary;
+    }
+
+    public SqlLiteral getDecimals() {
+        return decimals;
+    }
+
+    public SqlLiteral getCharSet() {
+        return charSet;
+    }
+
+    public SqlLiteral getCollation() {
+        return collation;
+    }
+
+    public SqlNodeList getCollectionVals() {
+        return collectionVals;
+    }
+
+    public SqlLiteral getFsp() {
+        return fsp;
     }
 }
 

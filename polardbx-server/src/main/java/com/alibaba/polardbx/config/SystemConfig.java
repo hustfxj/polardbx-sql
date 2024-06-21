@@ -73,7 +73,7 @@ public final class SystemConfig {
     @Deprecated
     private volatile int processorHandler = DEFAULT_PROCESSOR;
     private volatile int processorKillExecutor = DEFAULT_PROCESSOR;
-    private volatile int timerExecutor = DEFAULT_PROCESSOR;
+    private volatile int syncExecutor = DEFAULT_PROCESSOR;
     private volatile int serverExecutor = DEFAULT_PROCESSOR * processors;
     private volatile int managerExecutor = DEFAULT_PROCESSOR;
 
@@ -87,27 +87,18 @@ public final class SystemConfig {
     private volatile String clusterName = null;
     private volatile String unitName = null;
     private volatile String instanceId = null;
-    private volatile String instanceType = null;
     private volatile String masterInstanceId = null;
+    private volatile String instanceType = null;
     // 信任的ip子网列表
     private volatile String trustedIps = null;
     // 全局黑名单,不允许访问任何DRDS DB,防攻击
     private volatile String blackIps = null;
     private volatile String whiteIps = null;
-    private volatile long slowSqlTime = 1000;
     // slow log记录sql的最大长度
     private volatile int slowSqlSizeThresold = 16384;
     private volatile int deadLockCheckPeriod = 5 * 100;
-    // manager统计采集周期
-    private volatile int maxConnection = 20000;
     // 是否开启manager端口的用户登录,临时兼容下老的系统监控,以后会关闭用户登录manager端口
     private volatile int allowManagerLogin = 1;
-
-    // 是不是内部corona的模式，提供端口号和ip，向manager获取clustername
-    private volatile int coronaMode = 0;
-
-    // 最大处理的package大小
-    private int maxAllowedPacket = 16 * 1024 * 1024;
 
     private int socketRecvBuffer = 32 * 1024;
     private int socketSendBuffer = 64 * 1024;
@@ -150,6 +141,14 @@ public final class SystemConfig {
      * 针对SQL使用走MPP路由，默认不走，通过hint方式开启
      */
     private boolean enableMpp = false;
+
+    /**
+     * 是否打开MPP的利用Leader节点做服务发现功能，leader节点配置在diamond或者环境变量中
+     * ZERO_DB：MPP的节点服务发现策略：默认用0号库的服务发现
+     * DIAMOND：集团内用diamond设置master节点，采用mpprpc
+     */
+
+    private String nodeDiscoveryMode = "ZERO_DB";
 
     /**
      * 默认使用保留一个备库的备库路由策略， RESERVE_ONE_SLAVE
@@ -233,6 +232,11 @@ public final class SystemConfig {
      */
     private String balanceWindow;
 
+    /**
+     * Allow move the single table with locality='balance_single_table=on' during scale-out/scale-in
+     */
+    private boolean allowMovingBalancedSingeTable = false;
+
     private boolean dropOldDataBaseAfterSwitchDataSource = true;
 
     /**
@@ -254,6 +258,7 @@ public final class SystemConfig {
      * Some special settings that are forbidden externally while are allowed internally for test.
      */
     private boolean supportSingleDbMultiTbs = false;
+    private boolean supportRemoveDdl = false;
     private boolean supportDropAutoSeq = false;
     private boolean allowSimpleSequence = false;
 
@@ -290,6 +295,8 @@ public final class SystemConfig {
      * enable auto warm up for logical db
      */
     private boolean enableLogicalDbWarmmingUp;
+
+    private String columnarOssDirectory;
 
     // information needed by oss
     private String engine;
@@ -524,12 +531,12 @@ public final class SystemConfig {
         this.managerExecutor = managerExecutor;
     }
 
-    public int getTimerExecutor() {
-        return timerExecutor;
+    public int getSyncExecutor() {
+        return syncExecutor;
     }
 
-    public void setTimerExecutor(int timerExecutor) {
-        this.timerExecutor = timerExecutor;
+    public void setSyncExecutor(int syncExecutor) {
+        this.syncExecutor = syncExecutor;
     }
 
     public long getIdleTimeout() {
@@ -596,14 +603,6 @@ public final class SystemConfig {
         this.whiteIps = whiteIps;
     }
 
-    public long getSlowSqlTime() {
-        return slowSqlTime;
-    }
-
-    public void setSlowSqlTime(long slowSqlTime) {
-        this.slowSqlTime = slowSqlTime;
-    }
-
     public int getDeadLockCheckPeriod() {
         return deadLockCheckPeriod;
     }
@@ -626,14 +625,6 @@ public final class SystemConfig {
 
     public void setSlowSqlSizeThresold(int slowSqlSizeThresold) {
         this.slowSqlSizeThresold = slowSqlSizeThresold;
-    }
-
-    public int getMaxConnection() {
-        return maxConnection;
-    }
-
-    public void setMaxConnection(int maxConnection) {
-        this.maxConnection = maxConnection;
     }
 
     public int getAllowManagerLogin() {
@@ -673,22 +664,6 @@ public final class SystemConfig {
     @Override
     public String toString() {
         return ToStringBuilder.reflectionToString(this, TddlToStringStyle.DEFAULT_STYLE);
-    }
-
-    public int getCoronaMode() {
-        return coronaMode;
-    }
-
-    public void setCoronaMode(int coronaMode) {
-        this.coronaMode = coronaMode;
-    }
-
-    public int getMaxAllowedPacket() {
-        return maxAllowedPacket;
-    }
-
-    public void setMaxAllowedPacket(int maxAllowedPacket) {
-        this.maxAllowedPacket = maxAllowedPacket;
     }
 
     public int getSocketRecvBuffer() {
@@ -785,6 +760,14 @@ public final class SystemConfig {
 
     public void setEnableMpp(boolean enableMpp) {
         this.enableMpp = enableMpp;
+    }
+
+    public String getNodeDiscoveryMode() {
+        return nodeDiscoveryMode;
+    }
+
+    public void setNodeDiscoveryMode(String nodeDiscoveryMode) {
+        this.nodeDiscoveryMode = nodeDiscoveryMode;
     }
 
     public boolean isEnableBucketExecutor() {
@@ -955,6 +938,14 @@ public final class SystemConfig {
 
     public void setSupportSingleDbMultiTbs(boolean supportSingleDbMultiTbs) {
         this.supportSingleDbMultiTbs = supportSingleDbMultiTbs;
+    }
+
+    public boolean isSupportRemoveDdl() {
+        return supportRemoveDdl;
+    }
+
+    public void setSupportRemoveDdl(boolean supportRemoveDdl) {
+        this.supportRemoveDdl = supportRemoveDdl;
     }
 
     public boolean isSupportDropAutoSeq() {
@@ -1155,5 +1146,21 @@ public final class SystemConfig {
 
     public void setSecretKey(String secretKey) {
         this.secretKey = secretKey;
+    }
+
+    public boolean isAllowMovingBalancedSingeTable() {
+        return allowMovingBalancedSingeTable;
+    }
+
+    public void setAllowMovingBalancedSingeTable(boolean allowMovingBalancedSingeTable) {
+        this.allowMovingBalancedSingeTable = allowMovingBalancedSingeTable;
+    }
+
+    public String getColumnarOssDirectory() {
+        return columnarOssDirectory;
+    }
+
+    public void setColumnarOssDirectory(String columnarOssDirectory) {
+        this.columnarOssDirectory = columnarOssDirectory;
     }
 }

@@ -18,9 +18,6 @@ package com.alibaba.polardbx.executor.handler;
 
 import com.alibaba.polardbx.atom.TAtomDataSource;
 import com.alibaba.polardbx.atom.config.TAtomDsConfDO;
-import com.alibaba.polardbx.group.config.Weight;
-import com.alibaba.polardbx.group.jdbc.DataSourceWrapper;
-import com.alibaba.polardbx.group.jdbc.TGroupDataSource;
 import com.alibaba.polardbx.common.model.Group;
 import com.alibaba.polardbx.common.model.Matrix;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
@@ -36,8 +33,12 @@ import com.alibaba.polardbx.gms.topology.GroupDetailInfoAccessor;
 import com.alibaba.polardbx.gms.topology.GroupDetailInfoExRecord;
 import com.alibaba.polardbx.gms.util.GroupInfoUtil;
 import com.alibaba.polardbx.gms.util.InstIdUtil;
+import com.alibaba.polardbx.group.config.Weight;
+import com.alibaba.polardbx.group.jdbc.DataSourceWrapper;
+import com.alibaba.polardbx.group.jdbc.TGroupDataSource;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
+import com.alibaba.polardbx.optimizer.locality.StoragePoolManager;
 import org.apache.calcite.rel.RelNode;
 
 import java.sql.Connection;
@@ -68,10 +69,12 @@ public class LogicalShowDsHandler extends HandlerCommon {
         result.addColumn("GROUP", DataTypes.StringType);
         result.addColumn("PHY_DB", DataTypes.StringType);
         result.addColumn("MOVABLE", DataTypes.IntegerType);
+        result.addColumn("STORAGE_POOL", DataTypes.StringType);
 
         int index = 0;
         try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
 
+            StoragePoolManager storagePoolManager = StoragePoolManager.getInstance();
             GroupDetailInfoAccessor groupDetailInfoAccessor = new GroupDetailInfoAccessor();
             groupDetailInfoAccessor.setConnection(metaDbConn);
             List<GroupDetailInfoExRecord> completedGroupInfos =
@@ -84,10 +87,11 @@ public class LogicalShowDsHandler extends HandlerCommon {
                 String dbName = groupDetailInfoExRecord.dbName;
                 String grpName = groupDetailInfoExRecord.groupName;
                 String phyDbName = groupDetailInfoExRecord.phyDbName;
+                String storagePool = storagePoolManager.storagePoolMap.getOrDefault(storageInstId, "");
                 boolean movable = !GroupInfoUtil.isSingleGroup(grpName);
                 result.addRow(new Object[] {
                     index++, storageInstId, dbName, grpName,
-                    phyDbName, movable ? 1 : 0});
+                    phyDbName, movable ? 1 : 0, storagePool});
             }
 
         } catch (Throwable ex) {

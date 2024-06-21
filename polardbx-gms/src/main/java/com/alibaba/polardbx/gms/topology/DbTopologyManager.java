@@ -27,6 +27,7 @@ import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.gms.config.impl.ConnPoolConfigManager;
 import com.alibaba.polardbx.gms.config.impl.MetaDbInstConfigManager;
 import com.alibaba.polardbx.gms.engine.FileStorageMetaStore;
@@ -35,7 +36,12 @@ import com.alibaba.polardbx.gms.ha.impl.StorageHaManager;
 import com.alibaba.polardbx.gms.ha.impl.StorageInstHaContext;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbConfigManager;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbDataIdBuilder;
+import com.alibaba.polardbx.gms.locality.LocalityDesc;
+import com.alibaba.polardbx.gms.locality.StoragePoolInfoAccessor;
+import com.alibaba.polardbx.gms.locality.StoragePoolInfoRecord;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
+import com.alibaba.polardbx.gms.metadb.foreign.ForeignAccessor;
+import com.alibaba.polardbx.gms.metadb.foreign.ForeignRecord;
 import com.alibaba.polardbx.gms.metadb.misc.PersistentReadWriteLock;
 import com.alibaba.polardbx.gms.metadb.misc.ReadWriteLockRecord;
 import com.alibaba.polardbx.gms.metadb.table.FilesRecord;
@@ -87,7 +93,7 @@ public class DbTopologyManager {
 
     public static final String COLLATION_TEMPLATE = " collate `%s`";
 
-    public static final String DEFAULT_DB_CHARACTER_SET = "utf8mb4";
+    public static final String DEFAULT_SERVER_COLLATION = "utf8mb4_general_ci";
 
     public static final int DEFAULT_SHARD_DB_COUNT_EACH_STORAGE_INST = 8;
 
@@ -97,7 +103,9 @@ public class DbTopologyManager {
 
     public static final long DEFAULT_PARTITION_COUNT_EACH_DN = 8;
 
-    public static String defaultCharacterSetForCreatingDb = DEFAULT_DB_CHARACTER_SET;
+    //public static String defaultCharacterSetForCreatingDb = DEFAULT_DB_CHARACTER_SET;
+
+    public static String defaultCollationForCreatingDb = DEFAULT_SERVER_COLLATION;
 
     public static int maxLogicalDbCount = DbTopologyManager.DEFAULT_MAX_LOGICAL_DB_COUNT;
 
@@ -204,7 +212,7 @@ public class DbTopologyManager {
     }
 
     public static void createInternalSystemDbIfNeed(MetaDbDataSource metaDbDs, String dbName, String phyDbName,
-                                                    String groupName, String charset, int dbType) {
+                                                    String groupName, String charset, String collation, int dbType) {
         DataSource dataSource = metaDbDs.getDataSource();
         try (Connection metaDbConn = dataSource.getConnection()) {
 
@@ -219,6 +227,7 @@ public class DbTopologyManager {
             CreateDbInfo createDbInfo = new CreateDbInfo();
             createDbInfo.dbName = dbName;
             createDbInfo.charset = charset;
+            createDbInfo.collation = collation;
             createDbInfo.dbType = dbType;
             createDbInfo.singleGroup = groupName;
             createDbInfo.defaultDbIndex = groupName;
@@ -244,7 +253,7 @@ public class DbTopologyManager {
 
             createDbInfo.groupLocator =
                 new DefaultGroupLocator(createDbInfo.dbType,
-                    createDbInfo.groupPhyDbMap, createDbInfo.storageInstList, new ArrayList<>());
+                    createDbInfo.groupPhyDbMap, createDbInfo.storageInstList, new LocalityDesc(), new ArrayList<>());
             DbTopologyManager.createLogicalDb(createDbInfo);
 
         } catch (Throwable ex) {
@@ -262,13 +271,9 @@ public class DbTopologyManager {
 
             // acquire MetaDb Lock by for update, to avoiding concurrent create & drop databases
             metaDbLockConn.setAutoCommit(false);
-            try {
-                LockUtil.acquireMetaDbLockByForUpdate(metaDbLockConn);
-            } catch (Throwable ex) {
-                // throw exception
-                throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC, ex,
-                    String.format("Get metaDb lock timeout during creating db[%s], please retry", createDbInfo.dbName));
-            }
+
+            LockUtil.waitToAcquireMetaDbLock(String.format("Get metaDb lock interrupted during creating db[%s]",
+                createDbInfo.getDbName()), metaDbLockConn);
 
             // ---- check if logical db exists ----
             String dbName = createDbInfo.dbName;
@@ -295,7 +300,7 @@ public class DbTopologyManager {
                     ts = System.currentTimeMillis() << BITS_LOGICAL_TIME;
 
                     dropLogicalDbWithConn(dbName, true, metaDbConn, metaDbLockConn, createDbInfo.socketTimeout, ts,
-                        false);
+                        false, false);
                     hasDbConfig = false;
                 }
             }
@@ -346,17 +351,19 @@ public class DbTopologyManager {
 
     protected static void dropLogicalDbWithConn(String dbName, boolean isDropIfExists, Connection metaDbConn,
                                                 Connection metaDbLockConn, long socketTimeout, long ts,
-                                                boolean allowDropForce) throws SQLException {
+                                                boolean allowDropForce, boolean reservePhyDb) throws SQLException {
 
         // acquire MetaDb Lock by for update, to avoiding concurrent create & drop databases
         metaDbLockConn.setAutoCommit(false);
-        try {
-            LockUtil.acquireMetaDbLockByForUpdate(metaDbLockConn);
-        } catch (Throwable ex) {
-            // throw exception
-            throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC, ex,
-                String.format("Get metaDb lock timeout during drop db[%s], please retry", dbName));
-        }
+//        try {
+//            LockUtil.acquireMetaDbLockByForUpdate(metaDbLockConn);
+//        } catch (Throwable ex) {
+//            // throw exception
+//            throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC, ex,
+//                String.format("Get metaDb lock timeout during drop db[%s], please retry", dbName));
+//        }
+        LockUtil.waitToAcquireMetaDbLock(String.format("Get metaDb lock timeout during drop db[%s]", dbName),
+            metaDbLockConn);
 
         if (!allowDropForce) {
             if (checkDbExists(dbName)) {
@@ -424,7 +431,9 @@ public class DbTopologyManager {
 
         // ---- drop physical dbs according the topology info fo metadb ----
         String instId = InstIdUtil.getInstId();
-        dropPhysicalDbsIfExists(instId, dbName, socketTimeout);
+        if (!reservePhyDb) {
+            dropPhysicalDbsIfExists(instId, dbName, socketTimeout);
+        }
 
         // ---- remove topology config & group config from metadb by using trx ----
         metaDbConn.setAutoCommit(false);
@@ -450,7 +459,7 @@ public class DbTopologyManager {
             Connection metaDbLockConn = MetaDbDataSource.getInstance().getConnection()) {
 
             dropLogicalDbWithConn(dbName, isDropIfExists, metaDbConn, metaDbLockConn, socketTimeout, dropDbInfo.getTs(),
-                dropDbInfo.isAllowDropForce());
+                dropDbInfo.isAllowDropForce(), dropDbInfo.isReservePhyDb());
 
             // release meta db lock
             LockUtil.releaseMetaDbLockByCommit(metaDbLockConn);
@@ -571,11 +580,14 @@ public class DbTopologyManager {
 
     protected static String buildCreatePhyDbSql(String charset, String collation, String phyDbName) {
         String createDbSql = String.format(CREATE_DB_IF_NOT_EXISTS_SQL_TEMPLATE, phyDbName);
-        if (charset != null) {
-            createDbSql += String.format(CHARSET_TEMPLATE, charset);
-        } else if (collation != null) {
-            createDbSql += String.format(COLLATION_TEMPLATE, collation);
+        if (charset != null && !charset.isEmpty()) {
+            createDbSql += String.format(CHARSET_TEMPLATE, charset.toLowerCase());
         }
+
+        if (collation != null && !collation.isEmpty()) {
+            createDbSql += String.format(COLLATION_TEMPLATE, collation.toLowerCase());
+        }
+
         return createDbSql;
     }
 
@@ -698,7 +710,7 @@ public class DbTopologyManager {
             String appName = AppNameUtil.buildAppNameByInstAndDbName(instId, dbName);
             dbInfoAccessor
                 .addNewDb(dbName, appName, createDbInfo.dbType, DbInfoRecord.DB_STATUS_CREATING, createDbInfo.charset,
-                    createDbInfo.collation);
+                    createDbInfo.collation, createDbInfo.encryption, createDbInfo.defaultSingle);
 
             // ----- add schemata meta data -----
             if (!TStringUtil.equalsIgnoreCase(createDbInfo.dbName, SystemDbHelper.DEFAULT_DB_NAME)) {
@@ -1149,13 +1161,133 @@ public class DbTopologyManager {
         }
     }
 
+    public static List<DbGroupInfoRecord> getAllDbGroupInfoRecordByInstIdAndPhyDbName(String phyDbName,
+                                                                                      String storageInstId) {
+        try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
+            GroupDetailInfoAccessor accessor = new GroupDetailInfoAccessor();
+            accessor.setConnection(metaDbConn);
+            return accessor.getAllPhyDbNameByInstIdAndPhyDbName(phyDbName, storageInstId);
+        } catch (SQLException e) {
+            throw GeneralUtil.nestedException(e);
+        }
+    }
+
     public static CreateDbInfo initCreateDbInfo(String dbName, String charset, String collate,
-                                                String locality,
+                                                LocalityDesc locality,
                                                 Predicate<StorageInfoRecord> localityFilter,
                                                 int dbType,
                                                 boolean isCreateIfNotExists,
                                                 long socketTimeout,
                                                 int shardDbCountEachStorageInstOfStmt) {
+        return initCreateDbInfo(dbName, charset, collate, null, null, locality, localityFilter, dbType,
+            isCreateIfNotExists,
+            socketTimeout, shardDbCountEachStorageInstOfStmt);
+    }
+
+    public static CreateDbInfo initCreateDbInfo(String dbName,
+                                                String charset,
+                                                String collate,
+                                                Boolean encryption,
+                                                Boolean defaultSingle,
+                                                LocalityDesc locality,
+                                                Predicate<StorageInfoRecord> localityFilter,
+                                                int dbType,
+                                                boolean isCreateIfNotExists,
+                                                long socketTimeout,
+                                                int shardDbCountEachStorageInstOfStmt) {
+
+        int shardDbCountEachStorage = DbTopologyManager.shardDbCountEachStorageInst;
+        if (shardDbCountEachStorageInstOfStmt > 0) {
+            shardDbCountEachStorage = shardDbCountEachStorageInstOfStmt;
+        }
+        Map<String, String> grpAndPhyDbNameMap = Maps.newHashMap();
+        CreateDbInfo createDbInfo = new CreateDbInfo();
+
+        StorageInfoAccessor storageInfoAccessor = new StorageInfoAccessor();
+        try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
+            storageInfoAccessor.setConnection(metaDbConn);
+            /* Filter storage instance by locality */
+            List<StorageInfoRecord> storageList =
+                storageInfoAccessor.getStorageInfosByInstIdAndKind(
+                    InstIdUtil.getInstId(),
+                    StorageInfoRecord.INST_KIND_MASTER);
+            List<String> storageIdList = storageList.stream()
+                .filter(x -> localityFilter == null || localityFilter.test(x)) // filter locality property
+                .filter(StorageInfoRecord::isStatusReady) // create database on `READY` ata-nodes
+                .map(StorageInfoRecord::getInstanceId)
+                .distinct()
+                .collect(Collectors.toList());
+
+            if (storageIdList.isEmpty()) {
+                throw new TddlRuntimeException(ErrorCode.ERR_INVALID_DDL_PARAMS,
+                    "No storage match the locality " + locality.toString());
+            }
+            createDbInfo.setStorageInstList(storageIdList);
+        } catch (Throwable ex) {
+            throw GeneralUtil.nestedException(ex);
+        }
+        int storageInstCount = createDbInfo.getStorageInstList().size();
+        int shardDbCount = shardDbCountEachStorage * storageInstCount;
+
+        createDbInfo.dbName = dbName;
+        createDbInfo.charset = charset;
+        createDbInfo.collation = collate;
+        createDbInfo.encryption = encryption;
+        createDbInfo.dbType = dbType;
+
+        String grpNameSingleGroup = "";
+        if (createDbInfo.dbType == DbInfoRecord.DB_TYPE_PART_DB || createDbInfo.dbType == DbInfoRecord.DB_TYPE_CDC_DB) {
+            grpNameSingleGroup = GroupInfoUtil.buildGroupName(dbName, -1, false);
+            String phyDbNameSingle = GroupInfoUtil.buildPhyDbName(dbName, -1, false);
+            grpAndPhyDbNameMap.put(grpNameSingleGroup, phyDbNameSingle);
+            for (int i = 0; i < shardDbCount; i++) {
+                String grpName = GroupInfoUtil.buildGroupName(dbName, i, false);
+                String phyDbName = GroupInfoUtil.buildPhyDbName(dbName, i, false);
+                grpAndPhyDbNameMap.put(grpName, phyDbName);
+            }
+            createDbInfo.defaultSingle = true;
+        } else if (createDbInfo.dbType == DbInfoRecord.DB_TYPE_NEW_PART_DB) {
+            for (int i = 0; i < storageInstCount; i++) {
+                String grpName = GroupInfoUtil.buildGroupName(dbName, i, true);
+                String phyDbName = GroupInfoUtil.buildPhyDbName(dbName, i, true);
+                grpAndPhyDbNameMap.put(grpName, phyDbName);
+                if (StringUtils.isEmpty(grpNameSingleGroup)) {
+                    grpNameSingleGroup = grpName;
+                }
+            }
+            createDbInfo.defaultSingle = false;
+            if (defaultSingle != null) {
+                createDbInfo.defaultSingle = defaultSingle;
+            }
+        }
+
+        createDbInfo.locality = locality;
+        createDbInfo.groupPhyDbMap = grpAndPhyDbNameMap;
+        createDbInfo.singleGroup = grpNameSingleGroup;
+        createDbInfo.defaultDbIndex = grpNameSingleGroup;
+        createDbInfo.groupLocator =
+            new DefaultGroupLocator(createDbInfo.dbType, createDbInfo.groupPhyDbMap, createDbInfo.storageInstList,
+                createDbInfo.locality,
+                DbTopologyManager.singleGroupStorageInstList);
+
+        createDbInfo.isCreateIfNotExists = isCreateIfNotExists;
+        createDbInfo.socketTimeout = socketTimeout;
+        createDbInfo.shardDbCountEachInst = shardDbCountEachStorage;
+
+        return createDbInfo;
+    }
+
+    /**
+     * used for import database
+     */
+    public static CreateDbInfo initCreateDbInfoForImportDatabase(String dbName, String charset, String collate,
+                                                                 Boolean encryption,
+                                                                 LocalityDesc locality,
+                                                                 Predicate<StorageInfoRecord> localityFilter,
+                                                                 int dbType,
+                                                                 boolean isCreateIfNotExists,
+                                                                 long socketTimeout,
+                                                                 int shardDbCountEachStorageInstOfStmt) {
 
         int shardDbCountEachStorage = DbTopologyManager.shardDbCountEachStorageInst;
         if (shardDbCountEachStorageInstOfStmt > 0) {
@@ -1188,31 +1320,22 @@ public class DbTopologyManager {
             throw GeneralUtil.nestedException(ex);
         }
         int storageInstCount = createDbInfo.getStorageInstList().size();
-        int shardDbCount = shardDbCountEachStorage * storageInstCount;
 
         createDbInfo.dbName = dbName;
         createDbInfo.charset = charset;
         createDbInfo.collation = collate;
+        createDbInfo.encryption = encryption;
         createDbInfo.dbType = dbType;
+        createDbInfo.defaultSingle = false;
 
         String grpNameSingleGroup = "";
-        if (createDbInfo.dbType == DbInfoRecord.DB_TYPE_PART_DB || createDbInfo.dbType == DbInfoRecord.DB_TYPE_CDC_DB) {
-            grpNameSingleGroup = GroupInfoUtil.buildGroupName(dbName, -1, false);
-            String phyDbNameSingle = GroupInfoUtil.buildPhyDbName(dbName, -1, false);
-            grpAndPhyDbNameMap.put(grpNameSingleGroup, phyDbNameSingle);
-            for (int i = 0; i < shardDbCount; i++) {
-                String grpName = GroupInfoUtil.buildGroupName(dbName, i, false);
-                String phyDbName = GroupInfoUtil.buildPhyDbName(dbName, i, false);
-                grpAndPhyDbNameMap.put(grpName, phyDbName);
-            }
-        } else if (createDbInfo.dbType == DbInfoRecord.DB_TYPE_NEW_PART_DB) {
-            for (int i = 0; i < storageInstCount; i++) {
-                String grpName = GroupInfoUtil.buildGroupName(dbName, i, true);
-                String phyDbName = GroupInfoUtil.buildPhyDbName(dbName, i, true);
-                grpAndPhyDbNameMap.put(grpName, phyDbName);
-                if (StringUtils.isEmpty(grpNameSingleGroup)) {
-                    grpNameSingleGroup = grpName;
-                }
+
+        for (int i = 0; i < storageInstCount; i++) {
+            String grpName = String.format(GroupInfoUtil.GROUP_NAME_FOR_IMPORTED_DATABASE, dbName).toUpperCase();
+            String phyDbName = dbName;
+            grpAndPhyDbNameMap.put(grpName, phyDbName);
+            if (StringUtils.isEmpty(grpNameSingleGroup)) {
+                grpNameSingleGroup = grpName;
             }
         }
 
@@ -1222,6 +1345,7 @@ public class DbTopologyManager {
         createDbInfo.defaultDbIndex = grpNameSingleGroup;
         createDbInfo.groupLocator =
             new DefaultGroupLocator(createDbInfo.dbType, createDbInfo.groupPhyDbMap, createDbInfo.storageInstList,
+                createDbInfo.locality,
                 DbTopologyManager.singleGroupStorageInstList);
 
         createDbInfo.isCreateIfNotExists = isCreateIfNotExists;
@@ -1232,6 +1356,47 @@ public class DbTopologyManager {
 
     public static String getStorageInstIdByGroupName(String dbName, String groupName) {
         return getStorageInstIdByGroupName(InstIdUtil.getInstId(), dbName, groupName);
+    }
+
+    public static Map<String, StorageInfoRecord> getStorageInfoMap(String instId) {
+        Map<String, StorageInfoRecord> storageInfoMap = new HashMap<>();
+        try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
+            // Get storage info by group name
+            StorageInfoAccessor storageInfoAccessor = new StorageInfoAccessor();
+            storageInfoAccessor.setConnection(metaDbConn);
+            List<StorageInfoRecord> storageInfoRecords = storageInfoAccessor.getStorageInfosByInstId(instId)
+                .stream().filter(o -> o.instKind == StorageInfoRecord.INST_KIND_MASTER).collect(Collectors.toList());
+            Map<String, StorageInfoRecord> storageInfoRecordMap = new HashMap<>();
+            for (StorageInfoRecord storageInfoRecord : storageInfoRecords) {
+                if (!storageInfoMap.containsKey(storageInfoRecord.storageMasterInstId)) {
+                    storageInfoMap.put(storageInfoRecord.storageMasterInstId, storageInfoRecord);
+                }
+            }
+        } catch (Throwable ex) {
+            MetaDbLogUtil.META_DB_LOG.error(ex);
+            throw GeneralUtil.nestedException(ex);
+        }
+        return storageInfoMap;
+
+    }
+
+    public static Set<String> getAllAliveStorageInsts(String instId) {
+        Set<String> allStorageIds = new HashSet<>();
+        try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
+            // Get storage info by group name
+            StorageInfoAccessor storageInfoAccessor = new StorageInfoAccessor();
+            storageInfoAccessor.setConnection(metaDbConn);
+            allStorageIds = storageInfoAccessor.getStorageInfosByInstId(instId)
+                .stream().filter(o -> o.instKind == StorageInfoRecord.INST_KIND_MASTER)
+                .filter(o -> o.status == StorageInfoRecord.STORAGE_STATUS_READY)
+                .map(o -> o.storageInstId)
+                .collect(Collectors.toSet());
+        } catch (Throwable ex) {
+            MetaDbLogUtil.META_DB_LOG.error(ex);
+            throw GeneralUtil.nestedException(ex);
+        }
+        return allStorageIds;
+
     }
 
     // TODO why not cache it?
@@ -1252,6 +1417,27 @@ public class DbTopologyManager {
             throw GeneralUtil.nestedException(ex);
         }
         return storageInstId;
+    }
+
+    public static Map<String, String> getGroupNameToStorageInstIdMap(String dbName) {
+        Map<String, String> groupNameStorageInstIdMap = new HashMap<>();
+        try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
+            // Get storage info by group name
+            GroupDetailInfoAccessor groupDetailInfoAccessor = new GroupDetailInfoAccessor();
+            groupDetailInfoAccessor.setConnection(metaDbConn);
+            String instId = InstIdUtil.getMasterInstId();
+            List<GroupDetailInfoRecord> groupDetails =
+                groupDetailInfoAccessor.getGroupDetailInfoByInstIdAndDbName(instId, dbName);
+            if (groupDetails != null) {
+                groupNameStorageInstIdMap =
+                    groupDetails.stream().collect(Collectors.toMap(o -> o.groupName, o -> o.storageInstId));
+            }
+        } catch (Throwable ex) {
+            MetaDbLogUtil.META_DB_LOG.error(ex);
+            throw GeneralUtil.nestedException(ex);
+        }
+        return groupNameStorageInstIdMap;
+
     }
 
     /**
@@ -1893,7 +2079,7 @@ public class DbTopologyManager {
         String instId = ServerInstIdManager.getInstance().getInstId();
         String masterInstId = ServerInstIdManager.getInstance().getMasterInstId();
 
-        if (ServerInstIdManager.getInstance().isMasterInst()) {
+        if (ConfigDataMode.isMasterMode()) {
             // if curr inst is master mode, then ignore to init topology configs for ro inst
             return;
         }
@@ -1905,25 +2091,31 @@ public class DbTopologyManager {
             StorageInfoAccessor storageInfoAccessor = new StorageInfoAccessor();
             storageInfoAccessor.setConnection(metaDbConn);
 
-            List<Pair<String, String>> storageRoInfoList =
-                storageInfoAccessor.getReadOnlyStorageInfoListByInstIdAndInstKind(instId);
-            List<String> storageMetaDbInstIdList = storageInfoAccessor
-                .getStorageIdListByInstIdAndInstKind(masterInstId, StorageInfoRecord.INST_KIND_META_DB);
             GroupDetailInfoAccessor groupDetailInfoAccessor = new GroupDetailInfoAccessor();
             groupDetailInfoAccessor.setConnection(metaDbConn);
-            if (storageRoInfoList.size() == 0) {
-                return;
-            }
-            for (int i = 0; i < storageRoInfoList.size(); i++) {
-                Pair<String, String> roAndRwPair = storageRoInfoList.get(i);
-                String roInstId = roAndRwPair.getKey();
-                String rwInstId = roAndRwPair.getValue();
-                groupDetailInfoAccessor.addNewGroupDetailInfosForRoInst(instId, rwInstId,
-                    roInstId, false);
-            }
+
+            //register group info for information_schema although the role is columnar
+            List<String> storageMetaDbInstIdList = storageInfoAccessor
+                .getStorageIdListByInstIdAndInstKind(masterInstId, StorageInfoRecord.INST_KIND_META_DB);
             for (int i = 0; i < storageMetaDbInstIdList.size(); i++) {
                 groupDetailInfoAccessor.addNewGroupDetailInfosForRoInst(instId, storageMetaDbInstIdList.get(i),
                     storageMetaDbInstIdList.get(i), true);
+            }
+
+            //register group info
+            if (ConfigDataMode.isRowSlaveMode()) {
+                List<Pair<String, String>> storageRoInfoList =
+                    storageInfoAccessor.getReadOnlyStorageInfoListByInstIdAndInstKind(instId);
+                if (storageRoInfoList.size() == 0) {
+                    return;
+                }
+                for (int i = 0; i < storageRoInfoList.size(); i++) {
+                    Pair<String, String> roAndRwPair = storageRoInfoList.get(i);
+                    String roInstId = roAndRwPair.getKey();
+                    String rwInstId = roAndRwPair.getValue();
+                    groupDetailInfoAccessor.addNewGroupDetailInfosForRoInst(instId, rwInstId,
+                        roInstId, false);
+                }
             }
             metaDbConn.commit();
         } catch (Throwable ex) {
@@ -2018,16 +2210,21 @@ public class DbTopologyManager {
         for (DbGroupInfoRecord dbGroupInfoRecord : dbGroupInfoRecords) {
             int len = dbGroupInfoRecord.phyDbName.length();
             //ref to com.taobao.tddl.gms.util.GroupInfoUtil.PHY_DB_NAME_TEMPLATE_FOR_PARTITIONED_TABLES
-            String digitPart = dbGroupInfoRecord.phyDbName.substring(len - 5);
+            String digitPart = len >= 5 ?
+                dbGroupInfoRecord.phyDbName.substring(len - 5)
+                : null;
             if (!StringUtils.isEmpty(digitPart) && digitPart.matches("^\\d+$")) {
                 int index = Integer.valueOf(digitPart);
                 if (index >= physical_db_index) {
                     physical_db_index = index + 1;
                 }
             } else {
-                throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC,
-                    String.format("the physical database name :[%s] is not compliant, the expect format is:[%s]",
-                        dbGroupInfoRecord.phyDbName, GroupInfoUtil.PHY_DB_NAME_TEMPLATE_FOR_PARTITIONED_TABLES));
+                /**
+                 * imported database has the incompliant physical name, so we ignore this error
+                 * */
+//                throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC,
+//                    String.format("the physical database name :[%s] is not compliant, the expect format is:[%s]",
+//                        dbGroupInfoRecord.phyDbName, GroupInfoUtil.PHY_DB_NAME_TEMPLATE_FOR_PARTITIONED_TABLES));
             }
 
         }
@@ -2110,7 +2307,6 @@ public class DbTopologyManager {
         return getConnectionForStorage(storageInstId, GmsJdbcUtil.DEFAULT_PHY_DB, socketTimeout);
     }
 
-
     public static Connection getConnectionForStorage(String storageInstId, String schema, int socketTimeout) {
         HaSwitchParams haSwitchParams = StorageHaManager.getInstance().getStorageHaSwitchParams(storageInstId);
         if (haSwitchParams == null) {
@@ -2128,7 +2324,7 @@ public class DbTopologyManager {
             .buildJdbcConnection(host, port, schema, user, passwdEnc, connProps);
     }
 
-    public static Connection getConnectionForStorage(StorageInfoRecord storageInfoRecord) {
+    public static Connection getConnectionForLearnerStorage(StorageInfoRecord storageInfoRecord) {
         if (storageInfoRecord == null) {
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC,
                 String.format("no found the storage inst for %s", storageInfoRecord));
@@ -2180,7 +2376,8 @@ public class DbTopologyManager {
     /*
      * return key:instId, value:group/phyDb
      * */
-    public static Map<String, List<Pair<String, String>>> generateDbAndGroupNewConfigInfo(String dbName) {
+    public static Map<String, List<Pair<String, String>>> generateDbAndGroupNewConfigInfo(String dbName,
+                                                                                          LocalityDesc localityDesc) {
 
         Map<String, List<Pair<String, String>>> storageInstGrpAndDbMap;
         DataSource dataSource = MetaDbDataSource.getInstance().getDataSource();
@@ -2215,6 +2412,13 @@ public class DbTopologyManager {
             // batch get all storage configs (they ary connPool configs) by instId
             List<String> storageInstIdList =
                 storageInfoAccessor.getStorageIdListByInstIdAndInstKind(instId, storageKind);
+            if (localityDesc.hasStoragePoolDefinition() && !localityDesc.holdEmptyDnList()) {
+                storageInstIdList = storageInstIdList.stream().filter(localityDesc::fullMatchStorageInstance).collect(
+                    Collectors.toList());
+            } else if (!localityDesc.holdEmptyDnList()) {
+                storageInstIdList = storageInstIdList.stream().filter(localityDesc::matchStorageInstance).collect(
+                    Collectors.toList());
+            }
 
             // ----add group_detail_info for new db----
             DbGroupInfoAccessor dbGroupInfoAccessor = new DbGroupInfoAccessor();
@@ -2290,7 +2494,9 @@ public class DbTopologyManager {
         Set<String> allNonDeletableStorageInstIdSet = new HashSet<>();
         String instId = InstIdUtil.getInstId();
         GroupDetailInfoAccessor groupDetailInfoAccessor = new GroupDetailInfoAccessor();
+        StoragePoolInfoAccessor storagePoolInfoAccessor = new StoragePoolInfoAccessor();
         groupDetailInfoAccessor.setConnection(metaDbConn);
+        storagePoolInfoAccessor.setConnection(metaDbConn);
 
         List<GroupDetailInfoRecord> allGrpDetailInfos = groupDetailInfoAccessor.getGroupDetailInfoByInstId(instId);
         for (int i = 0; i < allGrpDetailInfos.size(); i++) {
@@ -2305,6 +2511,13 @@ public class DbTopologyManager {
                 if (!allNonDeletableStorageInstIdSet.contains(dnId)) {
                     allNonDeletableStorageInstIdSet.add(dnId);
                 }
+            }
+        }
+        List<StoragePoolInfoRecord> storagePoolInfoRecords = storagePoolInfoAccessor.getAllStoragePoolInfoRecord();
+        for (int i = 0; i < storagePoolInfoRecords.size(); i++) {
+            String undeletableDnId = storagePoolInfoRecords.get(i).undeletableDnId;
+            if (StringUtils.isNotEmpty(undeletableDnId) && !allDefaultGroupSet.contains(undeletableDnId)) {
+                allNonDeletableStorageInstIdSet.add(undeletableDnId);
             }
         }
 
@@ -2327,7 +2540,8 @@ public class DbTopologyManager {
             tableInfoManager.unBindingByArchiveSchemaName(schemaName);
             List<FilesRecord> filesRecordList = tableInfoManager.queryFilesByLogicalSchema(schemaName);
             for (FilesRecord filesRecord : filesRecordList) {
-                if (filesRecord.getCommitTs() != null && filesRecord.getRemoveTs() == null) {
+                if (filesRecord.getCommitTs() != null && filesRecord.getRemoveTs() == null
+                    && filesRecord.fileName != null) {
                     FileStorageMetaStore fileStorageMetaStore =
                         new FileStorageMetaStore(Engine.of(filesRecord.getEngine()));
                     fileStorageMetaStore.setConnection(connection);
@@ -2336,6 +2550,40 @@ public class DbTopologyManager {
             }
         } catch (Throwable e) {
             throw GeneralUtil.nestedException(e);
+        }
+    }
+
+    public static String getDefaultCollationForCreatingDb() {
+        return defaultCollationForCreatingDb;
+    }
+
+    public static void setDefaultCollationForCreatingDb(String newServerDefaultCollation) {
+        DbTopologyManager.defaultCollationForCreatingDb = newServerDefaultCollation;
+
+    }
+
+    public static void checkRefForeignKeyWhenDropDatabase(String dbName) {
+        // not allow to drop ref database first even check_foreign_key is off
+        try (Connection metaConn = MetaDbDataSource.getInstance().getConnection()) {
+            DbInfoAccessor dbInfoAccessor = new DbInfoAccessor();
+            ForeignAccessor foreignAccessor = new ForeignAccessor();
+            dbInfoAccessor.setConnection(metaConn);
+            foreignAccessor.setConnection(metaConn);
+            if (dbInfoAccessor.getDbInfoByDbNameForUpdate(dbName) != null) {
+                List<ForeignRecord> fks = foreignAccessor.queryReferencedForeignKeys(dbName);
+                for (ForeignRecord fk : fks) {
+                    String schemaName = fk.schemaName;
+                    if (!schemaName.equalsIgnoreCase(dbName)) {
+                        String tableName = fk.tableName;
+                        String constraint = fk.constraintName;
+                        throw new TddlRuntimeException(ErrorCode.ERR_DROP_TABLE_FK_CONSTRAINT,
+                            fk.refTableName, constraint, schemaName, tableName);
+                    }
+                }
+
+            }
+        } catch (Throwable ex) {
+            throw GeneralUtil.nestedException(ex);
         }
     }
 }

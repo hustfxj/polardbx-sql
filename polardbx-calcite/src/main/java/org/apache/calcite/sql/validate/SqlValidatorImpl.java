@@ -14,20 +14,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.calcite.sql.validate;
 
 import com.alibaba.polardbx.common.constants.SequenceAttribute;
 import com.alibaba.polardbx.common.exception.NotSupportException;
+import com.alibaba.polardbx.common.exception.TddlRuntimeException;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.utils.CaseInsensitive;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.druid.sql.SQLUtils;
 import com.alibaba.polardbx.druid.sql.ast.SQLStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLColumnDefinition;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLTableElement;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.MySqlKey;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableStatement;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlTableIndex;
 import com.alibaba.polardbx.druid.util.JdbcConstants;
+import com.alibaba.polardbx.gms.locality.LocalityDesc;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
@@ -68,6 +73,7 @@ import org.apache.calcite.sql.SequenceBean;
 import org.apache.calcite.sql.SqlAccessEnum;
 import org.apache.calcite.sql.SqlAccessType;
 import org.apache.calcite.sql.SqlAddIndex;
+import org.apache.calcite.sql.SqlAlterStoragePool;
 import org.apache.calcite.sql.SqlAlterTable;
 import org.apache.calcite.sql.SqlAlterTableAsOfTimeStamp;
 import org.apache.calcite.sql.SqlAlterTableModifyPartitionValues;
@@ -79,6 +85,8 @@ import org.apache.calcite.sql.SqlCallBinding;
 import org.apache.calcite.sql.SqlColumnDeclaration;
 import org.apache.calcite.sql.SqlCreate;
 import org.apache.calcite.sql.SqlCreateIndex;
+import org.apache.calcite.sql.SqlCreateMaterializedView;
+import org.apache.calcite.sql.SqlCreateStoragePool;
 import org.apache.calcite.sql.SqlCreateTable;
 import org.apache.calcite.sql.SqlCreateView;
 import org.apache.calcite.sql.SqlDataTypeSpec;
@@ -88,6 +96,8 @@ import org.apache.calcite.sql.SqlDelete;
 import org.apache.calcite.sql.SqlDesc;
 import org.apache.calcite.sql.SqlDrop;
 import org.apache.calcite.sql.SqlDropIndex;
+import org.apache.calcite.sql.SqlDropMaterializedView;
+import org.apache.calcite.sql.SqlDropStoragePool;
 import org.apache.calcite.sql.SqlDropTable;
 import org.apache.calcite.sql.SqlDropView;
 import org.apache.calcite.sql.SqlDynamicParam;
@@ -112,19 +122,26 @@ import org.apache.calcite.sql.SqlNumericLiteral;
 import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlOperatorTable;
 import org.apache.calcite.sql.SqlOrderBy;
+import org.apache.calcite.sql.SqlPartition;
 import org.apache.calcite.sql.SqlPartitionBy;
 import org.apache.calcite.sql.SqlPartitionByHash;
+import org.apache.calcite.sql.SqlPartitionByRange;
+import org.apache.calcite.sql.SqlPartitionValue;
+import org.apache.calcite.sql.SqlPartitionValueItem;
 import org.apache.calcite.sql.SqlRenameTable;
+import org.apache.calcite.sql.SqlRenameTables;
 import org.apache.calcite.sql.SqlSampleSpec;
 import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.SqlSelectKeyword;
 import org.apache.calcite.sql.SqlSetOperator;
 import org.apache.calcite.sql.SqlShow;
+import org.apache.calcite.sql.SqlSubPartitionByHash;
 import org.apache.calcite.sql.SqlSyntax;
 import org.apache.calcite.sql.SqlUnresolvedFunction;
 import org.apache.calcite.sql.SqlUpdate;
 import org.apache.calcite.sql.SqlUtil;
 import org.apache.calcite.sql.SqlUtil.SpecialIdentiFiers;
+import org.apache.calcite.sql.SqlValuesTableSource;
 import org.apache.calcite.sql.SqlWindow;
 import org.apache.calcite.sql.SqlWith;
 import org.apache.calcite.sql.SqlWithItem;
@@ -145,6 +162,7 @@ import org.apache.calcite.sql.util.SqlVisitor;
 import org.apache.calcite.sql.validate.implicit.TypeCoercion;
 import org.apache.calcite.sql2rel.InitializerContext;
 import org.apache.calcite.util.Bug;
+import org.apache.calcite.util.EqualsContext;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.ImmutableNullableList;
 import org.apache.calcite.util.Litmus;
@@ -165,6 +183,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -172,6 +191,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 
@@ -181,6 +201,7 @@ import static com.alibaba.polardbx.common.TddlConstants.IMPLICIT_KEY_NAME;
 import static org.apache.calcite.sql.SqlKind.AS;
 import static org.apache.calcite.sql.SqlKind.DAL;
 import static org.apache.calcite.sql.SqlKind.EXTRACT_PARTITION;
+import static org.apache.calcite.sql.SqlKind.MODIFY_PARTITION;
 import static org.apache.calcite.sql.SqlKind.SELECT;
 import static org.apache.calcite.sql.SqlKind.SET_QUERY;
 import static org.apache.calcite.sql.SqlKind.UNION;
@@ -190,7 +211,8 @@ import static org.apache.calcite.util.Static.RESOURCE;
 /**
  * Default implementation of {@link SqlValidator}.
  */
-public class SqlValidatorImpl implements SqlValidatorWithHints {
+public class
+SqlValidatorImpl implements SqlValidatorWithHints {
     //~ Static fields/initializers ---------------------------------------------
 
     public static final Logger TRACER = CalciteTrace.PARSER_LOGGER;
@@ -356,6 +378,9 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
     // Flag for current new partition database.
     private boolean autoPartitionDatabase = false;
 
+    // Flag for if database is create with default_single=true, only used by autoDb
+    private boolean defaultSingle = false;
+
     //~ Constructors -----------------------------------------------------------
 
     /**
@@ -396,6 +421,14 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
 
     public void setAutoPartitionDatabase(boolean autoPartitionDatabase) {
         this.autoPartitionDatabase = autoPartitionDatabase;
+    }
+
+    public boolean isDefaultSingle() {
+        return defaultSingle;
+    }
+
+    public void setDefaultSingle(boolean defaultSingle) {
+        this.defaultSingle = defaultSingle;
     }
 
     public SqlConformance getConformance() {
@@ -443,6 +476,26 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
     }
 
     public SqlNode[] expandStarForCheckSum(
+        SqlNode selectItem,
+        SqlSelect select) {
+        final List<SqlNode> list = new ArrayList<>();
+        final RelDataType originalType = getValidatedNodeTypeIfKnown(selectItem);
+        expandSelectItem(
+            selectItem,
+            select,
+            Util.first(originalType, unknownType),
+            list,
+            catalogReader.nameMatcher().isCaseSensitive()
+                ? new LinkedHashSet<>()
+                : new TreeSet<>(String.CASE_INSENSITIVE_ORDER),
+            new ArrayList<>(),
+            false);
+        //getRawSelectScope(select).setExpandedSelectList(list);
+        return list.toArray(new SqlNode[list.size()]);
+    }
+
+    @Override
+    public SqlNode[] expandStarForCheckSumV2(
         SqlNode selectItem,
         SqlSelect select) {
         final List<SqlNode> list = new ArrayList<>();
@@ -602,8 +655,8 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     final RelDataType rowType = fromNs.getRowType();
                     for (RelDataTypeField field : rowType.getFieldList()) {
                         String columnName = field.getName();
-                        if ((this.top.getKind() == SELECT || this.top.getKind() == SqlKind.INSERT) && isImplicitKey(
-                            columnName)) {
+                        if ((this.top.getKind() == SELECT || this.top.getKind() == SqlKind.INSERT
+                            || this.top.getKind() == SqlKind.REPLACE) && isImplicitKey(columnName)) {
                             continue;
                         }
                         // TODO: do real implicit collation here
@@ -664,8 +717,8 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             } else if (rowType.isStruct()) {
                 for (RelDataTypeField field : rowType.getFieldList()) {
                     String columnName = field.getName();
-                    if ((this.top.getKind() == SELECT || this.top.getKind() == SqlKind.INSERT) && isImplicitKey(
-                        columnName)) {
+                    if ((this.top.getKind() == SELECT || this.top.getKind() == SqlKind.INSERT
+                        || this.top.getKind() == SqlKind.REPLACE) && isImplicitKey(columnName)) {
                         continue;
                     }
                     // TODO: do real implicit collation here
@@ -1013,13 +1066,19 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         }
         if (topNode.getKind() == SqlKind.CREATE_TABLE || topNode.getKind() == SqlKind.DROP_TABLE
             || topNode.getKind() == SqlKind.DROP_VIEW || topNode.getKind() == SqlKind.DROP_FILESTORAGE
+            || topNode.getKind() == SqlKind.CLEAR_FILESTORAGE
             || topNode.getKind() == SqlKind.CREATE_FILESTORAGE
+            || topNode.getKind() == SqlKind.DROP_MATERIALIZED_VIEW
+            || topNode.getKind() == SqlKind.DROP_VIEW
             || topNode.getKind() == SqlKind.CREATE_TRIGGER
             || topNode.getKind() == SqlKind.DROP_TRIGGER
             || topNode.getKind() == SqlKind.CREATE_FUNCTION
             || topNode.getKind() == SqlKind.DROP_FUNCTION
             || topNode.getKind() == SqlKind.CREATE_PROCEDURE
             || topNode.getKind() == SqlKind.DROP_PROCEDURE
+            || topNode.getKind() == SqlKind.CREATE_STORAGE_POOL
+            || topNode.getKind() == SqlKind.ALTER_STORAGE_POOL
+            || topNode.getKind() == SqlKind.DROP_STORAGE_POOL
         ) {
             if (topNode.getKind() == SqlKind.CREATE_TABLE) {
                 outermostNode.validate(this, scope);
@@ -1251,8 +1310,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
     }
 
     private SqlIndexDefinition assignAutoPartitionForGsiIndex(
-        final SqlIndexDefinition index, final List<Pair<SqlIdentifier, SqlColumnDeclaration>> cols,
-        final SqlIdentifier newIndexName, boolean clustered) {
+        final SqlIndexDefinition index, final List<Pair<SqlIdentifier, SqlColumnDeclaration>> cols) {
         // Check we have to change this.
         if (index.isLocal()) {
             return null; // Ignore explicit local index.
@@ -1291,7 +1349,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 "Index '" + index.getIndexName().getLastName() + "' column '" + firstColName + "' not found."));
 
         final String pkDataType = firstColumn.getValue().getDataType().getTypeName().getLastName().toLowerCase();
-        return index.rebuildToGsi(newIndexName, assignAutoPartition(firstColumn.getKey(), pkDataType), clustered);
+        return index.rebuildToGsi(null, assignAutoPartition(firstColumn.getKey(), pkDataType));
     }
 
     private static boolean checkKeyExistence(SqlCreateTable sqlCreateTable, String keyName) {
@@ -1312,6 +1370,10 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             return true;
         }
         if (sqlCreateTable.getClusteredKeys() != null && sqlCreateTable.getClusteredKeys().stream()
+            .anyMatch(pair -> pair.getKey().getLastName().equalsIgnoreCase(keyName))) {
+            return true;
+        }
+        if (sqlCreateTable.getColumnarKeys() != null && sqlCreateTable.getColumnarKeys().stream()
             .anyMatch(pair -> pair.getKey().getLastName().equalsIgnoreCase(keyName))) {
             return true;
         }
@@ -1378,8 +1440,13 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
     }
 
     public static boolean supportNewPartition(String typeName) {
+        boolean enableAutoRangeForTimeIndex = DynamicConfig.getInstance().isEnableAutoUseRangeForTimeIndex();
+        boolean colTypeSupportGsiAutoSp = supportGsiAutoUseRangeKeySubPart(typeName);
+        if (colTypeSupportGsiAutoSp && enableAutoRangeForTimeIndex) {
+            return true;
+        }
         final String[] deniedTypes = {
-            "bit", "float", "double", "time", "year", "tinyblob", "blob", "mediumblob", "longblob", "enum", "decimal",
+            "bit", "float", "double", "time", "year", "tinyblob", "blob", "mediumblob", "longblob", "enum",
             "binary", "tinytext", "text", "mediumtext", "longtext", "set", "geometry", "timestamp",
             "datetime", "date"};
         for (String deniedType : deniedTypes) {
@@ -1390,26 +1457,50 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         return true;
     }
 
-    public static SqlNode assignAutoPartitionNewPartition(List<SqlIdentifier> keys, List<String> typeNames,
-                                                          long defaultPartitions) {
+    public static boolean supportGsiAutoUseRangeKeySubPart(String typeName) {
+        final String[] acceptedTypes = {
+            "datetime", "date"
+        };
+        for (String deniedType : acceptedTypes) {
+            if (typeName.equalsIgnoreCase(deniedType)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static SqlNode assignAutoPartitionNewPartition(List<SqlIdentifier> keys,
+                                                          List<String> typeNames,
+                                                          List<SqlIdentifier> pkKeys,
+                                                          List<String> pkTypeNames,
+                                                          long defaultPartitions,
+                                                          boolean force,
+                                                          boolean isColumnar) {
         assert keys.size() == typeNames.size();
+        assert pkKeys.size() == pkTypeNames.size();
+
+        // Columnar index use pk as partition key by default
+        final List<SqlIdentifier> candidates = isColumnar ? pkKeys : keys;
+        final List<String> candidateTypes = isColumnar ? pkTypeNames : typeNames;
+
         Set<String> duplicateChecker = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         List<SqlIdentifier> validKeys = new ArrayList<>();
         List<String> validTypeNames = new ArrayList<>();
-        for (int i = 0; i < keys.size(); ++i) {
+        for (int i = 0; i < candidates.size(); ++i) {
             // Use as much as possible.
-            if (!supportNewPartition(typeNames.get(i))) {
-                if (0 == i) {
+            if (!supportNewPartition(candidateTypes.get(i))) {
+                if (0 == i && !force) {
                     // First key must be valid.
                     throw new NotSupportException(
-                        "Key '" + keys.get(i).getLastName() + "' type '" + typeNames.get(i) + "' for auto partition");
+                        "Key '" + candidates.get(i).getLastName() + "' type '" + candidateTypes.get(i)
+                            + "' for auto partition");
                 }
                 // Or just ignore and next.
             } else {
                 // Put valid keys in correct order and remove duplicates.
-                if (duplicateChecker.add(keys.get(i).getLastName())) {
-                    validKeys.add(keys.get(i));
-                    validTypeNames.add(typeNames.get(i));
+                if (duplicateChecker.add(candidates.get(i).getLastName())) {
+                    validKeys.add(candidates.get(i));
+                    validTypeNames.add(candidateTypes.get(i));
                 }
             }
         }
@@ -1422,28 +1513,190 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             validTypeNames = validTypeNames.subList(0, maxPartitionColumnCount);
         }
 
-        // Generate the partitioning clause.
-        final SqlPartitionByHash sqlPartitionByHash = new SqlPartitionByHash(true, false, SqlParserPos.ZERO);
-        sqlPartitionByHash
-            .setPartitionsCount(SqlLiteral
-                .createLiteralForIntTypes(Long.toString(defaultPartitions),
-                    SqlParserPos.ZERO, SqlTypeName.BIGINT));
-        sqlPartitionByHash.getColumns().addAll(validKeys);
-        final StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < validKeys.size(); ++i) {
-            if (i != 0) {
-                builder.append(", ");
+        List<SqlIdentifier> originalIndexKeys = new ArrayList<>();
+        List<String> originalIndexKeyTypes = new ArrayList<>();
+        Map<String, Integer> pkKeyInfoMaps = new TreeMap<>(CaseInsensitive.CASE_INSENSITIVE_ORDER);
+        for (int i = 0; i < pkKeys.size(); i++) {
+            String pkKeyName = SQLUtils.normalizeNoTrim(pkKeys.get(i).getLastName());
+            if (!pkKeyInfoMaps.containsKey(pkKeyName)) {
+                pkKeyInfoMaps.put(pkKeyName, i);
             }
-            builder.append(SqlIdentifier.surroundWithBacktick(validKeys.get(i).getLastName()));
         }
-        sqlPartitionByHash.setSourceSql("KEY(" + builder + ") PARTITIONS " + defaultPartitions);
-        return sqlPartitionByHash;
+        for (int i = 0; i < validKeys.size(); i++) {
+            SqlIdentifier keyId = validKeys.get(i);
+            String typeName = validTypeNames.get(i);
+            String keyName = SQLUtils.normalizeNoTrim(keyId.getLastName());
+            if (pkKeyInfoMaps.containsKey(keyName)) {
+                continue;
+            }
+            originalIndexKeys.add(keyId);
+            originalIndexKeyTypes.add(typeName);
+        }
+
+        boolean useSubPartByForDateTimeIdx = false;
+        boolean enableAutoRangeForTimeIndex = DynamicConfig.getInstance().isEnableAutoUseRangeForTimeIndex();
+        if (originalIndexKeys.size() == 1) {
+            String typeName = originalIndexKeyTypes.get(0);
+            SqlTypeName sqlType = SqlTypeName.get(typeName.toUpperCase());
+            if (sqlType == SqlTypeName.DATETIME || sqlType == SqlTypeName.DATE && enableAutoRangeForTimeIndex) {
+                useSubPartByForDateTimeIdx = true;
+            }
+        }
+
+        SqlNode partByAst = null;
+        if (!useSubPartByForDateTimeIdx) {
+            // Generate the partitioning clause.
+            final SqlPartitionByHash sqlPartitionByHash = new SqlPartitionByHash(!isColumnar, false, SqlParserPos.ZERO);
+            // For cci, generate partition count in {@link PartitionInfoBuilder#buildPartitionInfoByPartDefAst}
+            if (!isColumnar) {
+                // Set partition count for gsi.
+                sqlPartitionByHash
+                    .setPartitionsCount(SqlLiteral
+                        .createLiteralForIntTypes(Long.toString(defaultPartitions),
+                            SqlParserPos.ZERO, SqlTypeName.BIGINT));
+            }
+            sqlPartitionByHash.getColumns().addAll(validKeys);
+            final StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < validKeys.size(); ++i) {
+                if (i != 0) {
+                    builder.append(", ");
+                }
+                builder.append(SqlIdentifier.surroundWithBacktick(validKeys.get(i).getLastName()));
+            }
+            if (isColumnar) {
+                // For cci, generate partition count in {@link PartitionInfoBuilder#buildPartitionInfoByPartDefAst}
+                sqlPartitionByHash.setSourceSql("DIRECT_HASH(" + builder + ")");
+            } else {
+                sqlPartitionByHash.setSourceSql("KEY(" + builder + ") PARTITIONS " + defaultPartitions);
+            }
+            partByAst = sqlPartitionByHash;
+        } else {
+            // Generate the partitioning clause.
+            final SqlSubPartitionByHash sqlSubPartitionByHash =
+                new SqlSubPartitionByHash(true, false, SqlParserPos.ZERO);
+            sqlSubPartitionByHash
+                .setSubPartitionsCount(SqlLiteral
+                    .createLiteralForIntTypes(Long.toString(defaultPartitions),
+                        SqlParserPos.ZERO, SqlTypeName.BIGINT));
+
+            List<SqlIdentifier> subPartKeys = pkKeys;
+            sqlSubPartitionByHash.getColumns().addAll(subPartKeys);
+            final StringBuilder subPartKeyBuilder = new StringBuilder();
+            final StringBuilder subPartBuilder = new StringBuilder();
+            for (int i = 0; i < subPartKeys.size(); ++i) {
+                if (i != 0) {
+                    subPartKeyBuilder.append(", ");
+                }
+                subPartKeyBuilder.append(SqlIdentifier.surroundWithBacktick(subPartKeys.get(i).getLastName()));
+            }
+
+            subPartBuilder.append("SUBPARTITION BY KEY(");
+            subPartBuilder.append(subPartKeyBuilder);
+            subPartBuilder.append(") SUBPARTITIONS ");
+            subPartBuilder.append(defaultPartitions);
+            sqlSubPartitionByHash.setSourceSql(subPartBuilder.toString());
+
+            final SqlPartitionByRange sqlPartitionByRange = new SqlPartitionByRange(SqlParserPos.ZERO);
+            sqlPartitionByRange.setColumns(true);
+            List<SqlIdentifier> rangePartKeys = originalIndexKeys;
+            sqlPartitionByRange.getColumns().addAll(rangePartKeys);
+            final StringBuilder partKeyBuilder = new StringBuilder();
+            final StringBuilder partBuilder = new StringBuilder();
+            for (int i = 0; i < rangePartKeys.size(); ++i) {
+                if (i != 0) {
+                    partKeyBuilder.append(", ");
+                }
+                partKeyBuilder.append(SqlIdentifier.surroundWithBacktick(rangePartKeys.get(i).getLastName()));
+            }
+
+            SqlPartitionValue maxValPartSpecVal =
+                new SqlPartitionValue(SqlPartitionValue.Operator.LessThan, SqlParserPos.ZERO);
+            for (int i = 0; i < rangePartKeys.size(); i++) {
+                SqlPartitionValueItem valItem =
+                    new SqlPartitionValueItem(new SqlIdentifier("MAXVALUE", SqlParserPos.ZERO));
+                valItem.setMaxValue(true);
+                maxValPartSpecVal.getItems().add(valItem);
+            }
+
+            SqlPartition maxValPartSpec =
+                new SqlPartition(new SqlIdentifier("p1", SqlParserPos.ZERO), maxValPartSpecVal, SqlParserPos.ZERO);
+            sqlPartitionByRange.getPartitions().add(maxValPartSpec);
+            sqlPartitionByRange.setSubPartitionBy(sqlSubPartitionByHash);
+
+            partBuilder.append("RANGE COLUMNS(");
+            partBuilder.append(partKeyBuilder);
+            partBuilder.append(") ");
+            partBuilder.append(subPartBuilder);
+
+            StringBuilder maxValBndSb = new StringBuilder("");
+            maxValBndSb.append("(");
+            for (int i = 0; i < rangePartKeys.size(); i++) {
+                if (i > 0) {
+                    maxValBndSb.append(",");
+                }
+                maxValBndSb.append("MAXVALUE");
+            }
+            maxValBndSb.append(")");
+            partBuilder.append(" ( PARTITION p1 VALUES LESS THAN ").append(maxValBndSb).append(")");
+            sqlPartitionByRange.setSourceSql(partBuilder.toString());
+            partByAst = sqlPartitionByRange;
+        }
+
+        return partByAst;
     }
 
-    private static SqlIndexDefinition assignAutoPartitionForGsiIndexNewPartition(
-        SqlIndexDefinition index, SqlCreateTable createTable,
-        SqlIdentifier newIndexName, boolean clustered) {
+//    public static SqlNode assignAutoPartitionNewPartition(List<SqlIdentifier> keys, List<String> typeNames) {
+//        assert keys.size() == typeNames.size();
+//        Set<String> duplicateChecker = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+//        List<SqlIdentifier> validKeys = new ArrayList<>();
+//        List<String> validTypeNames = new ArrayList<>();
+//        for (int i = 0; i < keys.size(); ++i) {
+//            // Use as much as possible.
+//            if (!supportNewPartition(typeNames.get(i))) {
+//                if (0 == i) {
+//                    // First key must be valid.
+//                    throw new NotSupportException(
+//                        "Key '" + keys.get(i).getLastName() + "' type '" + typeNames.get(i) + "' for auto partition");
+//                }
+//                // Or just ignore and next.
+//            } else {
+//                // Put valid keys in correct order and remove duplicates.
+//                if (duplicateChecker.add(keys.get(i).getLastName())) {
+//                    validKeys.add(keys.get(i));
+//                    validTypeNames.add(typeNames.get(i));
+//                }
+//            }
+//        }
+//
+//        assert validKeys.size() == validTypeNames.size();
+//        final int maxPartitionColumnCount = DynamicConfig.getInstance().getMaxPartitionColumnCount();
+//        if (validKeys.size() > maxPartitionColumnCount) {
+//            // Cut to max column count.
+//            validKeys = validKeys.subList(0, maxPartitionColumnCount);
+//            validTypeNames = validTypeNames.subList(0, maxPartitionColumnCount);
+//        }
+//
+//        // Generate the partitioning clause.
+//        final SqlPartitionByHash sqlPartitionByHash = new SqlPartitionByHash(true, false, SqlParserPos.ZERO);
+//        sqlPartitionByHash
+//            .setPartitionsCount(SqlLiteral
+//                .createLiteralForIntTypes(Long.toString(defaultPartitions),
+//                    SqlParserPos.ZERO, SqlTypeName.BIGINT));
+//        sqlPartitionByHash.getColumns().addAll(validKeys);
+//        final StringBuilder builder = new StringBuilder();
+//        for (int i = 0; i < validKeys.size(); ++i) {
+//            if (i != 0) {
+//                builder.append(", ");
+//            }
+//            builder.append(SqlIdentifier.surroundWithBacktick(validKeys.get(i).getLastName()));
+//        }
+//        sqlPartitionByHash.setSourceSql("KEY(" + builder + ") PARTITIONS "
+//            + DynamicConfig.getInstance().getAutoPartitionPartitions());
+//        return sqlPartitionByHash;
+//    }
 
+    private static SqlIndexDefinition assignAutoPartitionForGsiIndexNewPartition(SqlIndexDefinition index,
+                                                                                 SqlCreateTable createTable) {
         // Check legacy partition clause.
         if (index.getDbPartitionBy() != null || index.getDbPartitions() != null) {
             throw new NotSupportException(
@@ -1519,9 +1772,18 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         }
         assert concatKeys.size() == dataTypes.size();
 
-        long defaultPartitions = DynamicConfig.getInstance().getAutoPartitionPartitions();
+        final boolean columnar = index.isColumnar();
+        long defaultPartitions = getRowStoreDefaultPartitions();
         return index.rebuildToGsiNewPartition(
-            newIndexName, assignAutoPartitionNewPartition(concatKeys, dataTypes, defaultPartitions), clustered);
+            null,
+            assignAutoPartitionNewPartition(
+                columnar ? pks : concatKeys,
+                columnar ? pkDataTypes : dataTypes,
+                pks,
+                pkDataTypes,
+                defaultPartitions,
+                index.isGlobal(),
+                columnar));
     }
 
     private static class RewriteOps {
@@ -1541,7 +1803,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         for (Pair<SqlIdentifier, SqlIndexDefinition> pair : indexes) {
             // No name change, pure GSI.
             final SqlIndexDefinition changed =
-                assignAutoPartitionForGsiIndexNewPartition(pair.getValue(), createTable, null, false);
+                assignAutoPartitionForGsiIndexNewPartition(pair.getValue(), createTable);
             if (null == changed) {
                 localList.add(pair);
             } else {
@@ -1568,24 +1830,37 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         for (Pair<SqlIdentifier, SqlIndexDefinition> pair : indexes) {
             // No name change, pure GSI.
             final SqlIndexDefinition changed =
-                assignAutoPartitionForGsiIndexNewPartition(pair.getValue(), createTable, null, false);
+                assignAutoPartitionForGsiIndexNewPartition(pair.getValue(), createTable);
             if (changed != null) {
                 // Update it.
                 gsiList.add(new Pair<>(changed.getIndexName(), changed));
             } else {
                 gsiList.add(pair);
             }
-            // Generate a local index.
-            final SqlIndexDefinition indexDefinition = null == changed ? pair.getValue() : changed;
-            final String newLocalName = AUTO_LOCAL_INDEX_PREFIX + indexDefinition.getIndexName().getLastName();
-            if (checkKeyExistence(createTable, newLocalName)) {
-                continue; // Ignore existing.
+            // Generate a local index for gsi only.
+            if (!pair.getValue().isColumnar()) {
+                final SqlIndexDefinition indexDefinition = null == changed ? pair.getValue() : changed;
+                final String newLocalName = AUTO_LOCAL_INDEX_PREFIX + indexDefinition.getIndexName().getLastName();
+                if (checkKeyExistence(createTable, newLocalName)) {
+                    continue; // Ignore existing.
+                }
+                final SqlIdentifier newName = new SqlIdentifier(newLocalName, SqlParserPos.ZERO);
+                localList.add(new Pair<>(newName, pair.getValue().rebuildToExplicitLocal(newName)));
+                ops.addLocalOp.add(new Pair<>(indexDefinition.getIndexName().getLastName(), newLocalName));
             }
-            final SqlIdentifier newName = new SqlIdentifier(newLocalName, SqlParserPos.ZERO);
-            localList.add(new Pair<>(newName, pair.getValue().rebuildToExplicitLocal(newName)));
-            ops.addLocalOp.add(new Pair<>(indexDefinition.getIndexName().getLastName(), newLocalName));
         }
         return new Pair<>(localList, gsiList);
+    }
+
+    private static SqlCreateTable rewriteForBalanceSingleTableIfNeed(SqlCreateTable createTable) {
+        boolean noSpecifyLocality = StringUtils.isEmpty(createTable.getLocality());
+        boolean broadcastOrPartition = createTable.isBroadCast() || createTable.getSqlPartition() != null;
+        if (noSpecifyLocality && !broadcastOrPartition) {
+            String balanceSingleTableLocality = LocalityDesc.BALANCE_SINGLE_TABLE_ON;
+            createTable.setLocality(balanceSingleTableLocality);
+            createTable.setSingle(true);
+        }
+        return createTable;
     }
 
     private static SqlCreateTable rewriteForNewPartition(SqlCreateTable createTable) {
@@ -1608,8 +1883,10 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             final List<String> pkDataTypes = pks.stream()
                 .map(col -> getColumnDefine(createTable, col.getLastName()).getDataType().getTypeName().getLastName()
                     .toLowerCase()).collect(Collectors.toList());
-            long defaultPartitions = DynamicConfig.getInstance().getAutoPartitionPartitions();
-            createTable.setSqlPartition(assignAutoPartitionNewPartition(pks, pkDataTypes, defaultPartitions));
+            long defaultPartitions = getRowStoreDefaultPartitions();
+            createTable.setSqlPartition(
+                assignAutoPartitionNewPartition(pks, pkDataTypes, pks, pkDataTypes, defaultPartitions,
+                    createTable.createGsi(), false));
         }
 
         RewriteOps ops = new RewriteOps();
@@ -1680,9 +1957,17 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             createTable.getUniqueKeys().addAll(localGsi.left);
         }
 
+        // Assign auto dbpartition if not contain on CCI.
+        if (createTable.getColumnarKeys() != null && !createTable.getColumnarKeys().isEmpty()) {
+            final Pair<List<Pair<SqlIdentifier, SqlIndexDefinition>>, List<Pair<SqlIdentifier, SqlIndexDefinition>>>
+                lsiAndCci = gsiNormalizeNewPartition(createTable.getColumnarKeys(), createTable, ops);
+            createTable.setColumnarKeys(lsiAndCci.right);
+            // Do not add local index for CCI
+        }
+
         // Do sql rewrite.
         final List<SQLStatement> statementList =
-            SQLUtils.parseStatements(createTable.getSourceSql(), JdbcConstants.MYSQL);
+            SQLUtils.parseStatementsWithDefaultFeatures(createTable.getSourceSql(), JdbcConstants.MYSQL);
         final MySqlCreateTableStatement stmt = (MySqlCreateTableStatement) statementList.get(0);
         // rename and add local definition
         final List<SQLTableElement> added = new ArrayList<>();
@@ -1870,8 +2155,13 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                         SqlLiteral.createNull(SqlParserPos.ZERO),
                         null, true, SqlColumnDeclaration.SpecialIndex.PRIMARY,
                         SqlLiteral.createCharString("implicit pk", SqlParserPos.ZERO), null, null, null, false,
-                        SequenceAttribute.Type.GROUP, 1, 0, 100000);
-                ((SqlCreateTable) node).getColDefs().add(new Pair<SqlIdentifier, SqlColumnDeclaration>(implicitColName,
+                        SequenceAttribute.Type.GROUP, 1, 0, 100000, false, false, null);
+                List<Pair<SqlIdentifier, SqlColumnDeclaration>> sqlColDefs = ((SqlCreateTable) node).getColDefs();
+                if (sqlColDefs == null) {
+                    sqlColDefs = new ArrayList<Pair<SqlIdentifier, SqlColumnDeclaration>>();
+                    ((SqlCreateTable) node).setColDefs(sqlColDefs);
+                }
+                sqlColDefs.add(new Pair<SqlIdentifier, SqlColumnDeclaration>(implicitColName,
                     implicitCol));
 
                 // build implicit key name
@@ -1924,12 +2214,30 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 ((SqlCreateTable) node).setAutoPartition(true);
             }
 
-            if (autoPartitionDatabase && ((SqlCreateTable) node).isAutoPartition()) {
+            if (autoPartitionDatabase) {
                 // Auto partition for new partition database.
                 final SqlCreateTable createTable = (SqlCreateTable) node;
+                if (createTable.isAutoPartition()) {
+                    // Dealing normal rewrites for auto partition table.
+                    node = rewriteForNewPartition(createTable);
+                } else {
+                    if (defaultSingle) {
+                        /**
+                         * create autodb with default_single=true
+                         * auto rewrite create tbl without partitionby by single locality='balance_single_table=on'
+                         */
+                        node = rewriteForBalanceSingleTableIfNeed(createTable);
+                    }
 
-                // Dealing normal rewrites.
-                node = rewriteForNewPartition(createTable);
+                    // Rewrite cci on partition table
+                    // Assign auto dbpartition if not contain on CCI.
+                    if (createTable.getColumnarKeys() != null && !createTable.getColumnarKeys().isEmpty()) {
+                        createTable.setColumnarKeys(
+                            gsiNormalizeNewPartition(createTable.getColumnarKeys(), createTable, null).getValue());
+                        // Do not add local index for CCI
+                    }
+                }
+
             } else if (((SqlCreateTable) node).isAutoPartition()) { // Auto partition.
                 final SqlCreateTable createTable = (SqlCreateTable) node;
 
@@ -1966,7 +2274,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     for (Pair<SqlIdentifier, SqlIndexDefinition> pair : createTable.getKeys()) {
                         // No name change, pure GSI.
                         final SqlIndexDefinition changed =
-                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs(), null, false);
+                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs());
                         if (null == changed) {
                             tmpList.add(pair);
                         } else {
@@ -1992,7 +2300,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     for (Pair<SqlIdentifier, SqlIndexDefinition> pair : createTable.getUniqueKeys()) {
                         // No name change, pure GSI.
                         final SqlIndexDefinition changed =
-                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs(), null, false);
+                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs());
                         if (null == changed) {
                             tmpList.add(pair);
                         } else {
@@ -2017,7 +2325,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     for (Pair<SqlIdentifier, SqlIndexDefinition> pair : createTable.getGlobalKeys()) {
                         // No name change, pure GSI.
                         final SqlIndexDefinition changed =
-                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs(), null, false);
+                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs());
                         if (changed != null) {
                             // Update it.
                             tmpList.add(new Pair<>(pair.getKey(), changed));
@@ -2045,7 +2353,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     for (Pair<SqlIdentifier, SqlIndexDefinition> pair : createTable.getGlobalUniqueKeys()) {
                         // No name change, pure GSI.
                         final SqlIndexDefinition changed =
-                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs(), null, false);
+                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs());
                         if (changed != null) {
                             // Update it.
                             tmpList.add(new Pair<>(pair.getKey(), changed));
@@ -2074,7 +2382,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     for (Pair<SqlIdentifier, SqlIndexDefinition> pair : createTable.getClusteredKeys()) {
                         // No name change, clustered.
                         final SqlIndexDefinition changed =
-                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs(), null, true);
+                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs());
                         if (changed != null) {
                             // Update it.
                             tmpList.add(new Pair<>(pair.getKey(), changed));
@@ -2102,7 +2410,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     for (Pair<SqlIdentifier, SqlIndexDefinition> pair : createTable.getClusteredUniqueKeys()) {
                         // No name change, clustered.
                         final SqlIndexDefinition changed =
-                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs(), null, true);
+                            assignAutoPartitionForGsiIndex(pair.getValue(), createTable.getColDefs());
                         if (changed != null) {
                             // Update it.
                             tmpList.add(new Pair<>(pair.getKey(), changed));
@@ -2127,7 +2435,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
 
                 // Critical: Patch the sql string of SqlCreateTable. The sql string used to generate GSI table definition.
                 final List<SQLStatement> statementList =
-                    SQLUtils.parseStatements(createTable.getSourceSql(), JdbcConstants.MYSQL);
+                    SQLUtils.parseStatementsWithDefaultFeatures(createTable.getSourceSql(), JdbcConstants.MYSQL);
                 final MySqlCreateTableStatement stmt = (MySqlCreateTableStatement) statementList.get(0);
                 // rename and add local definition
                 final List<SQLTableElement> added = new ArrayList<>();
@@ -2185,6 +2493,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         if (node instanceof SqlCreateTable) {
             final SqlCreateTable createTable = (SqlCreateTable) node;
             // Deny GSI for no partitioned table.
+            // And support CCI for non-partitioned table.
             if (createTable.createGsi() &&
                 null == createTable.getDbpartitionBy() && null == createTable.getTbpartitionBy() &&
                 null == createTable.getSqlPartition()) {
@@ -2354,7 +2663,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     SqlNode sqlNode = orderList.get(i);
                     SqlNodeList selectList2 = getInnerSelect(node).getSelectList();
                     for (Ord<SqlNode> sel : Ord.zip(selectList2)) {
-                        if (stripAs(sel.e).equalsDeep(sqlNode, Litmus.IGNORE)) {
+                        if (stripAs(sel.e).equalsDeep(sqlNode, Litmus.IGNORE, EqualsContext.DEFAULT_EQUALS_CONTEXT)) {
                             orderList.set(i,
                                 SqlLiteral.createExactNumeric(Integer.toString(sel.i + 1),
                                     SqlParserPos.ZERO));
@@ -2631,7 +2940,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     call.getAlias().getSimple());
         }
         return new SqlSelect(SqlParserPos.ZERO, null, selectList, sourceTable,
-            call.getCondition(), null, null, null, call.getOrderList(), null, call.getFetch());
+            call.getCondition(), null, null, null, call.getOrderList(), call.getOffset(), call.getFetch());
     }
 
     // create SqlSelect for "on duplicate key update" list.
@@ -2747,10 +3056,10 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                         call.getAlias().getSimple());
             }
             return new SqlSelect(SqlParserPos.ZERO, null, selectList, sourceTable,
-                call.getCondition(), null, null, null, call.getOrderList(), null, call.getFetch());
+                call.getCondition(), null, null, null, call.getOrderList(), call.getOffset(), call.getFetch());
         } else {
             return new SqlSelect(SqlParserPos.ZERO, null, selectList, call.getSourceTableNode(),
-                call.getCondition(), null, null, null, call.getOrderList(), null, call.getFetch());
+                call.getCondition(), null, null, null, call.getOrderList(), call.getOffset(), call.getFetch());
         }
     }
 
@@ -2773,7 +3082,12 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             final List<String> aliasList = new ArrayList<>();
             final List<RelDataType> typeList = new ArrayList<>();
             for (Ord<SqlNode> column : Ord.zip(rowConstructor.getOperandList())) {
-                final String alias = deriveAlias(column.e, column.i);
+                final String alias;
+                if (values instanceof SqlValuesTableSource){
+                    alias = SqlValuesTableSource.COLUMN_NAME_PREFIX + column.i;
+                }else{
+                    alias = deriveAlias(column.e, column.i);
+                }
                 aliasList.add(alias);
                 final RelDataType type = deriveType(scope, column.e);
                 typeList.add(type);
@@ -2952,8 +3266,8 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             typeChecking.getAllowedSignatures(
                 unresolvedFunction,
                 unresolvedFunction.getName());
-        throw newValidationError(call,
-            RESOURCE.validatorUnknownFunction(signature));
+        throw new TddlRuntimeException(ErrorCode.ERR_FUNCTION_NOT_FOUND,
+            "No match found for function signature " + signature);
     }
 
     protected void inferUnknownTypes(
@@ -3861,7 +4175,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
 //            final RelDataType relDataType = typeFactory.createStructType(relDataTypes, fieldList);
 //            setValidatedNodeType(node, relDataType);
 
-            if (sqlCreateTbNode.createGsi()) {
+            if (sqlCreateTbNode.createGsiOrCci()) {
                 // For checking table existence.
                 IdentifierNamespace namespace =
                     new IdentifierNamespace(this, sqlCreateTbNode.getTargetTable(), sqlCreateTbNode, parentScope);
@@ -3893,6 +4207,14 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
 
                 if (GeneralUtil.isNotEmpty(node1.getClusteredUniqueKeys())) {
                     for (Pair<SqlIdentifier, SqlIndexDefinition> pair : node1.getClusteredUniqueKeys()) {
+                        IdentifierNamespace ddlTableNamespace =
+                            new IdentifierNamespace(this, pair.getKey(), node1, parentScope);
+                        registerNamespace(usingScope, alias, ddlTableNamespace, forceNullable);
+                    }
+                }
+
+                if (GeneralUtil.isNotEmpty(node1.getColumnarKeys())) {
+                    for (Pair<SqlIdentifier, SqlIndexDefinition> pair : node1.getColumnarKeys()) {
                         IdentifierNamespace ddlTableNamespace =
                             new IdentifierNamespace(this, pair.getKey(), node1, parentScope);
                         registerNamespace(usingScope, alias, ddlTableNamespace, forceNullable);
@@ -3967,19 +4289,37 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 SqlKind.INSERT, typeFactory));
             break;
         case RENAME_TABLE:
-            final DDLTableNamespace ddlNamespace =
-                new DDLTableNamespace(this, (SqlRenameTable) node, node, parentScope);
-            registerNamespace(usingScope, alias, ddlNamespace, false);
-            final SqlNode newRenameTable =
-                registerFrom(
-                    parentScope,
-                    usingScope,
-                    ((SqlRenameTable) node).getOperandList().get(0),
-                    ((SqlRenameTable) node).getOperandList().get(0),
-                    null,
-                    null,
-                    false);
-            ((SqlRenameTable) node).setTargetTable(newRenameTable);
+            if (node instanceof SqlRenameTables) {
+                final DDLTableNamespace ddlNamespace =
+                    new DDLTableNamespace(this, (SqlRenameTables) node, node, parentScope);
+                registerNamespace(usingScope, alias, ddlNamespace, false);
+                final SqlNode newRenameTable =
+                    registerFrom(
+                        parentScope,
+                        usingScope,
+                        ((SqlRenameTables) node).getTableNameList().get(0).getKey(),
+                        ((SqlRenameTables) node).getTableNameList().get(0).getKey(),
+                        null,
+                        null,
+                        false);
+
+                ((SqlRenameTables) node).setTargetTable(newRenameTable);
+            } else {
+                final DDLTableNamespace ddlNamespace =
+                    new DDLTableNamespace(this, (SqlRenameTable) node, node, parentScope);
+                registerNamespace(usingScope, alias, ddlNamespace, false);
+                final SqlNode newRenameTable =
+                    registerFrom(
+                        parentScope,
+                        usingScope,
+                        ((SqlRenameTable) node).getOperandList().get(0),
+                        ((SqlRenameTable) node).getOperandList().get(0),
+                        null,
+                        null,
+                        false);
+
+                ((SqlRenameTable) node).setTargetTable(newRenameTable);
+            }
             setValidatedNodeType(node, RelOptUtil.createDmlRowType(
                 SqlKind.INSERT, typeFactory));
             break;
@@ -4013,7 +4353,11 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         case IDENTIFIER:
         case ALTER_FILESTORAGE:
         case DROP_FILESTORAGE:
+        case CLEAR_FILESTORAGE:
         case CREATE_FILESTORAGE:
+        case CREATE_STORAGE_POOL:
+        case ALTER_STORAGE_POOL:
+        case DROP_STORAGE_POOL:
             setValidatedNodeType(node, RelOptUtil.createDmlRowType(
                 SqlKind.INSERT, typeFactory));
             break;
@@ -4029,6 +4373,28 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             registerNamespace(usingScope, null, dropNs, forceNullable);
             RelDataType rowType = RelOptUtil.createDmlRowType(SqlKind.INSERT, typeFactory);
             setValidatedNodeType(node, rowType);
+            break;
+        case CREATE_MATERIALIZED_VIEW:
+            SqlCreateMaterializedView createMaterializedView = (SqlCreateMaterializedView) node;
+            registerQuery(
+                parentScope,
+                usingScope,
+                createMaterializedView.getOperandList().get(createMaterializedView.getOperandList().size() - 1),
+                enclosingNode,
+                null,
+                false);
+            break;
+        case DROP_MATERIALIZED_VIEW:
+            SqlDropMaterializedView materializedView = (SqlDropMaterializedView) node;
+            DropMateriedViewNamespace dropMateriedViewNamespace =
+                new DropMateriedViewNamespace(
+                    this,
+                    materializedView,
+                    enclosingNode,
+                    parentScope);
+            registerNamespace(usingScope, null, dropMateriedViewNamespace, forceNullable);
+            RelDataType rowViewType = RelOptUtil.createDmlRowType(SqlKind.INSERT, typeFactory);
+            setValidatedNodeType(node, rowViewType);
             break;
         case DELETE:
             SqlDelete deleteCall = (SqlDelete) node;
@@ -4097,7 +4463,8 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 final SqlNode targetTable = updateCall.getSourceTables().get(0);
                 if (targetTable.isA(SqlKind.QUERY)) {
                     throw newValidationError(targetTable,
-                        RESOURCE.targetNotUpdatable(((SqlCall) updateCall.getAliases().get(0)).operand(1).toString()));
+                        RESOURCE.targetNotUpdatable(((SqlCall) updateCall.getAliases().get(0)).operand(1).toString(),
+                            updateCall.getKind().name()));
                 }
                 UpdateNamespace updateNs =
                     new UpdateNamespace(
@@ -4274,10 +4641,35 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 new CreateDatabaseNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
             registerNamespace(usingScope, alias, createDbNamespace, forceNullable);
             break;
+        case ALTER_DATABASE:
+            final AlterDatabaseNamespace alterDatabaseNamespace =
+                new AlterDatabaseNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
+            registerNamespace(usingScope, alias, alterDatabaseNamespace, forceNullable);
+            break;
+        case IMPORT_DATABASE:
+            final ImportDatabaseNamespace importDatabaseNamespace =
+                new ImportDatabaseNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
+            registerNamespace(usingScope, alias, importDatabaseNamespace, forceNullable);
+            break;
+        case IMPORT_SEQUENCE:
+            final ImportSequenceNamespace importSequenceNamespace =
+                new ImportSequenceNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
+            registerNamespace(usingScope, alias, importSequenceNamespace, forceNullable);
+            break;
         case DROP_DATABASE:
             final DropDatabaseNamespace dropDbNamespace =
                 new DropDatabaseNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
             registerNamespace(usingScope, alias, dropDbNamespace, forceNullable);
+            break;
+        case CREATE_JAVA_FUNCTION:
+            final CreateJavaFunctionNamespace createJavaFuncNamespace =
+                new CreateJavaFunctionNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
+            registerNamespace(usingScope, alias, createJavaFuncNamespace, forceNullable);
+            break;
+        case DROP_JAVA_FUNCTION:
+            final DropJavaFunctionNamespace dropJavaFunctionNamespace =
+                new DropJavaFunctionNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
+            registerNamespace(usingScope, alias, dropJavaFunctionNamespace, forceNullable);
             break;
         case LOCK_TABLE:
             registerDal(parentScope, usingScope, node, enclosingNode, alias, forceNullable);
@@ -4312,6 +4704,11 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             final AlterJoinGroupNamespace alterJoinGroupNamespace =
                 new AlterJoinGroupNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
             registerNamespace(usingScope, alias, alterJoinGroupNamespace, forceNullable);
+            break;
+        case ALTER_INSTANCE:
+            final AlterInstanceNamespace alterInstanceNamespace =
+                new AlterInstanceNamespace(this, (SqlDdl) node, enclosingNode, parentScope);
+            registerNamespace(usingScope, alias, alterInstanceNamespace, forceNullable);
             break;
         default:
             if (node.isA(DAL)) {
@@ -4382,10 +4779,11 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             final WithScope withScope = new WithScope(scope, withItem);
             scopes.put(withItem, withScope);
 
-            registerQuery(scope, null, withItem.query, with,
+            registerQuery(withScope, null, withItem.query, with,
                 withItem.name.getSimple(), false);
+            WithItemNamespace wns = new WithItemNamespace(this, withItem, enclosingNode, with.isRecursive);
             registerNamespace(null, alias,
-                new WithItemNamespace(this, withItem, enclosingNode),
+                wns,
                 false);
             scope = withScope;
         }
@@ -5005,10 +5403,10 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             validateCreateTable(create);
         }
 
-        if (create.createGsi() && create instanceof SqlCreateTable) {
+        if (create.createGsiOrCci() && create instanceof SqlCreateTable) {
             final SqlCreateTable createTable = (SqlCreateTable) create;
 
-            if (createTable.createGsi() && !createTable.isIfNotExists()) {
+            if (createTable.createGsiOrCci() && !createTable.isIfNotExists()) {
                 // Not allow create table with GSI which have name conflict.
                 SqlValidatorTable table = null;
                 try {
@@ -5045,6 +5443,10 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 createTable.getClusteredUniqueKeys().forEach(s -> gsiNames.add(s.getKey().getLastName()));
             }
 
+            if (GeneralUtil.isNotEmpty(createTable.getColumnarKeys())) {
+                createTable.getColumnarKeys().forEach(s -> gsiNames.add(s.getKey().getLastName()));
+            }
+
             if (GeneralUtil.isNotEmpty(createTable.getKeys())) {
                 validateIndexName(createTable.getKeys(), gsiNames);
             }
@@ -5070,13 +5472,14 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             validateGsiColumn(createTable.getGlobalUniqueKeys());
             validateGsiColumn(createTable.getClusteredKeys());
             validateGsiColumn(createTable.getClusteredUniqueKeys());
-        } else if (create.createGsi() && create instanceof SqlAlterTablePartitionKey) {
+            validateGsiColumn(createTable.getColumnarKeys());
+        } else if (create.createGsiOrCci() && create instanceof SqlAlterTablePartitionKey) {
             //do nothing for now
         } else if (create instanceof SqlAlterTableAsOfTimeStamp) {
             //do nothing for now
         } else if (create instanceof SqlAlterTablePurgeBeforeTimeStamp) {
             //do nothing for now
-        } else if (create.createGsi() && create instanceof SqlAlterTable) {
+        } else if (create.createGsiOrCci() && create instanceof SqlAlterTable) {
             final SqlAlterTable alterTable = (SqlAlterTable) create;
             alterTable.getAlters().forEach(alterItem -> {
                 if (alterItem.isA(SqlKind.ALTER_ADD_INDEX)) {
@@ -5091,7 +5494,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     });
                 }
             });
-        } else if (create.createGsi() && create instanceof SqlCreateIndex) {
+        } else if (create.createGsiOrCci() && create instanceof SqlCreateIndex) {
             checkDuplicatedIndexColumn((SqlCreateIndex) create);
         } else if (create instanceof SqlCreateTable && ((SqlCreateTable) create).getSqlPartition() != null) {
             SqlPartitionBy partBy = (SqlPartitionBy) ((SqlCreateTable) create).getSqlPartition();
@@ -5102,11 +5505,28 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             final SqlAlterTable alterTable = (SqlAlterTable) create;
             alterTable.getAlters().forEach(alterItem -> {
                 if (alterItem.getOperator().getKind() == SqlKind.SPLIT_PARTITION
-                    || alterItem.getOperator().getKind() == EXTRACT_PARTITION) {
+                    || alterItem.getOperator().getKind() == EXTRACT_PARTITION
+                    || alterItem.getOperator().getKind() == MODIFY_PARTITION) {
                     alterItem.validate(this, scope);
                 }
             });
 
+        } else if (create instanceof SqlCreateMaterializedView) {
+            final SqlCreateMaterializedView createTable = (SqlCreateMaterializedView) create;
+            // validate sqlCreate and build reldatatype of sqlcreate
+            validateMaterializedCreateTable(createTable);
+        } else if (create instanceof SqlCreateStoragePool) {
+            final SqlCreateStoragePool createStoragePool =
+                (SqlCreateStoragePool) create;
+            validateCreateStoragePool(createStoragePool);
+        } else if (create instanceof SqlDropStoragePool) {
+            final SqlDropStoragePool dropStoragePool =
+                (SqlDropStoragePool) create;
+            validateDropStoragePool(dropStoragePool);
+        } else if (create instanceof SqlAlterStoragePool) {
+            final SqlAlterStoragePool alterStoragePool =
+                (SqlAlterStoragePool) create;
+            validateAlterStoragePool(alterStoragePool);
         }
     }
 
@@ -5148,6 +5568,31 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         setValidatedNodeType(node, relDataType);
     }
 
+    public void validateCreateStoragePool(SqlCreateStoragePool createStoragePool) {
+
+    }
+
+    public void validateDropStoragePool(SqlDropStoragePool dropStoragePool) {
+
+    }
+
+    public void validateAlterStoragePool(SqlAlterStoragePool alterStoragePool) {
+
+    }
+
+    public void validateMaterializedCreateTable(SqlCreateMaterializedView sqlCreateTable) {
+        // Validate all fields
+        List<RelDataType> relDataTypes = new ArrayList<>();
+        List<String> fieldList = new ArrayList<>();
+        if (sqlCreateTable.columnList == null || sqlCreateTable.columnList.size() == 0) {
+            SqlNode sqlNode = sqlCreateTable.query;
+            final RelDataType type = getValidatedNodeType(sqlNode);
+            setValidatedNodeType(sqlCreateTable, type);
+        } else {
+            throw new NotSupportException();
+        }
+    }
+
     public void validateGsiColumn(List<Pair<SqlIdentifier, SqlIndexDefinition>> globalKeys) {
         if (null == globalKeys) {
             return;
@@ -5158,6 +5603,36 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             final SqlIndexDefinition indexDef = pair.getValue();
 
             checkDuplicatedIndexColumn(indexName, indexDef);
+        }
+    }
+
+    public static void validateUnsupportedColumTypeWithCci(MySqlCreateTableStatement stmt, List<String> primaryKeys,
+                                                           List<String> sortKeys, List<String> shardingKeys) {
+        final String[] deniedTypes = {
+            "float", "double", "decimal", "numeric", "json", "enum", "set", "point", "geometry"};
+
+        final Iterator<SQLTableElement> it = stmt.getTableElementList().iterator();
+        while (it.hasNext()) {
+            final SQLTableElement sqlTableElement = it.next();
+            if (sqlTableElement instanceof SQLColumnDefinition) {
+                final SQLColumnDefinition columnDef = (SQLColumnDefinition) sqlTableElement;
+                String columnType = columnDef.getDataType().getName().toLowerCase();
+                for (String deniedType : deniedTypes) {
+                    if (columnType.equals(deniedType)) {
+                        String columnName = SQLUtils.normalizeNoTrim(columnDef.getName().getSimpleName());
+                        if (sortKeys.contains(columnName)) {
+                            throw new TddlRuntimeException(ErrorCode.ERR_UNSUPPORTED_COLUMN_TYPE_WITH_CCI,
+                                "Sort Key '" + columnName + "'", columnType);
+                        } else if (shardingKeys.contains(columnName)) {
+                            throw new TddlRuntimeException(ErrorCode.ERR_UNSUPPORTED_COLUMN_TYPE_WITH_CCI,
+                                "Sharding Key '" + columnName + "'", columnType);
+                        } else if (primaryKeys.contains(columnName)) {
+                            throw new TddlRuntimeException(ErrorCode.ERR_UNSUPPORTED_COLUMN_TYPE_WITH_CCI,
+                                "Primary Key '" + columnName + "'", columnType);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -5198,8 +5673,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         }
     }
 
-    @Override
-    public void validateGsiName(Set<String> gsiNames, SqlIdentifier currentGsiName) {
+    public void validateGsiName(Set<String> gsiNames, SqlIdentifier currentGsiName, boolean isColumnar) {
         final String gsiName = currentGsiName.getLastName();
 
         SqlValidatorTable table = null;
@@ -5213,10 +5687,24 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         }
 
         if (null != table) {
-            throw newValidationError(currentGsiName, RESOURCE.gsiExists(gsiName));
+            if (isColumnar) {
+                throw newValidationError(currentGsiName, RESOURCE.cciExists(gsiName));
+            } else {
+                throw newValidationError(currentGsiName, RESOURCE.gsiExists(gsiName));
+            }
         }
 
         gsiNames.add(gsiName);
+    }
+
+    @Override
+    public void validateGsiName(Set<String> gsiNames, SqlIndexDefinition indexDefinition) {
+        validateGsiName(gsiNames, indexDefinition.getIndexName(), indexDefinition.isColumnar());
+    }
+
+    @Override
+    public void validateGsiName(Set<String> gsiNames, SqlCreateIndex createIndex) {
+        validateGsiName(gsiNames, createIndex.getIndexName(), createIndex.createCci());
     }
 
     public void validateIndexName(List<Pair<SqlIdentifier, SqlIndexDefinition>> keys, Set<String> gsiNames) {
@@ -5739,7 +6227,7 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             SqlNode window1 = windows.get(i);
             for (int j = i + 1; j < windows.size(); j++) {
                 SqlNode window2 = windows.get(j);
-                if (window1.equalsDeep(window2, Litmus.IGNORE)) {
+                if (window1.equalsDeep(window2, Litmus.IGNORE, EqualsContext.DEFAULT_EQUALS_CONTEXT)) {
                     throw newValidationError(window2, RESOURCE.dupWindowSpec());
                 }
             }
@@ -5766,9 +6254,37 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         validateNamespace(namespace, unknownType);
     }
 
-    public void validateWithItem(SqlWithItem withItem) {
+    public void validateWithItem(SqlWithItem withItem, boolean isRecursive) {
+        RelDataType rowType = null;
+        // recursive cte must build row_type with its anchor part query
+        if (isRecursive) {
+
+            // try to find the anchor part
+            SqlNode anchor = null;
+            if (withItem.query.getKind() == UNION) {
+                anchor = ((SqlCall) withItem.query).operand(0);
+            } else if (withItem.query instanceof SqlSelect) {
+                anchor = tryFindAnchorPart((SqlSelect) withItem.query);
+            }
+
+            if (anchor != null) {
+                // recursive cte with union should build rowtype with its first operand, which had not refer itself.
+                rowType = getValidatedNodeType(anchor);
+                SqlValidatorNamespace sns = getNamespace(withItem);
+                sns.validate(rowType);
+            }
+        }
         if (withItem.columnList != null) {
-            final RelDataType rowType = getValidatedNodeType(withItem.query);
+            if (rowType == null) {
+                try {
+                    rowType = getValidatedNodeType(withItem.query);
+                } catch (AssertionError cddt) {
+                    if (cddt.getMessage().contains("Cycle detected during type-checking")) {
+                        throw newValidationError(withItem.query,
+                            RESOURCE.validatorUnknownRecursiveCTE(withItem.name.getLastName()));
+                    }
+                }
+            }
             final int fieldCount = rowType.getFieldCount();
             if (withItem.columnList.size() != fieldCount) {
                 throw newValidationError(withItem.columnList,
@@ -5778,14 +6294,54 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 withItem.columnList.getList(), validationErrorFunction);
         } else {
             // Luckily, field names have not been make unique yet.
-            final List<String> fieldNames =
-                getValidatedNodeType(withItem.query).getFieldNames();
+            final List<String> fieldNames;
+            if (rowType != null) {
+                fieldNames = rowType.getFieldNames();
+            } else {
+                try {
+                    fieldNames = getValidatedNodeType(withItem.query).getFieldNames();
+                } catch (AssertionError cddt) {
+                    if (cddt.getMessage().contains("Cycle detected during type-checking")) {
+                        throw newValidationError(withItem.query,
+                            RESOURCE.validatorUnknownRecursiveCTE(withItem.name.getLastName()));
+                    } else {
+                        throw cddt;
+                    }
+                }
+            }
             final int i = Util.firstDuplicate(fieldNames);
             if (i >= 0) {
                 throw newValidationError(withItem.query,
                     RESOURCE.duplicateColumnAndNoColumnList(fieldNames.get(i)));
             }
         }
+    }
+
+    public SqlNode tryFindAnchorPart(SqlSelect query) {
+        // SqlSelect only allowed contained select * and limit phrase
+        SqlNodeList order = ((SqlSelect) query).getOrderList();
+        if (order != null && !order.getList().isEmpty()) {
+            throw newValidationError(query,
+                RESOURCE.validatorRecursiveCTENotSupport("order by"));
+        }
+        SqlNodeList selectList = ((SqlSelect) query).getSelectList();
+        List list = selectList.getList();
+        if (list != null && !list.isEmpty()) {
+            if (list.size() != 1 ||
+                !(list.get(0) instanceof SqlIdentifier) ||
+                !((SqlIdentifier) list.get(0)).isStar()) {
+                throw newValidationError(query,
+                    RESOURCE.validatorRecursiveCTENotSupport(list.toString()));
+            }
+        }
+
+        SqlNode from = query.getFrom();
+        if (from == null || !(from.getKind() == UNION)) {
+            throw newValidationError(query,
+                RESOURCE.validatorRecursiveCTENotSupport(from == null ? null : from.toString()));
+        }
+        // from must be union call here
+        return ((SqlBasicCall) from).getOperands()[0];
     }
 
     public void validateSequenceValue(SqlValidatorScope scope, SqlIdentifier id) {
@@ -6324,6 +6880,17 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
             ? targetNamespace.getTable()
             : relOptTable.unwrap(SqlValidatorTable.class);
 
+        // Throw exception if any target table is a dummy table or a view
+        if (!checkTargetTableUpdatable(relOptTable)) {
+            final List<String> qualifiedName = table.getQualifiedName();
+            final String targetTableName =
+                qualifiedName.size() == 2 ? String.format("%s.%s", qualifiedName.get(0), Util.last(qualifiedName)) :
+                    Util.last(qualifiedName);
+
+            throw newValidationError(insert.getTargetTable(),
+                RESOURCE.targetNotUpdatable(targetTableName, insert.getKind().name()));
+        }
+
         // INSERT has an optional column name list.  If present then
         // reduce the rowtype to the columns specified.  If not present
         // then the entire target rowtype is used.
@@ -6371,6 +6938,13 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                     insert.getUpdateColumnList(),
                     false, null);
             validateSelect(insert.getUpdateSelect(), updateRowType);
+
+            // TODO(qianjing): check here
+            for (int i = 0; i < insert.getUpdateSelect().getSelectList().size(); i++) {
+                SqlNode selectItem = insert.getUpdateSelect().getSelectList().get(i);
+                SqlNode sqlNode = ((SqlBasicCall) selectItem).getOperands()[0];
+                insert.getUpdateList().getList().set(i, sqlNode);
+            }
         }
     }
 
@@ -6816,6 +7390,17 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 ? targetNamespace.getTable()
                 : relOptTable.unwrap(SqlValidatorTable.class);
 
+            // Throw exception if any target table is a dummy table or a view
+            if (!checkTargetTableUpdatable(relOptTable)) {
+                final List<String> qualifiedName = table.getQualifiedName();
+                final String targetTableName =
+                    qualifiedName.size() == 2 ? String.format("%s.%s", qualifiedName.get(0), Util.last(qualifiedName)) :
+                        Util.last(qualifiedName);
+
+                throw newValidationError(call.getTargetTable(),
+                    RESOURCE.targetNotUpdatable(targetTableName, call.getKind().name()));
+            }
+
             String alias = call.getAlias() == null ? null : call.getAlias().getSimple();
 
             final RelDataType targetRowType =
@@ -7113,6 +7698,14 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
                 throw newValidationError(node, RESOURCE.columnNotNullable(pair.right.getName()));
             }
         }
+    }
+
+    protected boolean checkTargetTableUpdatable(RelOptTable table) {
+        return true;
+    }
+
+    protected static long getRowStoreDefaultPartitions() {
+        return DynamicConfig.getInstance().getAutoPartitionPartitions(false);
     }
 
     protected SqlNode getTop() {
@@ -7792,6 +8385,23 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         }
     }
 
+    /**
+     * Namespace for a Drop statement.
+     */
+    private static class DropMateriedViewNamespace extends DdlNamespace {
+        private final SqlDropMaterializedView node;
+
+        DropMateriedViewNamespace(SqlValidatorImpl validator, SqlDropMaterializedView node,
+                                  SqlNode enclosingNode, SqlValidatorScope parentScope) {
+            super(validator, node.getTargetTable(), enclosingNode, parentScope);
+            this.node = Preconditions.checkNotNull(node);
+        }
+
+        public SqlDropMaterializedView getNode() {
+            return node;
+        }
+    }
+
     private static class DropViewNamespace extends DdlNamespace {
         private final SqlDropView node;
 
@@ -7892,6 +8502,138 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
         private final SqlValidatorScope scope;
 
         CreateDatabaseNamespace(SqlValidatorImpl validator, SqlDdl node,
+                                SqlNode enclosingNode, SqlValidatorScope scope) {
+            super(validator, enclosingNode);
+            this.current = Preconditions.checkNotNull(node);
+            this.scope = scope;
+        }
+
+        @Override
+        public SqlNode getNode() {
+            return current;
+        }
+
+        @Override
+        protected RelDataType validateImpl(RelDataType targetRowType) {
+            return current.getOperator().deriveType(this.validator, this.scope, this.current);
+        }
+    }
+
+    private static class CreateJavaFunctionNamespace extends AbstractNamespace {
+        private final SqlCall current;
+        private final SqlValidatorScope scope;
+
+        CreateJavaFunctionNamespace(SqlValidatorImpl validator, SqlDdl node,
+                                    SqlNode enclosingNode, SqlValidatorScope scope) {
+            super(validator, enclosingNode);
+            this.current = Preconditions.checkNotNull(node);
+            this.scope = scope;
+        }
+
+        @Override
+        public SqlNode getNode() {
+            return current;
+        }
+
+        @Override
+        protected RelDataType validateImpl(RelDataType targetRowType) {
+            return current.getOperator().deriveType(this.validator, this.scope, this.current);
+        }
+    }
+
+    private static class DropJavaFunctionNamespace extends AbstractNamespace {
+        private final SqlCall current;
+        private final SqlValidatorScope scope;
+
+        DropJavaFunctionNamespace(SqlValidatorImpl validator, SqlDdl node,
+                                  SqlNode enclosingNode, SqlValidatorScope scope) {
+            super(validator, enclosingNode);
+            this.current = Preconditions.checkNotNull(node);
+            this.scope = scope;
+        }
+
+        @Override
+        public SqlNode getNode() {
+            return current;
+        }
+
+        @Override
+        protected RelDataType validateImpl(RelDataType targetRowType) {
+            return current.getOperator().deriveType(this.validator, this.scope, this.current);
+        }
+    }
+
+    private static class AlterDatabaseNamespace extends AbstractNamespace {
+        private final SqlCall current;
+        private final SqlValidatorScope scope;
+
+        AlterDatabaseNamespace(SqlValidatorImpl validator, SqlDdl node,
+                               SqlNode enclosingNode, SqlValidatorScope scope) {
+            super(validator, enclosingNode);
+            this.current = Preconditions.checkNotNull(node);
+            this.scope = scope;
+        }
+
+        @Override
+        public SqlNode getNode() {
+            return current;
+        }
+
+        @Override
+        protected RelDataType validateImpl(RelDataType targetRowType) {
+            return current.getOperator().deriveType(this.validator, this.scope, this.current);
+        }
+    }
+
+    private static class AlterInstanceNamespace extends AbstractNamespace {
+        private final SqlCall current;
+        private final SqlValidatorScope scope;
+
+        AlterInstanceNamespace(SqlValidatorImpl validator, SqlDdl node,
+                               SqlNode enclosingNode, SqlValidatorScope scope) {
+            super(validator, enclosingNode);
+            this.current = Preconditions.checkNotNull(node);
+            this.scope = scope;
+        }
+
+        @Override
+        public SqlNode getNode() {
+            return current;
+        }
+
+        @Override
+        protected RelDataType validateImpl(RelDataType targetRowType) {
+            return current.getOperator().deriveType(this.validator, this.scope, this.current);
+        }
+    }
+
+    private static class ImportDatabaseNamespace extends AbstractNamespace {
+        private final SqlCall current;
+        private final SqlValidatorScope scope;
+
+        ImportDatabaseNamespace(SqlValidatorImpl validator, SqlDdl node,
+                                SqlNode enclosingNode, SqlValidatorScope scope) {
+            super(validator, enclosingNode);
+            this.current = Preconditions.checkNotNull(node);
+            this.scope = scope;
+        }
+
+        @Override
+        public SqlNode getNode() {
+            return current;
+        }
+
+        @Override
+        protected RelDataType validateImpl(RelDataType targetRowType) {
+            return current.getOperator().deriveType(this.validator, this.scope, this.current);
+        }
+    }
+
+    private static class ImportSequenceNamespace extends AbstractNamespace {
+        private final SqlCall current;
+        private final SqlValidatorScope scope;
+
+        ImportSequenceNamespace(SqlValidatorImpl validator, SqlDdl node,
                                 SqlNode enclosingNode, SqlValidatorScope scope) {
             super(validator, enclosingNode);
             this.current = Preconditions.checkNotNull(node);
@@ -8494,6 +9236,17 @@ public class SqlValidatorImpl implements SqlValidatorWithHints {
 
                         return new SqlBasicCall(SqlStdOperatorTable.CHECK_SUM, expandedSelectList, SqlParserPos.ZERO);
                     }
+                }
+            }
+
+            if (call.isCheckSumV2Star()) {
+                SqlValidatorScope scope = getScope();
+                if (scope instanceof SelectScope) {
+                    SqlValidator validator = scope.getValidator();
+                    SqlNode[] expandedSelectList =
+                        validator.expandStarForCheckSumV2(call.operand(0), ((SelectScope) scope).getNode());
+
+                    return new SqlBasicCall(SqlStdOperatorTable.CHECK_SUM_V2, expandedSelectList, SqlParserPos.ZERO);
                 }
             }
 

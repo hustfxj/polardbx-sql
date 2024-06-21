@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.executor.gsi.backfill;
 
+import com.alibaba.polardbx.executor.backfill.Extractor;
 import com.alibaba.polardbx.executor.backfill.Loader;
 import com.alibaba.polardbx.executor.cursor.Cursor;
 import com.alibaba.polardbx.executor.gsi.InsertIndexExecutor;
@@ -42,9 +43,12 @@ import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
+
+import static com.alibaba.polardbx.common.TddlConstants.IMPLICIT_COL_NAME;
 
 /**
  * Fill batch data into index table with duplication check
@@ -72,6 +76,8 @@ public class GsiLoader extends Loader {
         final SqlNodeList targetColumnList = new SqlNodeList(
             indexTableMeta.getAllColumns()
                 .stream()
+                .filter(columnMeta -> (!columnMeta.isGeneratedColumn() && !(columnMeta.getMappingName() != null
+                    && columnMeta.getMappingName().isEmpty())))
                 .map(columnMeta -> new SqlIdentifier(columnMeta.getName(), SqlParserPos.ZERO))
                 .collect(Collectors.toList()),
             SqlParserPos.ZERO);
@@ -114,10 +120,14 @@ public class GsiLoader extends Loader {
         final TddlRuleManager tddlRuleManager = optimizerContext.getRuleManager();
         final Set<String> filterColumns = Sets.newTreeSet(String::compareToIgnoreCase);
         final Set<String> primaryKeys = Sets.newTreeSet(String::compareToIgnoreCase);
-        primaryKeys.addAll(GlobalIndexMeta.getPrimaryKeys(primaryTableMeta));
+        primaryKeys.addAll(Extractor.getPrimaryKeys(primaryTableMeta, ec));
         filterColumns.addAll(primaryKeys);
         filterColumns.addAll(tddlRuleManager.getSharedColumns(primaryTable));
         filterColumns.addAll(tddlRuleManager.getSharedColumns(indexTable));
+
+        if (filterColumns.contains(IMPLICIT_COL_NAME) && indexTableMeta.getColumn(IMPLICIT_COL_NAME) == null) {
+            filterColumns.remove(IMPLICIT_COL_NAME);
+        }
 
         final List<String> filterList = ImmutableList.copyOf(filterColumns);
 

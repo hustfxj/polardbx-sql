@@ -17,6 +17,7 @@
 package com.alibaba.polardbx.executor.ddl.job.factory;
 
 import com.alibaba.polardbx.common.properties.ConnectionParams;
+import com.alibaba.polardbx.common.utils.CaseInsensitive;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.executor.ddl.job.builder.tablegroup.AlterTableModifyPartitionBuilder;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.PauseCurrentJobTask;
@@ -39,9 +40,10 @@ import com.alibaba.polardbx.optimizer.core.rel.PhyDdlTableOperation;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.AlterTableGroupItemPreparedData;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.AlterTableGroupModifyPartitionPreparedData;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.AlterTableModifyPartitionPreparedData;
+import com.alibaba.polardbx.optimizer.locality.LocalityInfoUtils;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
-import com.alibaba.polardbx.optimizer.partition.PartitionLocation;
 import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionLocation;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import org.apache.calcite.rel.core.DDL;
@@ -54,6 +56,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 /**
@@ -69,7 +72,7 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
                                                Map<String, Map<String, List<List<String>>>> tablesTopologyMap,
                                                Map<String, Map<String, Set<String>>> targetTablesTopology,
                                                Map<String, Map<String, Set<String>>> sourceTablesTopology,
-                                               Map<String, List<Pair<String, String>>> orderedTargetTablesLocations,
+                                               Map<String, Map<String, Pair<String, String>>> orderedTargetTablesLocations,
                                                ExecutionContext executionContext) {
         super(ddl, preparedData, tablesPrepareData, newPartitionsPhysicalPlansMap, tablesTopologyMap,
             targetTablesTopology, sourceTablesTopology, orderedTargetTablesLocations,
@@ -78,7 +81,6 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
 
     @Override
     protected void validate() {
-
     }
 
     @Override
@@ -89,6 +91,8 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
             return modifyAndMoveToExistTableGroup();
         } else if (preparedData.isCreateNewTableGroup()) {
             return modifyInNewTableGroup();
+        } else if (StringUtils.isNotEmpty(preparedData.getTargetImplicitTableGroupName())) {
+            return withImplicitTableGroup(executionContext);
         } else {
             throw new RuntimeException("unexpected");
         }
@@ -105,7 +109,7 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
 
         DdlTask validateTask =
             new AlterTableGroupValidateTask(schemaName, alterTableGroupModifyPartitionPreparedData.getTableGroupName(),
-                tablesVersion, true, alterTableGroupModifyPartitionPreparedData.getTargetPhysicalGroups());
+                tablesVersion, true, alterTableGroupModifyPartitionPreparedData.getTargetPhysicalGroups(), false);
         TableGroupConfig tableGroupConfig = OptimizerContext.getContext(schemaName).getTableGroupInfoManager()
             .getTableGroupConfigByName(alterTableGroupModifyPartitionPreparedData.getTableGroupName());
 
@@ -121,6 +125,7 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
                 }
             }
         }
+
         List<String> targetDbList = new ArrayList<>();
         int targetDbCnt = alterTableGroupModifyPartitionPreparedData.getTargetGroupDetailInfoExRecords().size();
         List<String> newPartitions = new ArrayList<>();
@@ -129,9 +134,12 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
                 .get(i % targetDbCnt).phyDbName);
             newPartitions.add(alterTableGroupModifyPartitionPreparedData.getNewPartitionNames().get(i));
         }
+
+        Set<String> outdatedPartitionNameSet = new TreeSet<>(CaseInsensitive.CASE_INSENSITIVE_ORDER);
+        outdatedPartitionNameSet.addAll(outdatedPartitionNames);
         List<LocalityDesc> oldPartitionLocalities = tableGroupConfig.getPartitionGroupRecords().stream()
             .filter(o -> outdatedPartitionNames.contains(o.partition_name)).
-            map(o -> LocalityDesc.parse(o.getLocality())).collect(Collectors.toList());
+            map(o -> LocalityInfoUtils.parse(o.getLocality())).collect(Collectors.toList());
         List<String> localties = Collections.nCopies(newPartitions.size(), oldPartitionLocalities.get(0).toString());
         DdlTask addMetaTask = new AlterTableGroupAddMetaTask(schemaName,
             tableGroupName,
@@ -156,7 +164,9 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
         if (((AlterTableGroupModifyPartitionPreparedData) preparedData).isDropVal()) {
             AlterTableGroupRemoveTempPartitionTask alterTableGroupRemoveTempPartitionTask =
                 new AlterTableGroupRemoveTempPartitionTask(schemaName,
-                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).getTempPartition(),
+                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).getTempPartitionNames(),
+                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).getParentPartitionNames(),
+                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).needRemoveTempParentPart(),
                     tableGroupConfig.getTableGroupRecord().getId());
             bringUpAlterTableGroupTasks.add(0, alterTableGroupRemoveTempPartitionTask);
         }
@@ -198,11 +208,11 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
         DdlTask validateSourceTableGroup =
             new AlterTableGroupValidateTask(schemaName,
                 sourceTableGroup, tablesVersion, false,
-                /*todo*/null);
+                /*todo*/null, false);
         DdlTask validateTargetTableGroup =
             new AlterTableGroupValidateTask(schemaName,
                 targetTableGroup, preparedData.getFirstTableVersionInTargetTableGroup(), false,
-                preparedData.getTargetPhysicalGroups());
+                preparedData.getTargetPhysicalGroups(), false);
 
         executableDdlJob.addTask(emptyTask);
         executableDdlJob.addTask(validateSourceTableGroup);
@@ -212,9 +222,9 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
 
         Set<Long> outdatedPartitionGroupId = new HashSet<>();
 
-        for (String splitPartitionName : preparedData.getOldPartitionNames()) {
+        for (String oldPartName : preparedData.getOldPartitionNames()) {
             for (PartitionGroupRecord record : tableGroupConfig.getPartitionGroupRecords()) {
-                if (record.partition_name.equalsIgnoreCase(splitPartitionName)) {
+                if (record.partition_name.equalsIgnoreCase(oldPartName)) {
                     outdatedPartitionGroupId.add(record.id);
                     break;
                 }
@@ -245,7 +255,9 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
         if (preparedData.isDropVal()) {
             AlterTableGroupRemoveTempPartitionTask alterTableGroupRemoveTempPartitionTask =
                 new AlterTableGroupRemoveTempPartitionTask(schemaName,
-                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).getTempPartition(),
+                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).getTempPartitionNames(),
+                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).getParentPartitionNames(),
+                    ((AlterTableGroupModifyPartitionPreparedData) preparedData).needRemoveTempParentPart(),
                     tableGroupConfig.getTableGroupRecord().getId());
             bringUpAlterTableGroupTasks.add(0, alterTableGroupRemoveTempPartitionTask);
         }
@@ -278,11 +290,10 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
         DdlTask validateTask =
             new AlterTableGroupValidateTask(schemaName,
                 preparedData.getTableGroupName(), tablesVersion, false,
-                preparedData.getTargetPhysicalGroups());
+                preparedData.getTargetPhysicalGroups(), false);
 
         SubJobTask subJobMoveTableToNewGroup =
-            new SubJobTask(schemaName, String.format("alter table %s set tablegroup=''", preparedData.getTableName()),
-                null);
+            new SubJobTask(schemaName, String.format(SET_NEW_TABLE_GROUP, preparedData.getTableName()), null);
         SubJobTask subJobModifyTable = new SubJobTask(schemaName, preparedData.getSourceSql(), null);
         subJobMoveTableToNewGroup.setParentAcquireResource(true);
         subJobModifyTable.setParentAcquireResource(true);
@@ -309,7 +320,7 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
             alterTableModifyPartitionBuilder.getTablesPreparedData();
         Map<String, List<PhyDdlTableOperation>> newPartitionsPhysicalPlansMap =
             alterTableModifyPartitionBuilder.getNewPartitionsPhysicalPlansMap();
-        Map<String, List<Pair<String, String>>> orderedTargetTablesLocations =
+        Map<String, Map<String, Pair<String, String>>> orderedTargetTablesLocations =
             alterTableModifyPartitionBuilder.getOrderedTargetTablesLocations();
         return new AlterTableModifyPartitionJobFactory(ddl, preparedData, tableGroupItemPreparedDataMap,
             newPartitionsPhysicalPlansMap, tablesTopologyMap, targetTablesTopology, sourceTablesTopology,
@@ -350,7 +361,7 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
             DdlTask dropUselessTableTask = ComplexTaskFactory
                 .CreateDropUselessPhyTableTask(schemaName, preparedData.getTableName(),
                     getTheDeletedPartitionsLocation(preparedData.getSchemaName(), preparedData.getTableName(),
-                        subTaskJobFactory.getTempPartitionInfo()), executionContext);
+                        subTaskJobFactory.getTempPartitionSpecs()), executionContext);
             executableDdlJob.addTask(dropUselessTableTask);
             executableDdlJob.addTask(dropUselessTableTask);
             executableDdlJob.labelAsTail(dropUselessTableTask);
@@ -362,7 +373,7 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
     }
 
     public Map<String, Set<String>> getTheDeletedPartitionsLocation(String schemaName, String tableName,
-                                                                    PartitionSpec tempPartitionSpec) {
+                                                                    List<PartitionSpec> tempPartitionSpecs) {
         Map<String, Set<String>> deletedPhyTables = new HashMap<>();
         PartitionInfo partitionInfo =
             OptimizerContext.getContext(schemaName).getPartitionInfoManager()
@@ -371,7 +382,7 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
         List<String> outdatedPartitionNames = new ArrayList();
         outdatedPartitionNames.addAll(preparedData.getNewPartitionNames());
         for (String oldPartitionName : outdatedPartitionNames) {
-            for (PartitionSpec partitionSpec : partitionInfo.getPartitionBy().getPartitions()) {
+            for (PartitionSpec partitionSpec : partitionInfo.getPartitionBy().getPhysicalPartitions()) {
                 if (partitionSpec.getName().equalsIgnoreCase(oldPartitionName)) {
                     PartitionLocation location = partitionSpec.getLocation();
                     deletedPhyTables.computeIfAbsent(location.getGroupKey(), o -> new HashSet<>())
@@ -383,10 +394,13 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
         }
         assert num == preparedData.getNewPartitionNames().size();
 
-        if (((AlterTableGroupModifyPartitionPreparedData) preparedData).isDropVal() && tempPartitionSpec != null) {
-            PartitionLocation location = tempPartitionSpec.getLocation();
-            deletedPhyTables.computeIfAbsent(location.getGroupKey(), o -> new HashSet<>())
-                .add(location.getPhyTableName());
+        if (((AlterTableGroupModifyPartitionPreparedData) preparedData).isDropVal() && !tempPartitionSpecs.isEmpty()) {
+            for (int i = 0; i < tempPartitionSpecs.size(); i++) {
+                PartitionSpec tempPartitionSpec = tempPartitionSpecs.get(i);
+                PartitionLocation location = tempPartitionSpec.getLocation();
+                deletedPhyTables.computeIfAbsent(location.getGroupKey(), o -> new HashSet<>())
+                    .add(location.getPhyTableName());
+            }
         }
         return deletedPhyTables;
     }
@@ -403,9 +417,13 @@ public class AlterTableModifyPartitionJobFactory extends AlterTableGroupBaseJobF
         if (preparedData.isDropVal()) {
             CdcTableGroupDdlMarkTask cdcTableGroupDdlMarkTask =
                 (CdcTableGroupDdlMarkTask) subTaskJobFactory.getCdcTableGroupDdlMarkTask();
-            PartitionSpec tempPartitionInfo = subTaskJobFactory.getTempPartitionInfo();
-            Map<String, Set<String>> topology = cdcTableGroupDdlMarkTask.getTargetTableTopology();
-            topology.forEach((k, v) -> v.remove(tempPartitionInfo.getLocation().getPhyTableName()));
+
+            List<PartitionSpec> tempPartSpecs = subTaskJobFactory.getTempPartitionSpecs();
+            for (int i = 0; i < tempPartSpecs.size(); i++) {
+                PartitionSpec tempPartitionInfo = tempPartSpecs.get(i);
+                Map<String, Set<String>> topology = cdcTableGroupDdlMarkTask.getTargetTableTopology();
+                topology.forEach((k, v) -> v.remove(tempPartitionInfo.getLocation().getPhyTableName()));
+            }
         }
     }
 }

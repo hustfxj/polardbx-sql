@@ -16,40 +16,50 @@
 
 package com.alibaba.polardbx.optimizer.config.table;
 
-import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
-import com.alibaba.polardbx.optimizer.partition.LocalPartitionDefinitionInfo;
-import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticResult;
-import com.alibaba.polardbx.gms.metadb.table.ColumnStatus;
-import com.alibaba.polardbx.optimizer.tablegroup.TableGroupVersionManager;
-import com.alibaba.polardbx.optimizer.utils.SchemaVersionManager;
-import com.google.common.collect.ImmutableList;
 import com.alibaba.polardbx.common.Engine;
 import com.alibaba.polardbx.common.TddlConstants;
+import com.alibaba.polardbx.common.ddl.foreignkey.ForeignKeyData;
 import com.alibaba.polardbx.common.utils.CaseInsensitive;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.TStringUtil;
+import com.alibaba.polardbx.common.utils.version.InstanceVersion;
 import com.alibaba.polardbx.config.ConfigDataMode;
+import com.alibaba.polardbx.druid.sql.ast.SQLExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLExprUtils;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.parser.MySqlExprParser;
+import com.alibaba.polardbx.gms.metadb.table.ColumnStatus;
 import com.alibaba.polardbx.gms.metadb.table.TableStatus;
 import com.alibaba.polardbx.gms.metadb.table.TablesRecord;
 import com.alibaba.polardbx.gms.partition.TablePartitionRecord;
 import com.alibaba.polardbx.gms.tablegroup.ComplexTaskOutlineRecord;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
+import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.config.schema.MetaDbSchema;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager.GsiIndexMetaBean;
+import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
+import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticResult;
+import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.TddlOperatorTable;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
-import com.alibaba.polardbx.optimizer.partition.LocalPartitionDefinitionInfo;
+import com.alibaba.polardbx.optimizer.core.planner.SqlConverter;
+import com.alibaba.polardbx.optimizer.parse.visitor.FastSqlToCalciteNodeVisitor;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
+import com.alibaba.polardbx.optimizer.partition.common.LocalPartitionDefinitionInfo;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
 import com.alibaba.polardbx.optimizer.sql.sql2rel.TddlSqlToRelConverter;
+import com.alibaba.polardbx.optimizer.tablegroup.TableGroupVersionManager;
 import com.alibaba.polardbx.optimizer.utils.CalciteUtils;
+import com.alibaba.polardbx.optimizer.utils.SchemaVersionManager;
+import com.alibaba.polardbx.rule.TableRule;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.taobao.tddl.common.utils.TddlToStringStyle;
 import org.apache.calcite.config.CalciteConnectionConfig;
+import org.apache.calcite.plan.Context;
+import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -62,19 +72,25 @@ import org.apache.calcite.schema.Statistic;
 import org.apache.calcite.schema.Statistics;
 import org.apache.calcite.schema.Table;
 import org.apache.calcite.schema.Wrapper;
+import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql2rel.InitializerContext;
 import org.apache.calcite.sql2rel.InitializerExpressionFactory;
 import org.apache.calcite.sql2rel.NullInitializerExpressionFactory;
 import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.NlsString;
+import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.builder.ToStringBuilder;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.Serializable;
 import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -82,7 +98,9 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * 一个table的描述，包含主键信息/字段信息/索引信息等，暂时不考虑外键/约束键，目前没意义
@@ -132,6 +150,16 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
     private final Map<String, IndexMeta> secondaryIndexes =
         new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
+    /**
+     * Foreign key.
+     */
+    private final Map<String, ForeignKeyData> foreignKeys = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    /**
+     * Referenced foreign key.
+     * <constrained schema/table/index name, ForeignKeyData>
+     */
+    private final Map<String, ForeignKeyData> referencedForeignKeys = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+
     private final Map<String, ColumnMeta> primaryKeys =
         new TreeMap<>(CaseInsensitive.CASE_INSENSITIVE_ORDER);
     private final Map<String, ColumnMeta> columns =
@@ -140,6 +168,15 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         new TreeMap<>(CaseInsensitive.CASE_INSENSITIVE_ORDER);
     private final List<ColumnMeta> allColumnsOrderByDefined = new ArrayList<>();
 
+    // cache
+    private volatile List<ColumnMeta> readColumnsCache = null;
+    private volatile List<ColumnMeta> writeColumnsCache = null;
+    private Boolean hasLogicalGeneratedColumnCache = null;
+    private Boolean hasDefaultExprColumnCache = null;
+    private Boolean hasGeneratedColumnCache = null;
+    private Boolean withGsi = null;
+    private Boolean withCci = null;
+
     private boolean hasPrimaryKey = true;
 
     private TableColumnMeta tableColumnMeta = null;
@@ -147,6 +184,8 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
     private List<ColumnMeta> autoUpdateColumns = null;
     private GsiMetaManager.GsiTableMetaBean gsiTableMetaBean = null;
     private Map<String, GsiIndexMetaBean> gsiPublished = null;
+    private Map<String, GsiIndexMetaBean> columnarIndexPublished = null;
+    private Map<String, GsiIndexMetaBean> columnarIndexChecking = null;
 
     private ComplexTaskOutlineRecord complexTaskOutlineRecord = null;
     private ComplexTaskMetaManager.ComplexTaskTableMetaBean complexTaskTableMetaBean = null;
@@ -165,7 +204,16 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
     private Map<String, Map<String, List<FileMeta>>> fileMetaSet = null;
     private Map<String, List<FileMeta>> flatFileMetas = null;
 
+    // for columnar column mapping
+    private List<Long> columnarFieldIdList = null;
+
     private volatile LocalPartitionDefinitionInfo localPartitionDefinitionInfo;
+
+    private volatile TableFilesMeta tableFilesMeta = null;
+
+    private String defaultCharset;
+
+    private String defaultCollation;
 
     public TableMeta(String schemaName, String tableName, List<ColumnMeta> allColumnsOrderByDefined,
                      IndexMeta primaryIndex,
@@ -196,6 +244,10 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         this.version = version;
         this.flag = flag;
         this.digest = tableName + "#version:" + version;
+    }
+
+    public void buildFileStoreMeta(Map<String, String> columnMapping, Map<String, ColumnMeta> columnMetaMap) {
+        this.tableFilesMeta = new TableFilesMeta(columnMapping, columnMetaMap);
     }
 
     public Engine getEngine() {
@@ -230,6 +282,10 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return (flag & TablesRecord.FLAG_LOGICAL_COLUMN_ORDER) != 0L;
     }
 
+    public boolean rebuildingTable() {
+        return (flag & TablesRecord.FLAG_REBUILDING_TABLE) != 0L;
+    }
+
     public String getSchemaName() {
         return schemaName;
     }
@@ -244,6 +300,14 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
             return null;
         }
         return primaryIndexes.isEmpty() ? null : primaryIndexes.values().iterator().next();
+    }
+
+    public String getDefaultCharset() {
+        return defaultCharset;
+    }
+
+    public void setDefaultCharset(String defaultCharset) {
+        this.defaultCharset = defaultCharset;
     }
 
     private boolean indexContainsMultiWriteTargetColumn(IndexMeta indexMeta, ColumnMeta multiWriteTargetColumnMeta) {
@@ -289,6 +353,14 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return result;
     }
 
+    public Map<String, ForeignKeyData> getForeignKeys() {
+        return foreignKeys;
+    }
+
+    public Map<String, ForeignKeyData> getReferencedForeignKeys() {
+        return referencedForeignKeys;
+    }
+
     public Collection<ColumnMeta> getPrimaryKey() {
         return primaryKeys.values();
     }
@@ -314,24 +386,34 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return allColumnsOrderByDefined;
     }
 
-    public List<ColumnMeta> getAllColumns() {   //兼容以前
-        return allColumnsOrderByDefined.stream().filter(column -> column.getStatus() == ColumnStatus.PUBLIC
-            || column.getStatus() == ColumnStatus.MULTI_WRITE_SOURCE).collect(Collectors.toList());
+    public List<ColumnMeta> getAllColumns() {   //兼容以前 可读的columns
+        if (readColumnsCache == null) {
+            synchronized (this) {
+                if (readColumnsCache == null) {
+                    readColumnsCache = allColumnsOrderByDefined.stream()
+                        .filter(column -> column.getStatus() == ColumnStatus.PUBLIC
+                            || column.getStatus() == ColumnStatus.MULTI_WRITE_SOURCE)
+                        .collect(Collectors.collectingAndThen(Collectors.toList(), Collections::unmodifiableList));
+                }
+            }
+        }
+        return readColumnsCache;
     }
 
     public List<ColumnMeta> getWriteColumns() {  //可写的columns
-        return allColumnsOrderByDefined.stream()
-            .filter(column -> column.getStatus() == ColumnStatus.PUBLIC
-                || column.getStatus() == ColumnStatus.MULTI_WRITE_SOURCE
-                || column.getStatus() == ColumnStatus.WRITE_ONLY || column.getStatus() == ColumnStatus.WRITE_REORG)
-            .collect(Collectors.toList());
-    }
-
-    public List<ColumnMeta> getReadColumns() {   //可读的columns
-        return allColumnsOrderByDefined.stream()
-            .filter(column -> column.getStatus() == ColumnStatus.PUBLIC
-                || column.getStatus() == ColumnStatus.MULTI_WRITE_SOURCE)
-            .collect(Collectors.toList());
+        if (writeColumnsCache == null) {
+            synchronized (this) {
+                if (writeColumnsCache == null) {
+                    writeColumnsCache = allColumnsOrderByDefined.stream()
+                        .filter(column -> column.getStatus() == ColumnStatus.PUBLIC
+                            || column.getStatus() == ColumnStatus.MULTI_WRITE_SOURCE
+                            || column.getStatus() == ColumnStatus.WRITE_ONLY
+                            || column.getStatus() == ColumnStatus.WRITE_REORG)
+                        .collect(Collectors.collectingAndThen(Collectors.toList(), Collections::unmodifiableList));
+                }
+            }
+        }
+        return writeColumnsCache;
     }
 
     public ColumnMeta getColumnMultiWriteSourceColumnMeta() {
@@ -388,6 +470,50 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return indexes;
     }
 
+    public boolean isLastShardIndex(String indexName) {
+        List<IndexMeta> allIndexes = getAllIndexes();
+        IndexMeta targetIndexMeta = getIndexMeta(indexName);
+
+        if (DbInfoManager.getInstance().isNewPartitionDb(schemaName)) {
+            List<String> partitionKeys = this.getPartitionInfo().getActualPartitionColumnsNotReorder();
+            if (!targetIndexMeta.isCoverShardKey(partitionKeys)) {
+                return false;
+            }
+            for (IndexMeta indexMeta : allIndexes) {
+                if (indexMeta.isCoverShardKey(partitionKeys) &&
+                    !StringUtils.equalsIgnoreCase(indexMeta.getPhysicalIndexName(), indexName)) {
+                    // 存在其他 local index cover 了拆分键
+                    return false;
+                }
+            }
+            return true;
+        } else {
+            TableRule tableRule = OptimizerContext.getContext(schemaName).getLatestSchemaManager().getTddlRuleManager()
+                .getTableRule(tableName);
+            List<String> dbKeys = tableRule.getDbPartitionKeys();
+            List<String> tbKeys = tableRule.getTbPartitionKeys();
+
+            boolean coverDbKeys = targetIndexMeta.isCoverShardKey(dbKeys);
+            boolean coverTbKeys = targetIndexMeta.isCoverShardKey(tbKeys);
+
+            if (!coverDbKeys && !coverTbKeys) {
+                return false;
+            }
+
+            for (IndexMeta indexMeta : allIndexes) {
+                if (coverDbKeys && indexMeta.isCoverShardKey(dbKeys)
+                    && !StringUtils.equalsIgnoreCase(indexMeta.getPhysicalIndexName(), indexName)) {
+                    return false;
+                }
+                if (coverTbKeys && indexMeta.isCoverShardKey(tbKeys)
+                    && !StringUtils.equalsIgnoreCase(indexMeta.getPhysicalIndexName(), indexName)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
     public ColumnMeta getColumn(String name) {
         if (name.contains(".")) {
             return allColumns.get(name.split("\\.")[1]); // 避免转义
@@ -407,6 +533,15 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return null;
     }
 
+    /**
+     * 判断列是否存在，建议DML中判断都用这个
+     */
+    public boolean containsColumn(String columnName) {
+        return null != getColumnIgnoreCase(columnName) || (getTableColumnMeta() != null
+            && getTableColumnMeta().isGsiModifying()
+            && getTableColumnMeta().getColumnMultiWriteMapping().containsKey(columnName.toLowerCase()));
+    }
+
     @Override
     public String toString() {
         return ToStringBuilder.reflectionToString(this, TddlToStringStyle.DEFAULT_STYLE);
@@ -418,6 +553,14 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
 
     public boolean hasGsiImplicitPrimaryKey() {
         return isGsi() && secondaryIndexes.containsKey(TddlConstants.UGSI_PK_INDEX_NAME);
+    }
+
+    public boolean hasForeignKey() {
+        return null != getForeignKeys() && !getForeignKeys().isEmpty();
+    }
+
+    public boolean hasReferencedForeignKey() {
+        return null != getReferencedForeignKeys() && !getReferencedForeignKeys().isEmpty();
     }
 
     public void setHasPrimaryKey(boolean hasPrimaryKey) {
@@ -441,14 +584,20 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return null;
     }
 
-    public double getRowCount() {
+    public double getRowCount(Context context) {
         if (MetaDbSchema.NAME.equalsIgnoreCase(schemaName)) {
             return 100;
         }
         if (ConfigDataMode.isFastMock()) {
             return 10;
         }
-        StatisticResult statisticResult = StatisticManager.getInstance().getRowCount(schemaName, tableName);
+        PlannerContext pc = context == null ? null : context.unwrap(PlannerContext.class);
+        boolean isNeedTrace = pc != null && pc.isNeedStatisticTrace();
+        StatisticResult statisticResult =
+            StatisticManager.getInstance().getRowCount(schemaName, tableName, isNeedTrace);
+        if (isNeedTrace) {
+            pc.recordStatisticTrace(statisticResult.getTrace());
+        }
         long rowCount = statisticResult.getLongValue();
         return rowCount <= 0 ? 1 : rowCount;
     }
@@ -467,6 +616,10 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return null;
     }
 
+    public RelDataType getPhysicalRowType(RelDataTypeFactory typeFactory) {
+        return CalciteUtils.switchRowType(getPhysicalColumns(), typeFactory);
+    }
+
     @Override
     public RelDataType getRowType(RelDataTypeFactory typeFactory) {
         return CalciteUtils.switchRowType(getAllColumns(), typeFactory);
@@ -474,7 +627,7 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
 
     @Override
     public Statistic getStatistic() {
-        return Statistics.of(getRowCount(), ImmutableList.<ImmutableBitSet>of());
+        return Statistics.of(getRowCount(null), ImmutableList.<ImmutableBitSet>of());
     }
 
     @Override
@@ -524,6 +677,74 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return autoUpdateColumns;
     }
 
+    public List<String> getLogicalGeneratedColumnNames() {
+        List<String> generatedColumns = new ArrayList<>();
+        // Get all generated columns regardless their status
+        for (Entry<String, ColumnMeta> entry : allColumns.entrySet()) {
+            ColumnMeta meta = entry.getValue();
+            if (meta.isLogicalGeneratedColumn()) {
+                generatedColumns.add(entry.getKey());
+            }
+        }
+        return generatedColumns;
+    }
+
+    public List<String> getGeneratedColumnNames() {
+        List<String> generatedColumns = new ArrayList<>();
+        // Get all generated columns regardless their status
+        for (Entry<String, ColumnMeta> entry : allColumns.entrySet()) {
+            ColumnMeta meta = entry.getValue();
+            if (meta.isGeneratedColumn()) {
+                generatedColumns.add(entry.getKey());
+            }
+        }
+        return generatedColumns;
+    }
+
+    public List<String> getPublicLogicalGeneratedColumnNames() {
+        List<String> generatedColumns = new ArrayList<>();
+        // Get all public generated columns
+        for (ColumnMeta meta : getAllColumns()) {
+            if (meta.isLogicalGeneratedColumn()) {
+                generatedColumns.add(meta.getName());
+            }
+        }
+        return generatedColumns;
+    }
+
+    public boolean hasLogicalGeneratedColumn() {
+        if (hasLogicalGeneratedColumnCache == null) {
+            hasLogicalGeneratedColumnCache =
+                allColumns.values().stream().anyMatch(ColumnMeta::isLogicalGeneratedColumn);
+        }
+        return hasLogicalGeneratedColumnCache;
+    }
+
+    public boolean hasDefaultExprColumn() {
+        if (hasDefaultExprColumnCache == null) {
+            hasDefaultExprColumnCache = allColumns.values().stream().anyMatch(ColumnMeta::isDefaultExpr);
+        }
+        return hasDefaultExprColumnCache;
+    }
+
+    public boolean hasGeneratedColumn() {
+        if (hasGeneratedColumnCache == null) {
+            hasGeneratedColumnCache = allColumns.values().stream().anyMatch(ColumnMeta::isGeneratedColumn);
+        }
+        return hasGeneratedColumnCache;
+    }
+
+    public boolean hasUnpublishedLogicalGeneratedColumn() {
+        for (Entry<String, ColumnMeta> entry : allColumns.entrySet()) {
+            ColumnMeta meta = entry.getValue();
+            if (meta.isLogicalGeneratedColumn() && (meta.getStatus() != ColumnStatus.PUBLIC
+                || meta.getStatus() == ColumnStatus.MULTI_WRITE_SOURCE)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public TableColumnMeta getTableColumnMeta() {
         return tableColumnMeta;
     }
@@ -540,31 +761,87 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return gsiPublished;
     }
 
+    public Map<String, GsiIndexMetaBean> getColumnarIndexPublished() {
+        return columnarIndexPublished;
+    }
+
+    public Map<String, GsiIndexMetaBean> getColumnarIndexChecking() {
+        return columnarIndexChecking;
+    }
+
     public void setGsiTableMetaBean(GsiMetaManager.GsiTableMetaBean gsiTableMetaBean) {
         this.gsiTableMetaBean = gsiTableMetaBean;
         if (null != gsiTableMetaBean && gsiTableMetaBean.tableType.isPrimary()) {
-            this.gsiPublished = gsiTableMetaBean.indexMap.entrySet()
-                .stream()
-                .filter(e -> e.getValue().indexStatus.isPublished())
-                .collect(Collectors.toMap(Entry::getKey, Entry::getValue));
+            this.gsiPublished = new HashMap<>();
+            this.columnarIndexPublished = new HashMap<>();
+            this.columnarIndexChecking = new HashMap<>();
+            for (Entry<String, GsiIndexMetaBean> indexMetaBeanEntry : gsiTableMetaBean.indexMap.entrySet()) {
+                if (indexMetaBeanEntry.getValue().indexStatus.isWriteReorg()
+                    && indexMetaBeanEntry.getValue().columnarIndex) {
+                    // CCI is in checking state.
+                    this.columnarIndexChecking.put(indexMetaBeanEntry.getKey(), indexMetaBeanEntry.getValue());
+                }
+                if (!indexMetaBeanEntry.getValue().indexStatus.isPublished()) {
+                    continue;
+                }
+                if (indexMetaBeanEntry.getValue().columnarIndex) {
+                    this.columnarIndexPublished.put(indexMetaBeanEntry.getKey(), indexMetaBeanEntry.getValue());
+                } else {
+                    this.gsiPublished.put(indexMetaBeanEntry.getKey(), indexMetaBeanEntry.getValue());
+                }
+            }
         }
     }
 
     public boolean withGsi() {
-        return null != getGsiTableMetaBean() && getGsiTableMetaBean().tableType != GsiMetaManager.TableType.GSI
-            && GeneralUtil.isNotEmpty(getGsiTableMetaBean().indexMap);
-    }
-
-    public boolean hasGsi(String indexName) {
-        List<String> gsiNames = new ArrayList<>();
-        getGsiTableMetaBean().indexMap.forEach((key, value) -> {
-            gsiNames.add(TddlSqlToRelConverter.unwrapGsiName(key));
-        });
-        return gsiNames.contains(indexName);
+        if (withGsi == null) {
+            withGsi = null != getGsiTableMetaBean() && getGsiTableMetaBean().tableType != GsiMetaManager.TableType.GSI
+                && GeneralUtil.isNotEmpty(getGsiTableMetaBean().indexMap);
+        }
+        return withGsi;
     }
 
     public boolean withGsi(String indexName) {
-        return withGsi() && hasGsi(indexName);
+        return withGsi() && hasGsiIgnoreCase(indexName);
+    }
+
+    public boolean withCci() {
+        if (withCci == null) {
+            withCci =
+                null != getGsiTableMetaBean() && getGsiTableMetaBean().tableType != GsiMetaManager.TableType.COLUMNAR
+                    && GeneralUtil.isNotEmpty(getGsiTableMetaBean().indexMap) && getGsiTableMetaBean().indexMap.values()
+                    .stream().anyMatch(index -> index.columnarIndex);
+        }
+        return withCci;
+    }
+
+    public boolean hasCci(String indexName) {
+        Set<String> cciNames = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        getGsiTableMetaBean().indexMap.forEach((key, value) -> {
+            if (value.columnarIndex) {
+                cciNames.add(TddlSqlToRelConverter.unwrapGsiName(key));
+            }
+        });
+        return cciNames.contains(indexName);
+    }
+
+    public boolean withCci(String indexName) {
+        return withCci() && hasCci(indexName);
+    }
+
+    public Stream<String> gsiNameStream() {
+        return withGsi() ? getGsiTableMetaBean().indexMap.keySet().stream() : Stream.empty();
+    }
+
+    public Stream<String> gsiNameStream(Predicate<GsiIndexMetaBean> filter) {
+        return withGsi() ?
+            getGsiTableMetaBean()
+                .indexMap
+                .values()
+                .stream()
+                .filter(filter)
+                .map(imb -> imb.indexName)
+            : Stream.empty();
     }
 
     public boolean hasGsiIgnoreCase(String indexName) {
@@ -592,6 +869,28 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
             return true;
         }
         return null != getGsiTableMetaBean() && getGsiTableMetaBean().tableType == GsiMetaManager.TableType.GSI;
+    }
+
+    public boolean isColumnar() {
+        if (partitionInfo != null && partitionInfo.isColumnar()) {
+            return true;
+        }
+        return null != getGsiTableMetaBean() && getGsiTableMetaBean().tableType == GsiMetaManager.TableType.COLUMNAR;
+    }
+
+    public boolean withColumnar() {
+        return null != getGsiTableMetaBean() && getGsiTableMetaBean().tableType != GsiMetaManager.TableType.COLUMNAR
+            && GeneralUtil.isNotEmpty(getGsiTableMetaBean().indexMap);
+    }
+
+    public String columnarOriginTable() {
+        if (getGsiTableMetaBean() == null) {
+            return null;
+        }
+        if (getGsiTableMetaBean().gsiMetaBean == null) {
+            return null;
+        }
+        return getGsiTableMetaBean().gsiMetaBean.tableName.toLowerCase();
     }
 
     public boolean isClustered() {
@@ -697,6 +996,14 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         return null;
     }
 
+    public void setDefaultCollation(String defaultCollation) {
+        this.defaultCollation = defaultCollation;
+    }
+
+    public String getDefaultCollation() {
+        return defaultCollation;
+    }
+
     private class TableMetaInitializerExpressionFactory extends NullInitializerExpressionFactory {
         @Override
         public RexNode newColumnDefaultValue(RelOptTable table, int iColumn, InitializerContext context) {
@@ -718,6 +1025,19 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
                     // Default value is NULL
                     return rexBuilder.makeLiteral(columnDefaultStr, relDataTypeField.getType(), false);
                 }
+            }
+
+            if (InstanceVersion.isMYSQL80()) {
+                ColumnMeta columnMeta = getColumnIgnoreCase(columnName);
+                String expr = columnMeta.getField().getUnescapeDefault();
+                if (columnMeta.isDefaultExpr()) {
+                    SQLExpr sqlExpr =
+                        new MySqlExprParser(com.alibaba.polardbx.druid.sql.parser.ByteString.from(expr)).expr();
+                    if (!SQLExprUtils.isLiteralExpr(sqlExpr)) {
+                        return getDefaultExpressionRex(sqlExpr, table);
+                    }
+                }
+
             }
 
             if (TStringUtil.containsIgnoreCase(columnDefaultStr, "CURRENT_TIMESTAMP")) {
@@ -764,6 +1084,23 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
 
             return super.newImplicitDefaultValue(table, iColumn, context);
         }
+
+        public RexNode getDefaultExpressionRex(SQLExpr sqlExpr, RelOptTable table) {
+            ExecutionContext ec = new ExecutionContext();
+            ec.setSchemaName(schemaName);
+
+            FastSqlToCalciteNodeVisitor visitor = new FastSqlToCalciteNodeVisitor(null, null);
+            sqlExpr.accept(visitor);
+            SqlCall sqlCall =
+                new SqlBasicCall(SqlStdOperatorTable.GEN_COL_WRAPPER_FUNC, new SqlNode[] {visitor.getSqlNode()},
+                    SqlParserPos.ZERO);
+            SqlConverter sqlConverter = SqlConverter.getInstance(schemaName, ec);
+
+            RelOptCluster cluster = sqlConverter.createRelOptCluster();
+            PlannerContext plannerContext = PlannerContext.getPlannerContext(cluster);
+
+            return sqlConverter.getRexForDefaultExpr(table.getRowType(), sqlCall, plannerContext);
+        }
     }
 
     public void initPartitionInfo(String schemaName, String tableName, TddlRuleManager rule) {
@@ -775,26 +1112,51 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
         this.partitionInfo = rule.getPartitionInfoManager().getPartitionInfo(tableName);
     }
 
-    public Map<String, Map<String, List<FileMeta>>> getFileMetaSet() {
-        return fileMetaSet;
+    /**
+     * get the field id of a column for OSS table
+     *
+     * @param column column name
+     * @return the same colum name if the table is an old file storage table
+     */
+    public String getColumnFieldId(String column) {
+        return tableFilesMeta.columnMapping.get(column.toLowerCase());
+    }
+
+    @Nullable
+    public List<Long> getColumnarFieldIdList() {
+        return columnarFieldIdList;
+    }
+
+    public void setColumnarFieldIdList(List<Long> columnarFieldIdList) {
+        this.columnarFieldIdList = columnarFieldIdList;
+    }
+
+    /**
+     * get the field id of a column for CCI
+     *
+     * @param columnIndex column index
+     * @return corresponding field id of the column
+     */
+    public long getColumnarFieldId(int columnIndex) {
+        return columnarFieldIdList.get(columnIndex);
     }
 
     public void setFileMetaSet(Map<String, Map<String, List<FileMeta>>> fileMetaSet) {
         // only for file-store engine table
         Preconditions.checkArgument(Engine.isFileStore(this.getEngine()));
-        this.fileMetaSet = fileMetaSet;
-        // build flat map for physical table - file meta
-        Map<String, List<FileMeta>> flatFileMetas = new HashMap<>();
-        for (Entry<String, Map<String, List<FileMeta>>> phySchemas : this.fileMetaSet.entrySet()) {
-            for (Entry<String, List<FileMeta>> phyTables : phySchemas.getValue().entrySet()) {
-                flatFileMetas.put(phyTables.getKey(), phyTables.getValue());
-            }
-        }
-        this.flatFileMetas = flatFileMetas;
+        Preconditions.checkArgument(tableFilesMeta != null, "File Storage Meta info is empty");
+        tableFilesMeta.setFileMetaSet(fileMetaSet);
     }
 
     public Map<String, List<FileMeta>> getFlatFileMetas() {
-        return flatFileMetas;
+        return tableFilesMeta.getFlatFileMetas();
+    }
+
+    public boolean isOldFileStorage() {
+        if (tableFilesMeta == null) {
+            return false;
+        }
+        return tableFilesMeta.isOldFileStorage();
     }
 
     public void initPartitionInfo(String schemaName, String tableName, TddlRuleManager rule,
@@ -814,5 +1176,4 @@ public class TableMeta implements Serializable, Cloneable, Table, Wrapper {
             return OptimizerContext.getContext(schemaName).getRuleManager().getTableRule(tableName).getActualTopology();
         }
     }
-
 }

@@ -44,7 +44,7 @@ public class AlterTableGroupModifyPartitionBuilder extends AlterTableGroupBaseBu
         PartitionInfo
             partitionInfo = OptimizerContext.getContext(preparedData.getSchemaName()).getPartitionInfoManager()
             .getPartitionInfo(tableName);
-        PartitionSpec partitionSpec = partitionInfo.getPartitionBy().getPartitions().get(0);
+        PartitionSpec partitionSpec = partitionInfo.getPartitionBy().getPhysicalPartitions().get(0);
         alterTableGroupItemPreparedData.setDefaultPartitionSpec(partitionSpec);
         alterTableGroupItemPreparedData.setGroupDetailInfoExRecords(groupDetailInfoExRecords);
         alterTableGroupItemPreparedData.setTableGroupName(preparedData.getTableGroupName());
@@ -67,9 +67,45 @@ public class AlterTableGroupModifyPartitionBuilder extends AlterTableGroupBaseBu
         alterTableGroupItemPreparedData.setPrimaryTableName(primaryTableName);
         alterTableGroupItemPreparedData
             .setTableVersion(
-                executionContext.getSchemaManager(preparedData.getSchemaName()).getTable(primaryTableName).getVersion());
+                executionContext.getSchemaManager(preparedData.getSchemaName()).getTable(primaryTableName)
+                    .getVersion());
 
         return alterTableGroupItemPreparedData;
     }
 
+//    @Override
+//    protected void generateNewPhysicalTableNames(List<String> allLogicalTableNames) {
+//        final String schemaName = preparedData.getSchemaName();
+//        TableGroupRecord tableGroupRecord;
+//        try (Connection conn = MetaDbDataSource.getInstance().getConnection()) {
+//            try {
+//                conn.setAutoCommit(false);
+//                TableGroupAccessor accessor = new TableGroupAccessor();
+//                accessor.setConnection(conn);
+//                List<TableGroupRecord> tableGroupRecords = accessor
+//                    .getTableGroupsBySchemaAndName(schemaName, preparedData.getTableGroupName(), true);
+//                assert tableGroupRecords.size() == 1;
+//                tableGroupRecord = tableGroupRecords.get(0);
+//
+//                int[] minPostfix = new int[1];
+//                int maxPostfix = 1;
+//                for (String tableName : allLogicalTableNames) {
+//                    minPostfix[0] = tableGroupRecord.getInited() - preparedData.getNewPartitionNames().size();
+//                    minPostfix[0] = Math.max(minPostfix[0], 0);
+//                    PartitionInfo partitionInfo =
+//                        OptimizerContext.getContext(schemaName).getPartitionInfoManager().getPartitionInfo(tableName);
+//                    List<String> physicalTables = PartitionInfoUtil
+//                        .getNextNPhyTableNames(partitionInfo, preparedData.getNewPartitionNames().size(), minPostfix);
+//                    maxPostfix = Math.max(minPostfix[0], maxPostfix);
+//                    newPhysicalTables.put(tableName, physicalTables);
+//                }
+//                accessor.updateInitedById(tableGroupRecord.getId(), maxPostfix);
+//                conn.commit();
+//            } finally {
+//                MetaDbUtil.endTransaction(conn, PartitionNameUtil.LOGGER);
+//            }
+//        } catch (Throwable e) {
+//            throw new TddlRuntimeException(ErrorCode.ERR_GMS_GET_CONNECTION, e, e.getMessage());
+//        }
+//    }
 }

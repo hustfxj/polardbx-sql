@@ -16,8 +16,8 @@
 
 package com.alibaba.polardbx.executor.vectorized.compare;
 
-import com.alibaba.polardbx.common.charset.CharsetFactory;
-import com.alibaba.polardbx.common.collation.CollationHandler;
+import com.alibaba.polardbx.optimizer.config.table.charset.CharsetFactory;
+import com.alibaba.polardbx.optimizer.config.table.collation.CollationHandler;
 import com.alibaba.polardbx.executor.chunk.LongBlock;
 import com.alibaba.polardbx.executor.chunk.MutableChunk;
 import com.alibaba.polardbx.executor.chunk.RandomAccessBlock;
@@ -29,9 +29,13 @@ import com.alibaba.polardbx.executor.vectorized.LiteralVectorizedExpression;
 import com.alibaba.polardbx.executor.vectorized.VectorizedExpression;
 import com.alibaba.polardbx.executor.vectorized.VectorizedExpressionUtils;
 import com.alibaba.polardbx.executor.vectorized.metadata.ExpressionSignatures;
+import com.alibaba.polardbx.optimizer.config.table.charset.CharsetFactory;
+import com.alibaba.polardbx.optimizer.config.table.charset.CollationHandlers;
+import com.alibaba.polardbx.optimizer.config.table.collation.CollationHandler;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
 import com.alibaba.polardbx.optimizer.core.datatype.SliceType;
 import io.airlift.slice.Slice;
+import io.airlift.slice.Slices;
 
 import static com.alibaba.polardbx.executor.vectorized.metadata.ArgumentKind.Const;
 import static com.alibaba.polardbx.executor.vectorized.metadata.ArgumentKind.Variable;
@@ -49,7 +53,13 @@ public class LikeVarcharColCharConstVectorizedExpression extends AbstractVectori
         super(DataTypes.LongType, outputIndex, children);
 
         SliceType sliceType = (SliceType) children[0].getOutputDataType();
-        this.collationHandler = CharsetFactory.DEFAULT_CHARSET_HANDLER.getCollationHandler();
+        // FIXME ignore collation here
+        if (sliceType.isLatin1Encoding()) {
+            this.collationHandler = CollationHandlers.COLLATION_HANDLER_LATIN1_BIN;
+            ;
+        } else {
+            this.collationHandler = CharsetFactory.DEFAULT_CHARSET_HANDLER.getCollationHandler();
+        }
 
         Object operand1Value = ((LiteralVectorizedExpression) children[1]).getConvertedValue();
         if (operand1Value == null) {
@@ -73,7 +83,7 @@ public class LikeVarcharColCharConstVectorizedExpression extends AbstractVectori
         RandomAccessBlock leftInputVectorSlot =
             chunk.slotIn(children[0].getOutputIndex(), children[0].getOutputDataType());
 
-        long[] output = ((LongBlock) outputVectorSlot).longArray();
+        long[] output = (outputVectorSlot.cast(LongBlock.class)).longArray();
 
         if (operand1IsNull) {
             boolean[] outputNulls = outputVectorSlot.nulls();
@@ -84,16 +94,18 @@ public class LikeVarcharColCharConstVectorizedExpression extends AbstractVectori
             return;
         }
 
+        Slice cachedSlice = new Slice();
+
         VectorizedExpressionUtils.mergeNulls(chunk, outputIndex, children[0].getOutputIndex());
 
         if (leftInputVectorSlot instanceof SliceBlock) {
-            SliceBlock sliceBlock = (SliceBlock) leftInputVectorSlot;
+            SliceBlock sliceBlock = leftInputVectorSlot.cast(SliceBlock.class);
 
             if (isSelectionInUse) {
                 for (int i = 0; i < batchSize; i++) {
                     int j = sel[i];
 
-                    Slice slice = sliceBlock.getRegion(j);
+                    Slice slice = sliceBlock.getRegion(j, cachedSlice);
 
                     output[j] = collationHandler.wildCompare(slice, operand1)
                         ? LongBlock.TRUE_VALUE : LongBlock.FALSE_VALUE;
@@ -101,7 +113,7 @@ public class LikeVarcharColCharConstVectorizedExpression extends AbstractVectori
             } else {
                 for (int i = 0; i < batchSize; i++) {
 
-                    Slice slice = sliceBlock.getRegion(i);
+                    Slice slice = sliceBlock.getRegion(i, cachedSlice);
 
                     output[i] = collationHandler.wildCompare(slice, operand1)
                         ? LongBlock.TRUE_VALUE : LongBlock.FALSE_VALUE;
@@ -113,7 +125,9 @@ public class LikeVarcharColCharConstVectorizedExpression extends AbstractVectori
                     int j = sel[i];
 
                     Slice lSlice = ((Slice) leftInputVectorSlot.elementAt(j));
-
+                    if (lSlice == null) {
+                        lSlice = Slices.EMPTY_SLICE;
+                    }
                     output[j] = collationHandler.wildCompare(lSlice, operand1)
                         ? LongBlock.TRUE_VALUE : LongBlock.FALSE_VALUE;
                 }
@@ -121,7 +135,9 @@ public class LikeVarcharColCharConstVectorizedExpression extends AbstractVectori
                 for (int i = 0; i < batchSize; i++) {
 
                     Slice lSlice = ((Slice) leftInputVectorSlot.elementAt(i));
-
+                    if (lSlice == null) {
+                        lSlice = Slices.EMPTY_SLICE;
+                    }
                     output[i] = collationHandler.wildCompare(lSlice, operand1)
                         ? LongBlock.TRUE_VALUE : LongBlock.FALSE_VALUE;
                 }

@@ -16,23 +16,23 @@
 
 package com.alibaba.polardbx.server.response;
 
-
 import com.alibaba.polardbx.executor.partitionvisualizer.VisualLayerService;
 import com.alibaba.polardbx.executor.sync.SyncManagerHelper;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.net.compress.PacketOutputProxyFactory;
 import com.alibaba.polardbx.net.packet.OkPacket;
 import com.alibaba.polardbx.server.ServerConnection;
 
 /**
  * @author ximing.yd
- * @date 2022/2/16 11:09 上午
  */
 public final class ClearPartitionsHeatmapCache {
 
-    public static void response(ServerConnection c, boolean hasMore) {
+    public static boolean response(ServerConnection c, boolean hasMore) {
         VisualLayerService.clearPartitionsHeatmapCache();
-        SyncManagerHelper.sync(new ClearPartitionsHeatmapCacheSyncAction(), "information_schema");
+        SyncManagerHelper.sync(new ClearPartitionsHeatmapCacheSyncAction(), "information_schema", SyncScope.ALL);
         PacketOutputProxyFactory.getInstance().createProxy(c)
             .writeArrayAsPacket(hasMore ? OkPacket.OK_WITH_MORE : OkPacket.OK);
+        return true;
     }
 }

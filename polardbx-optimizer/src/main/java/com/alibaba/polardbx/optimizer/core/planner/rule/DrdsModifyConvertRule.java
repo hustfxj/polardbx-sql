@@ -47,6 +47,7 @@ public class DrdsModifyConvertRule extends ConverterRule {
         if (Engine.isFileStore(tableMeta.getEngine())) {
             throw new TddlRuntimeException(ErrorCode.ERR_NOT_SUPPORT, "dml in file store");
         }
+
         RelTraitSet relTraitSet = logicalModify.getTraitSet().simplify();
         return logicalModify.copy(relTraitSet.replace(DrdsConvention.INSTANCE),
             convertList(logicalModify.getInputs(), DrdsConvention.INSTANCE));

@@ -136,7 +136,7 @@ public class SequenceDDLTest extends BaseSequenceTestCase {
      */
     @Test
     public void testSimpleMaxValueSequenceValue() {
-        String sql = String.format("create simple sequence %s start with 99999999996 maxvalue 99999999999", seqName2);
+        String sql = String.format("create sequence %s start with 99999999996 maxvalue 99999999999", seqName2);
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
         assertExistsSequence(seqName2, 99999999996L);
@@ -155,6 +155,32 @@ public class SequenceDDLTest extends BaseSequenceTestCase {
             e.printStackTrace();
             Assert.fail(e.getMessage());
         }
+    }
+
+    @Test
+    public void testAlterGroupSequenceStartWith() {
+        String sql = String.format("create group sequence %s start with 891832123", seqName1);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
+        assertExistsSequence(seqName1, 891832123L);
+
+        //alter sequence start with -1 (failed)
+        String sql2 = String.format("alter sequence %s start with -1", seqName1);
+        JdbcUtil.executeUpdateFailed(tddlConnection, sql2, "must be a positive number");
+
+        //alter sequence start with 0
+        String sql3 = String.format("alter sequence %s start with 0", seqName1);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql3);
+        assertExistsSequence(seqName1, 0L);
+
+        //alter sequence start with 1
+        String sql4 = String.format("alter sequence %s start with 1", seqName1);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql4);
+        assertExistsSequence(seqName1, 0L);
+
+        //alter sequence start with 2
+        String sql5 = String.format("alter sequence %s start with 2", seqName1);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql5);
+        assertExistsSequence(seqName1, 2L);
     }
 
     public void assertExistsSequence(String name, long num) {

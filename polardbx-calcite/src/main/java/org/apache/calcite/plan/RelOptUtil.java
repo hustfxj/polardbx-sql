@@ -235,7 +235,7 @@ public abstract class RelOptUtil {
    */
   public static List<RelOptTable> findAllTables(RelNode rel) {
     final Multimap<Class<? extends RelNode>, RelNode> nodes =
-        RelMetadataQuery.instance().getNodeTypes(rel);
+       rel.getCluster().getMetadataQuery().getNodeTypes(rel);
     final List<RelOptTable> usedTables = new ArrayList<>();
     for (Entry<Class<? extends RelNode>, Collection<RelNode>> e : nodes.asMap().entrySet()) {
       if (TableScan.class.isAssignableFrom(e.getKey())) {
@@ -259,7 +259,7 @@ public abstract class RelOptUtil {
    */
   public static List<RelNode> findAllCorrelate(RelNode rel) {
     final Multimap<Class<? extends RelNode>, RelNode> nodes =
-        RelMetadataQuery.instance().getNodeTypes(rel);
+        rel.getCluster().getMetadataQuery().getNodeTypes(rel);
     final List<RelNode> usedTables = new ArrayList<>();
     for (Entry<Class<? extends RelNode>, Collection<RelNode>> e : nodes.asMap().entrySet()) {
       if (Correlate.class.isAssignableFrom(e.getKey())) {
@@ -1925,6 +1925,11 @@ public abstract class RelOptUtil {
       return litmus.succeed();
     }
 
+    if (type1.getSqlTypeName() == SqlTypeName.DECIMAL
+        && type2.getSqlTypeName() ==  SqlTypeName.DECIMAL) {
+      return litmus.succeed();
+    }
+
     if (type1 != type2) {
       return litmus.fail("type mismatch:\n{}:\n{}\n{}:\n{}",
           desc1, type1.getFullTypeString(),
@@ -2877,7 +2882,7 @@ public abstract class RelOptUtil {
     try {
       new RelVisitor() {
         public void visit(RelNode node, int ordinal, RelNode parent) {
-          if (node instanceof Sort) {
+          if (node instanceof Sort&&((Sort)node).withLimit()) {
             throw Util.FoundOne.NULL;
           }
           super.visit(node, ordinal, parent);
@@ -3840,6 +3845,23 @@ public abstract class RelOptUtil {
     public RexNode visitInputRef(RexInputRef inputRef) {
       inputPosReferenced.add(inputRef.getIndex());
       return inputRef;
+    }
+  }
+
+  /** Shuttle that finds the set of inputs in equality that are used. */
+  public static class EquivalentInputReferencedVisitor extends InputReferencedVisitor {
+
+    @Override
+    public RexNode visitCall(RexCall call) {
+      boolean[] update = {false};
+      switch (call.getOperator().getKind()) {
+      case EQUALS:
+      case IS_NOT_DISTINCT_FROM:
+      case AND:
+        visitList(call.operands, update);
+      default:
+        return call;
+      }
     }
   }
 

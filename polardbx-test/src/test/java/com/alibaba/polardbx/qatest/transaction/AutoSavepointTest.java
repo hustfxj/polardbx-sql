@@ -26,7 +26,6 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
-import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
 import java.sql.Connection;
@@ -45,7 +44,7 @@ import java.util.function.Supplier;
 import static com.alibaba.polardbx.qatest.DDLBaseNewDBTestCase.quoteSpecialName;
 
 @NotThreadSafe
-@Ignore("wait for new XProtocol")
+
 public class AutoSavepointTest extends CrudBasedLockTestCase {
     private final String primaryName;
     private final String gsiName;
@@ -62,16 +61,20 @@ public class AutoSavepointTest extends CrudBasedLockTestCase {
     private final String updateTemplate = "UPDATE {0} SET {1}";
     private Supplier<String> goodValuesSupplier;
 
-    public AutoSavepointTest(String trxPolicy) {
+    private boolean xProtoOpt;
+
+    public AutoSavepointTest(String trxPolicy, String xProtoOpt) {
         this.trxPolicy = trxPolicy;
+        this.xProtoOpt = Boolean.parseBoolean(xProtoOpt);
         this.primaryName = "auto_savepoint_test_primary_table" + trxPolicy;
         this.gsiName = "auto_savepoint_test_gsi_table" + trxPolicy;
         this.mysqlName = "auto_savepoint_test_mysql_table" + trxPolicy;
     }
 
-    @Parameterized.Parameters(name = "{index}:trxPolicy={0}")
+    @Parameterized.Parameters(name = "{index}:trxPolicy={0},xprotoOpt={1}")
     public static List<String[]> prepareDate() {
-        return ImmutableList.of(new String[] {"XA"}, new String[] {"TSO"});
+        return ImmutableList.of(new String[] {"XA", "FALSE"}, new String[] {"TSO", "FALSE"},
+            new String[] {"TSO", "TRUE"});
     }
 
     /**
@@ -79,14 +82,17 @@ public class AutoSavepointTest extends CrudBasedLockTestCase {
      */
     @Before
     public void before() {
+        JdbcUtil.executeUpdate(tddlConnection, "SET GLOBAL CONN_POOL_XPROTO_SLOW_THRESH = 0");
         this.myPolarXConn = getPolardbxConnection();
         this.myMysqlConn = getMysqlConnection();
         Assert.assertTrue(initialMaxKey > 1);
 
         JdbcUtil.executeUpdateSuccess(myPolarXConn, "set global enable_auto_savepoint = true");
+        JdbcUtil.executeUpdateSuccess(myPolarXConn,
+            String.format("set global ENABLE_X_PROTO_OPT_FOR_AUTO_SP = %s", xProtoOpt));
 
         final String createTableTemplate = "CREATE TABLE {0} ({1} {2}) {3}";
-        final String columnDef = "a int primary key, b int, c char(1), d int";
+        final String columnDef = "a int primary key, b int, c char(1), d int not null";
         final String partitionStr = " dbpartition by hash({0}) tbpartition by hash({0}) tbpartitions 2";
         final String uniqueIndexTddlStr =
             ", unique global index " + gsiName + " (b) covering (c) " + MessageFormat.format(partitionStr, "b");
@@ -99,7 +105,7 @@ public class AutoSavepointTest extends CrudBasedLockTestCase {
         final String createMysqlTableSql = MessageFormat.format(
             createTableTemplate, mysqlName, columnDef, uniqueIndexMysqlStr, "");
         // Create table.
-        dropTableWithGsi(primaryName, ImmutableList.of(gsiName));
+        dropTableIfExists(myPolarXConn, primaryName);
         JdbcUtil.executeUpdateSuccess(myPolarXConn, createTddlTableSql);
         dropTableIfExists(myMysqlConn, mysqlName);
         JdbcUtil.executeUpdateSuccess(myMysqlConn, createMysqlTableSql);
@@ -135,24 +141,13 @@ public class AutoSavepointTest extends CrudBasedLockTestCase {
         JdbcUtil.executeUpdateSuccess(conn, sql);
     }
 
-    private void dropTableWithGsi(String primary, List<String> indexNames) {
-        final String finalPrimary = quoteSpecialName(primary);
-        try (final Statement stmt = myPolarXConn.createStatement()) {
-            stmt.execute("DROP TABLE IF EXISTS " + finalPrimary);
-            for (String gsi : Optional.ofNullable(indexNames).orElse(ImmutableList.of())) {
-                stmt.execute("DROP TABLE IF EXISTS " + quoteSpecialName(gsi));
-            }
-        } catch (Exception e) {
-            throw GeneralUtil.nestedException(e);
-        }
-    }
-
     @After
     public void after() throws SQLException {
-        dropTableIfExists(myMysqlConn, mysqlName);
-        dropTableWithGsi(primaryName, ImmutableList.of(gsiName));
+//        dropTableIfExists(myMysqlConn, mysqlName);
+//        dropTableWithGsi(primaryName, ImmutableList.of(gsiName));
         myPolarXConn.close();
         myMysqlConn.close();
+        JdbcUtil.executeUpdate(tddlConnection, "SET GLOBAL CONN_POOL_XPROTO_SLOW_THRESH = 1000");
     }
 
     private String getIncKey() {
@@ -226,6 +221,11 @@ public class AutoSavepointTest extends CrudBasedLockTestCase {
                 "Out of range value for column 'b'");
 
             insertGoodValuesToTddlAndMysql();
+            // Insert "(x, x, '0')" should fail with Filed 'd' doesn't have a default value.
+            expectInsertFailed2(getValuesStr(Arrays.asList(getIncKey(), getIncKey(), "'0'")),
+                "doesn't have a default value");
+
+            insertGoodValuesToTddlAndMysql();
             // Update causes duplicate entry.
             final String key = getIncKey();
             insertValuesToTddlAndMysql(getValuesStr(Arrays.asList(key, key, "'0'", key)));
@@ -246,6 +246,17 @@ public class AutoSavepointTest extends CrudBasedLockTestCase {
         JdbcUtil.executeUpdateFailed(myPolarXConn, getInsertSql(primaryName, badValues), tddlError);
 
         JdbcUtil.executeUpdateFailed(myMysqlConn, getInsertSql(mysqlName, badValues), mysqlError);
+    }
+
+    private void expectInsertFailed2(String badValues, String tddlError) {
+        // Assert the same error.
+        expectInsertFailed2(badValues, tddlError, tddlError);
+    }
+
+    private void expectInsertFailed2(String badValues, String tddlError, String mysqlError) {
+        JdbcUtil.executeUpdateFailed(myPolarXConn, getInsertSql(primaryName + "(a, b, c)", badValues), tddlError);
+
+        JdbcUtil.executeUpdateFailed(myMysqlConn, getInsertSql(mysqlName + "(a, b, c)", badValues), mysqlError);
     }
 
     private void expectUpdateFailed(String updateStr, String error) {
@@ -594,6 +605,40 @@ public class AutoSavepointTest extends CrudBasedLockTestCase {
             myPolarXConn.rollback();
             myPolarXConn.setAutoCommit(true);
         }
+    }
+
+    @Test
+    public void testRollbackFirstAutoSp() throws SQLException {
+        String tableName = "testRollbackFirstAutoSp";
+        String createSql = "create table " + tableName + " (id int primary key, a int) dbpartition by hash(id)";
+        String dropSql = "drop table if exists " + tableName;
+        String insertSql = "insert into " + tableName + " values ";
+        JdbcUtil.executeUpdateSuccess(myPolarXConn, dropSql);
+        JdbcUtil.executeUpdateSuccess(myPolarXConn, createSql);
+        // init data: (0, 0), (1, 1)
+        JdbcUtil.executeUpdateSuccess(myPolarXConn, insertSql + "(0, 0), (1, 1)");
+        try {
+            // begin transaction
+            myPolarXConn.setAutoCommit(false);
+            final String setTrxPolicySql = String.format("set drds_transaction_policy = %s", trxPolicy);
+            JdbcUtil.executeUpdateSuccess(myPolarXConn, setTrxPolicySql);
+            // insert duplicate value should be rollback
+            JdbcUtil.executeUpdateFailed(myPolarXConn, insertSql + "(0, 0), (1, 1), (2, 2), (3, 3)",
+                "Duplicate entry");
+            JdbcUtil.executeUpdateSuccess(myPolarXConn, insertSql + "(4, 4), (5, 5)");
+            myPolarXConn.commit();
+        } finally {
+            myPolarXConn.rollback();
+            myPolarXConn.setAutoCommit(true);
+        }
+        ResultSet rs = JdbcUtil.executeQuerySuccess(myPolarXConn, "select id from " + tableName + " order by id");
+        int[] expectedData = {0, 1, 4, 5};
+        int i = 0;
+        while (rs.next()) {
+            Assert.assertEquals(expectedData[i], rs.getInt(1));
+            i++;
+        }
+        JdbcUtil.executeUpdateSuccess(myPolarXConn, dropSql);
     }
 
 }

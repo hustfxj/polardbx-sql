@@ -16,10 +16,6 @@
 
 package com.alibaba.polardbx.executor.operator;
 
-import com.google.common.base.Preconditions;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.alibaba.polardbx.common.exception.TddlRuntimeException;
-import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.executor.chunk.Chunk;
 import com.alibaba.polardbx.executor.operator.util.BufferInputBatchQueue;
@@ -29,6 +25,8 @@ import com.alibaba.polardbx.optimizer.core.join.EquiJoinKey;
 import com.alibaba.polardbx.optimizer.memory.MemoryAllocatorCtx;
 import com.alibaba.polardbx.optimizer.memory.MemoryPool;
 import com.alibaba.polardbx.optimizer.memory.MemoryPoolUtils;
+import com.google.common.base.Preconditions;
+import com.google.common.util.concurrent.ListenableFuture;
 import org.apache.calcite.rel.core.JoinRelType;
 
 import java.util.List;
@@ -40,7 +38,6 @@ import java.util.List;
 public class MaterializedSemiJoinExec extends AbstractJoinExec implements ConsumerExecutor {
 
     private final int batchSize;
-    private final int materializedItemsLimit;
     private BufferInputBatchQueue bufferInputBatchQueue;
     private boolean distinctInput;
     private boolean passThrough;
@@ -64,7 +61,6 @@ public class MaterializedSemiJoinExec extends AbstractJoinExec implements Consum
         } else { // ANTI JOIN
             this.batchSize = Integer.MAX_VALUE;
         }
-        this.materializedItemsLimit = context.getParamManager().getInt(ConnectionParams.MATERIALIZED_ITEMS_LIMIT);
         this.distinctInput = distinctInput;
         this.blocked = ProducerExecutor.NOT_BLOCKED;
 
@@ -148,10 +144,6 @@ public class MaterializedSemiJoinExec extends AbstractJoinExec implements Consum
                         if (chunk == null) {
                             this.isFinish = true;
                         } else {
-                            if (chunk.getPositionCount() >= materializedItemsLimit) {
-                                throw new TddlRuntimeException(ErrorCode.ERR_EXECUTOR,
-                                    "Too many items in Materialized Semi-Join");
-                            }
                             Chunk lookupKeys = innerKeyChunkGetter.apply(chunk);
                             lookUpExec.updateLookupPredicate(lookupKeys);
                             lookUpExec.resume();

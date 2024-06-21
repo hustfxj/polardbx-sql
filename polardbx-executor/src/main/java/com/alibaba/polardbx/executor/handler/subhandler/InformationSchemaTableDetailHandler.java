@@ -17,6 +17,7 @@
 package com.alibaba.polardbx.executor.handler.subhandler;
 
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
+import com.alibaba.polardbx.common.utils.CaseInsensitive;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.executor.balancer.stats.StatsUtils;
@@ -28,10 +29,14 @@ import com.alibaba.polardbx.gms.partition.TablePartRecordInfoContext;
 import com.alibaba.polardbx.gms.partition.TablePartitionRecord;
 import com.alibaba.polardbx.gms.tablegroup.PartitionGroupRecord;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupConfig;
+import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
 import com.alibaba.polardbx.optimizer.core.function.calc.scalar.filter.Like;
+import com.alibaba.polardbx.optimizer.partition.PartSpecSearcher;
+import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
+import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
 import com.alibaba.polardbx.optimizer.sql.sql2rel.TddlSqlToRelConverter;
 import com.alibaba.polardbx.optimizer.view.InformationSchemaTableDetail;
 import com.alibaba.polardbx.optimizer.view.VirtualView;
@@ -51,6 +56,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 
@@ -74,72 +80,21 @@ public class InformationSchemaTableDetailHandler extends BaseVirtualViewSubClass
 
     @Override
     public Cursor handle(VirtualView virtualView, ExecutionContext executionContext, ArrayResultCursor cursor) {
-        InformationSchemaTableDetail informationSchemaTableDetail = (InformationSchemaTableDetail) virtualView;
-
         // only new partitioning db
         Set<String> schemaNames = new TreeSet<>(String::compareToIgnoreCase);
         schemaNames.addAll(StatsUtils.getDistinctSchemaNames());
 
-        List<Object> tableSchemaIndexValue =
-            virtualView.getIndex().get(informationSchemaTableDetail.getTableSchemaIndex());
-
-        Object tableSchemaLikeValue =
-            virtualView.getLike().get(informationSchemaTableDetail.getTableSchemaIndex());
-
-        List<Object> tableNameIndexValue =
-            virtualView.getIndex().get(informationSchemaTableDetail.getTableNameIndex());
-
-        Object tableNameLikeValue =
-            virtualView.getLike().get(informationSchemaTableDetail.getTableNameIndex());
-
+        final int schemaIndex = InformationSchemaTableDetail.getTableSchemaIndex();
+        final int tableIndex = InformationSchemaTableDetail.getTableNameIndex();
         Map<Integer, ParameterContext> params = executionContext.getParams().getCurrentParameter();
 
-        // schemaIndex
-        Set<String> indexSchemaNames = new HashSet<>();
-        if (tableSchemaIndexValue != null && !tableSchemaIndexValue.isEmpty()) {
-            for (Object obj : tableSchemaIndexValue) {
-                ExecUtils.handleTableNameParams(obj, params, indexSchemaNames);
-            }
-            schemaNames = schemaNames.stream()
-                .filter(schemaName -> indexSchemaNames.contains(schemaName.toLowerCase()))
-                .collect(Collectors.toSet());
-        }
-
-        // schemaLike
-        String schemaLike = null;
-        if (tableSchemaLikeValue != null) {
-            if (tableSchemaLikeValue instanceof RexDynamicParam) {
-                schemaLike =
-                    String.valueOf(params.get(((RexDynamicParam) tableSchemaLikeValue).getIndex() + 1).getValue());
-            } else if (tableSchemaLikeValue instanceof RexLiteral) {
-                schemaLike = ((RexLiteral) tableSchemaLikeValue).getValueAs(String.class);
-            }
-            if (schemaLike != null) {
-                final String likeArg = schemaLike;
-                schemaNames = schemaNames.stream().filter(schemaName -> new Like(null, null).like(
-                    schemaName, likeArg)).collect(
-                    Collectors.toSet());
-            }
-        }
+        schemaNames = virtualView.applyFilters(schemaIndex, params, schemaNames);
 
         // tableIndex
-        Set<String> indexTableNames = new HashSet<>();
-        if (tableNameIndexValue != null && !tableNameIndexValue.isEmpty()) {
-            for (Object obj : tableNameIndexValue) {
-                ExecUtils.handleTableNameParams(obj, params, indexSchemaNames);
-            }
-        }
-
+        Set<String> indexTableNames = virtualView.getEqualsFilterValues(tableIndex, params);
         // tableLike
-        String tableLike = null;
-        if (tableNameLikeValue != null) {
-            if (tableNameLikeValue instanceof RexDynamicParam) {
-                tableLike =
-                    String.valueOf(params.get(((RexDynamicParam) tableNameLikeValue).getIndex() + 1).getValue());
-            } else if (tableNameLikeValue instanceof RexLiteral) {
-                tableLike = ((RexLiteral) tableNameLikeValue).getValueAs(String.class);
-            }
-        }
+        String tableLike = virtualView.getLikeString(tableIndex, params);
+
         List<TableGroupConfig> allTableGroupConfigs = StatsUtils.getTableGroupConfigs(schemaNames);
 
         List<TableGroupConfig> tableGroupConfigs =
@@ -154,8 +109,11 @@ public class InformationSchemaTableDetailHandler extends BaseVirtualViewSubClass
         return cursor;
     }
 
-    private void queryStats(String tableLike, Set<String> logicalTableNames, Set<String> schemaNames,
-                            List<TableGroupConfig> tableGroupConfigs, boolean isPrimaryTable,
+    private void queryStats(String tableLike,
+                            Set<String> logicalTableNames,
+                            Set<String> schemaNames,
+                            List<TableGroupConfig> tableGroupConfigs,
+                            boolean isPrimaryTable,
                             ExecutionContext executionContext,
                             Set<String> gsiNames,
                             ArrayResultCursor cursor) {
@@ -172,19 +130,25 @@ public class InformationSchemaTableDetailHandler extends BaseVirtualViewSubClass
             }
             String schemaName = tableGroupConfig.getTableGroupRecord().schema;
 
-            Map<String, Map<String, List<Object>>> tablesStatInfo =
-                StatsUtils.queryTableGroupStats(tableGroupConfig, logicalTableNames, tableLike, phyDbTablesInfo);
-            if (MapUtils.isEmpty(tablesStatInfo)) {
+            Map<String, Map<String, Map<String, Object>>> tableGroupStatInfo =
+                StatsUtils.queryTableGroupStatInfos(tableGroupConfig, logicalTableNames, tableLike, phyDbTablesInfo);
+
+            if (MapUtils.isEmpty(tableGroupStatInfo)) {
                 continue;
             }
             List<PartitionGroupRecord> partitionGroupRecords = tableGroupConfig.getPartitionGroupRecords();
-            HashMap<String, String> partitionPyhDbMap = new HashMap<>();
+            /**
+             * key: partName
+             * val: phyDb
+             * Prepare the partName->phyDb map for table group
+             */
+            Map<String, String> partitionPyhDbMap = new TreeMap<>(CaseInsensitive.CASE_INSENSITIVE_ORDER);
             if (CollectionUtils.isNotEmpty(partitionGroupRecords)) {
                 partitionPyhDbMap.putAll(partitionGroupRecords.stream().collect(Collectors.toMap(
                     PartitionGroupRecord::getPartition_name, PartitionGroupRecord::getPhy_db)));
             }
-            for (TablePartRecordInfoContext context : tableGroupConfig.getAllTables()) {
-                String logicalTableName = context.getTableName().toLowerCase();
+            for (String tableName : tableGroupConfig.getAllTables()) {
+                String logicalTableName = tableName.toLowerCase();
                 TableMeta tableMeta = executionContext.getSchemaManager(schemaName).getTable(logicalTableName);
                 String indexName = StringUtils.EMPTY;
                 if (tableMeta.isGsi()) {
@@ -192,15 +156,16 @@ public class InformationSchemaTableDetailHandler extends BaseVirtualViewSubClass
                         continue;
                     }
                     logicalTableName = tableMeta.getGsiTableMetaBean().gsiMetaBean.tableName;
-                    indexName = TddlSqlToRelConverter.unwrapGsiName(context.getTableName().toLowerCase());
+                    indexName = TddlSqlToRelConverter.unwrapGsiName(tableName.toLowerCase());
                 }
                 if (!StatsUtils.isFilterTable(logicalTableNames, tableLike, logicalTableName) && isPrimaryTable) {
                     continue;
                 }
-                Map<String, List<Object>> tableStatInfo =
-                    tablesStatInfo.get(context.getLogTbRec().tableName.toLowerCase());
 
-                if (tableStatInfo == null) {
+                Map<String, Map<String, Object>> phyTblStatInfoOfOneLogTb =
+                    tableGroupStatInfo.get(tableName.toLowerCase());
+
+                if (phyTblStatInfoOfOneLogTb == null) {
                     continue;
                 }
 
@@ -208,55 +173,125 @@ public class InformationSchemaTableDetailHandler extends BaseVirtualViewSubClass
                     gsiNames.addAll(tableMeta.getGsiTableMetaBean().indexMap.keySet());
                 }
 
-                Objects.requireNonNull(tableStatInfo,
-                    String.format("table meta corrupted: %s.%s", schemaName, context.getTableName()));
+                Objects.requireNonNull(phyTblStatInfoOfOneLogTb,
+                    String.format("table meta corrupted: %s.%s", schemaName, tableName));
+
                 Long totalRows = 0L;
-                for (Map.Entry<String, List<Object>> phyEntry : tableStatInfo.entrySet()) {
-                    totalRows += DataTypes.LongType.convertFrom(phyEntry.getValue().get(3));
+                for (Map.Entry<String, Map<String, Object>> phyEntry : phyTblStatInfoOfOneLogTb.entrySet()) {
+                    totalRows += DataTypes.LongType.convertFrom(phyEntry.getValue().get("physicalTableRows"));
                 }
-                List<TablePartitionRecord> tablePartitionRecords =
-                    context.getPartitionRecList().stream().filter(
-                        o -> (o.partLevel != TablePartitionRecord.PARTITION_LEVEL_LOGICAL_TABLE)).collect(
-                        Collectors.toList());
-                for (int i = 0; i < tablePartitionRecords.size(); i++) {
-                    TablePartitionRecord record = tablePartitionRecords.get(i);
-                    List<Object> tableStatRow = tableStatInfo.get(record.phyTable.toLowerCase());
+
+                /**
+                 * Fetch all the phyPartRecords of metadb
+                 */
+                List<PartitionSpec> partitionSpecs =
+                    tableMeta.getPartitionInfo().getPartitionBy().getPhysicalPartitions();
+                for (int i = 0; i < partitionSpecs.size(); i++) {
+                    /**
+                     * record is a record of phySpec
+                     */
+                    PartitionSpec record = partitionSpecs.get(i);
+
+                    Map<String, Object> tableStatRow =
+                        phyTblStatInfoOfOneLogTb.get(record.getLocation().getPhyTableName().toLowerCase());
+
                     Objects.requireNonNull(tableStatRow,
                         String.format("physical table meta corrupted: %s.%s.%s",
-                            schemaName, record.tableName, record.phyTable));
-                    long tableRow = DataTypes.LongType.convertFrom(tableStatRow.get(3));
-                    double percent = Math.min(100.0, tableRow / Math.max(totalRows.doubleValue(), 1));
-                    String phyDb = partitionPyhDbMap.get(record.partName);
+                            schemaName, tableMeta.getTableName(), record.getLocation().getPhyTableName()));
+
+                    String partName = DataTypes.StringType.convertFrom(tableStatRow.get("partName"));
+                    String subpartName = DataTypes.StringType.convertFrom(tableStatRow.get("subpartName"));
+                    String subpartTemplateName =
+                        DataTypes.StringType.convertFrom(tableStatRow.get("subpartTemplateName"));
+                    Long phyPartPosition = DataTypes.LongType.convertFrom(tableStatRow.get("phyPartPosition"));
+                    String boundValue = DataTypes.StringType.convertFrom(tableStatRow.get("boundValue"));
+                    String subBoundValue = DataTypes.StringType.convertFrom(tableStatRow.get("subBoundValue"));
+
+                    Long physicalTableRows = DataTypes.LongType.convertFrom(tableStatRow.get("physicalTableRows"));
+                    Long physicalDataLength = DataTypes.LongType.convertFrom(tableStatRow.get("physicalDataLength"));
+                    Long physicalIndexLength = DataTypes.LongType.convertFrom(tableStatRow.get("physicalIndexLength"));
+
+                    Long physicalRowsRead = 0L;
+                    if (tableStatRow.containsKey("physicalRowsRead")) {
+                        physicalRowsRead = DataTypes.LongType.convertFrom(tableStatRow.get("physicalRowsRead"));
+                    }
+
+                    Long physicalRowsInserted = 0L;
+                    if (tableStatRow.containsKey("physicalRowsInserted")) {
+                        physicalRowsInserted = DataTypes.LongType.convertFrom(tableStatRow.get("physicalRowsInserted"));
+                    }
+
+                    Long physicalRowsUpdated = 0L;
+                    if (tableStatRow.containsKey("physicalRowsUpdated")) {
+                        physicalRowsUpdated = DataTypes.LongType.convertFrom(tableStatRow.get("physicalRowsUpdated"));
+                    }
+
+                    Long physicalRowsDeleted = 0L;
+                    if (tableStatRow.containsKey("physicalRowsDeleted")) {
+                        physicalRowsDeleted = DataTypes.LongType.convertFrom(tableStatRow.get("physicalRowsDeleted"));
+                    }
+
+                    double percent = Math.min(100.0, physicalTableRows / Math.max(totalRows.doubleValue(), 1));
+                    /**
+                     * fetch phyDb by the phyPartName of phySpec
+                     */
+                    String phyDb = partitionPyhDbMap.get(record.getName());
+
                     Pair<String/**storageInstId**/, String/**groupName**/> pair = storageInstIdGroupNames.get(phyDb);
                     String storageInstId = pair.getKey();
                     String groupName = pair.getValue();
+                    String phyTblName = record.getLocation().getPhyTableName();
 
-                    Object[] row = new Object[18];
+                    Object[] row = new Object[21];
                     cursor.addRow(row);
                     int index = 0;
+
                     row[index++] = DataTypes.StringType.convertFrom(schemaName);
                     row[index++] = DataTypes.StringType.convertFrom(tableGroupConfig.getTableGroupRecord().tg_name);
                     row[index++] = DataTypes.StringType.convertFrom(logicalTableName);
                     row[index++] = tableMeta.isGsi() ? indexName : StringUtils.EMPTY;
-                    row[index++] = DataTypes.StringType.convertFrom(record.phyTable);
+                    row[index++] = DataTypes.StringType.convertFrom(phyTblName);
 
-                    row[index++] = DataTypes.ULongType.convertFrom(i);
-                    row[index++] = DataTypes.StringType.convertFrom(record.partName);
-                    row[index++] = DataTypes.ULongType.convertFrom(tableRow);
-                    row[index++] = DataTypes.ULongType.convertFrom(tableStatRow.get(4));
-                    row[index++] = DataTypes.ULongType.convertFrom(tableStatRow.get(5));
-                    row[index++] = DataTypes.StringType.convertFrom(tableStatRow.get(0));
+                    // PARTITION_SEQ
+                    row[index++] = DataTypes.ULongType.convertFrom(phyPartPosition);
+                    // PARTITION_NAME
+                    row[index++] = DataTypes.StringType.convertFrom(partName);
+                    // SUBPARTITION_NAME
+                    row[index++] = DataTypes.StringType.convertFrom(subpartName);
+                    // SUBPARTITION_TEMPLATE_NAME
+                    row[index++] = DataTypes.StringType.convertFrom(subpartTemplateName);
+
+                    // TABLE_ROWS
+                    row[index++] = DataTypes.ULongType.convertFrom(physicalTableRows);
+                    // DATA_LENGTH
+                    row[index++] = DataTypes.ULongType.convertFrom(physicalDataLength);
+                    // INDEX_LENGTH
+                    row[index++] = DataTypes.ULongType.convertFrom(physicalIndexLength);
+
+                    // BOUND_VALUE, a complete interval with lower_bnd and upper_bnd for part
+                    row[index++] = DataTypes.StringType.convertFrom(boundValue);
+                    // SUB_BOUND_VALUE, a complete interval with lower_bnd and upper_bnd for subpart
+                    row[index++] = DataTypes.StringType.convertFrom(subBoundValue);
+
+                    // PERCENT
                     row[index++] = DataTypes.StringType.convertFrom(getPercentString(percent));
+                    // STORAGE_INST_ID
                     row[index++] = DataTypes.StringType.convertFrom(storageInstId);
+                    // GROUP_NAME
                     row[index++] = DataTypes.StringType.convertFrom(groupName);
 
-                    if (tableStatRow.size() > 6) {
-                        for (int k = 6; k < 10; k++) {
-                            if (tableStatRow.get(k) != null) {
-                                row[k + 8] = DataTypes.ULongType.convertFrom(tableStatRow.get(k));
-                            }
-                        }
-                    }
+                    // ROWS_READ
+                    row[index++] = DataTypes.ULongType.convertFrom(physicalRowsRead);
+
+                    // ROWS_INSERTED
+                    row[index++] = DataTypes.ULongType.convertFrom(physicalRowsInserted);
+
+                    // ROWS_UPDATED
+                    row[index++] = DataTypes.ULongType.convertFrom(physicalRowsUpdated);
+
+                    // ROWS_DELETED
+                    row[index++] = DataTypes.ULongType.convertFrom(physicalRowsDeleted);
+
                 }
             }
         }

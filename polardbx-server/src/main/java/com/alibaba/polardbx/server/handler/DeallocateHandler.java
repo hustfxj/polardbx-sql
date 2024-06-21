@@ -16,7 +16,7 @@
 
 package com.alibaba.polardbx.server.handler;
 
-import com.alibaba.polardbx.ErrorCode;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.net.compress.PacketOutputProxyFactory;
 import com.alibaba.polardbx.net.packet.OkPacket;
 import com.alibaba.polardbx.server.ServerConnection;
@@ -32,29 +32,29 @@ import java.sql.SQLSyntaxErrorException;
  */
 public final class DeallocateHandler {
 
-    public static void handle(ByteString stmt, ServerConnection c, boolean hasMore, boolean inProcedureCall) {
+    public static boolean handle(ByteString stmt, ServerConnection c, boolean hasMore, boolean inProcedureCall) {
 
         try {
-            parseAndRemove(stmt, c.getSmForQuery());
+            parseAndRemove(stmt, c);
 
             if (!inProcedureCall) {
                 // return OK
                 PacketOutputProxyFactory.getInstance().createProxy(c)
                     .writeArrayAsPacket(hasMore ? OkPacket.OK_WITH_MORE : OkPacket.OK);
             }
+            return true;
         } catch (SQLSyntaxErrorException e) {
             c.writeErrMessage(ErrorCode.ER_PARSE_ERROR, "Parse '" + stmt + "'");
-        } finally {
-
+            return false;
         }
     }
 
-    private static void parseAndRemove(ByteString sql, StatementMap map) throws SQLSyntaxErrorException {
+    private static void parseAndRemove(ByteString sql, ServerConnection c) throws SQLSyntaxErrorException {
         try {
             MysqlDeallocatePrepareStatement statement =
                 (MysqlDeallocatePrepareStatement) FastsqlUtils.parseSql(sql).get(0);
             String name = statement.getStatementName().getSimpleName();
-            map.delete(name);
+            c.removePreparedCache(name, false);
         } catch (Exception e) {
             throw new SQLSyntaxErrorException("deallocate prepare statement error", e);
         }

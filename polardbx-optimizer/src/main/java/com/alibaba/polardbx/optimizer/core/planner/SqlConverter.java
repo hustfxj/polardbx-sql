@@ -54,13 +54,16 @@ import org.apache.calcite.prepare.CalciteCatalogReader;
 import org.apache.calcite.rel.RelCollationTraitDef;
 import org.apache.calcite.rel.RelDistributionTraitDef;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelPartitionWiseTraitDef;
 import org.apache.calcite.rel.RelRoot;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlAlterSpecification;
 import org.apache.calcite.sql.SqlBasicCall;
+import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlInsert;
 import org.apache.calcite.sql.SqlKind;
@@ -150,6 +153,10 @@ public class SqlConverter {
         validator.setAutoPartitionDatabase(autoModeDb);
     }
 
+    public void setDefaultSingle(boolean isDefaultSingle) {
+        validator.setDefaultSingle(isDefaultSingle);
+    }
+
     public SqlNode validate(final SqlNode parsedNode) {
         checkSqlKindSupport(parsedNode);
         SqlNode validatedNode;
@@ -157,7 +164,11 @@ public class SqlConverter {
             validatedNode = validator.validate(parsedNode);
         } catch (Exception e) {
             logger.error("Sql validate error : " + parsedNode, e);
-            throw new SqlValidateException(e, e.getMessage());
+            if (ErrorCode.match(e.getMessage())) {
+                throw e;
+            } else {
+                throw new SqlValidateException(e, e.getMessage());
+            }
         }
         return validatedNode;
     }
@@ -166,7 +177,7 @@ public class SqlConverter {
         if (!OptimizerUtils.supportedSqlKind(ast)) {
             throw new TddlRuntimeException(ErrorCode.ERR_NOT_SUPPORT, "Unsupported SQL kind: " + ast.getKind());
         }
-        if (ConfigDataMode.isSlaveMode() && SqlKind.DDL.contains(ast.getKind())) {
+        if (ConfigDataMode.isReadOnlyMode() && SqlKind.DDL.contains(ast.getKind())) {
             throw new TddlRuntimeException(ErrorCode.ERR_OPERATION_NOT_ALLOWED,
                 "DDL Operations are not allowed on a Read-Only Instance.");
         }
@@ -226,6 +237,7 @@ public class SqlConverter {
         planner.addRelTraitDef(ConventionTraitDef.INSTANCE);
         planner.addRelTraitDef(RelCollationTraitDef.INSTANCE);
         planner.addRelTraitDef(RelDistributionTraitDef.INSTANCE);
+        planner.addRelTraitDef(RelPartitionWiseTraitDef.INSTANCE);
         RelOptCluster relOptCluster = RelOptCluster.create(planner, rexBuilder);
         relOptCluster.setMetadataProvider(DrdsRelMetadataProvider.INSTANCE);
         return relOptCluster;
@@ -400,5 +412,71 @@ public class SqlConverter {
             converterConfig,
             plannerContext);
         return sqlToRelConverter.getRexInfoFromPartition(sqlPartitionBy);
+    }
+
+    public Map<SqlNode, RexNode> convertPartition(SqlPartitionBy sqlPartitionBy,
+                                                  final PlannerContext plannerContext) {
+        final RelOptCluster cluster = createRelOptCluster(plannerContext);
+        final SqlToRelConverter sqlToRelConverter = new TddlSqlToRelConverter(null,
+            validator,
+            catalog,
+            cluster,
+            StandardConvertletTable.INSTANCE,
+            converterConfig,
+            plannerContext);
+        return sqlToRelConverter.convertPartition(sqlPartitionBy);
+    }
+
+    public Map<SqlNode, RexNode> getRexInfoFromSqlAlterSpec(SqlNode parentNode,
+                                                            List<SqlAlterSpecification> sqlAlterSpecifications,
+                                                            final PlannerContext plannerContext) {
+        final RelOptCluster cluster = createRelOptCluster(plannerContext);
+        final SqlToRelConverter sqlToRelConverter = new TddlSqlToRelConverter(null,
+            validator,
+            catalog,
+            cluster,
+            StandardConvertletTable.INSTANCE,
+            converterConfig,
+            plannerContext);
+        validate(parentNode);
+        return sqlToRelConverter.getRexInfoFromSqlAlterSpec(sqlAlterSpecifications);
+    }
+
+    public List<RexNode> getRexForGeneratedColumn(RelDataType rowType, List<SqlCall> sqlCalls,
+                                                  final PlannerContext plannerContext) {
+        final RelOptCluster cluster = createRelOptCluster(plannerContext);
+        final SqlToRelConverter sqlToRelConverter = new TddlSqlToRelConverter(null,
+            validator,
+            catalog,
+            cluster,
+            StandardConvertletTable.INSTANCE,
+            converterConfig,
+            plannerContext);
+        return sqlToRelConverter.getRexForGeneratedColumn(rowType, sqlCalls);
+    }
+
+    public RexNode getRexForDefaultExpr(RelDataType rowType, SqlCall sqlCall,
+                                        final PlannerContext plannerContext) {
+        final RelOptCluster cluster = createRelOptCluster(plannerContext);
+        final SqlToRelConverter sqlToRelConverter = new TddlSqlToRelConverter(null,
+            validator,
+            catalog,
+            cluster,
+            StandardConvertletTable.INSTANCE,
+            converterConfig,
+            plannerContext);
+        return sqlToRelConverter.getRexForDefaultExpr(rowType, sqlCall);
+    }
+
+    public SqlCall getValidatedSqlCallForGeneratedColumn(String tableName, SqlCall sqlCall) {
+        // TODO(qianjing): check here
+        final SqlNodeList selectList = new SqlNodeList(SqlParserPos.ZERO);
+        String alias = SqlUtil.deriveAliasFromOrdinal(0);
+        selectList.add(SqlValidatorUtil.addAlias(sqlCall, alias));
+        SqlNode sourceTable = new SqlIdentifier(tableName, SqlParserPos.ZERO);
+        SqlSelect sqlSelect = new SqlSelect(SqlParserPos.ZERO, null, selectList, sourceTable,
+            null, null, null, null, null, null, null);
+        validator.validate(sqlSelect);
+        return (SqlCall) ((SqlCall) (sqlSelect.getSelectList().get(0))).getOperandList().get(0);
     }
 }

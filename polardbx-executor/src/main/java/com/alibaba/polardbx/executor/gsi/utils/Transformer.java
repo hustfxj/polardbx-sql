@@ -18,6 +18,8 @@ package com.alibaba.polardbx.executor.gsi.utils;
 
 import com.alibaba.polardbx.common.datatype.Decimal;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
+import com.alibaba.polardbx.common.exception.TddlRuntimeException;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.jdbc.ParameterMethod;
 import com.alibaba.polardbx.common.jdbc.ZeroDate;
@@ -35,7 +37,7 @@ import com.alibaba.polardbx.statistics.SQLRecorderLogger;
 import com.google.common.base.Preconditions;
 import com.google.common.io.BaseEncoding;
 import io.airlift.slice.Slice;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang.StringUtils;
 
 import java.math.BigInteger;
 import java.nio.charset.Charset;
@@ -43,6 +45,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.BiFunction;
 
 /**
@@ -57,7 +60,7 @@ public class Transformer {
      * @param defaultGen Default upper bound generator for empty source table
      * @return Parameter list for data extraction
      */
-    public static List<Map<Integer, ParameterContext>> convertUpperBoundWithDefault(Cursor cursor,
+    public static List<Map<Integer, ParameterContext>> convertUpperBoundWithDefault(Cursor cursor, boolean useBinary,
                                                                                     BiFunction<ColumnMeta, Integer,
                                                                                         ParameterContext> defaultGen) {
         final List<Map<Integer, ParameterContext>> batchParams = new ArrayList<>();
@@ -69,7 +72,7 @@ public class Transformer {
             final Map<Integer, ParameterContext> params = new HashMap<>(columns.size());
             for (int i = 0; i < columns.size(); i++) {
 
-                ParameterContext pc = buildColumnParam(row, i);
+                ParameterContext pc = buildColumnParam(row, i, useBinary);
 
                 final DataType columnType = columns.get(i).getDataType();
                 if (DataTypeUtil.anyMatchSemantically(columnType, DataTypes.FloatType, DataTypes.DoubleType)) {
@@ -105,13 +108,51 @@ public class Transformer {
         return batchParams;
     }
 
+    public static List<Map<Integer, ParameterContext>> convertUpperBoundWithDefaultForFastChecker(Cursor cursor,
+                                                                                                  boolean useBinary,
+                                                                                                  List<List<Object>> rowValues) {
+        final List<Map<Integer, ParameterContext>> batchParams = new ArrayList<>();
+
+        Row row;
+        while ((row = cursor.next()) != null) {
+            final List<ColumnMeta> columns = row.getParentCursorMeta().getColumns();
+
+            final Map<Integer, ParameterContext> params = new HashMap<>(columns.size());
+            final List<Object> rowValue = new ArrayList<>();
+            for (int i = 0; i < columns.size(); i++) {
+                rowValue.add(row.getObject(i));
+                if (row.getObject(i) == null) {
+                    throw new TddlRuntimeException(ErrorCode.ERR_FAST_CHECKER,
+                        "fastchecker failed because found null value in sampled primary keys");
+                }
+                ParameterContext pc = buildColumnParam(row, i, useBinary);
+
+                final DataType columnType = columns.get(i).getDataType();
+                if (DataTypeUtil.anyMatchSemantically(columnType, DataTypes.FloatType, DataTypes.DoubleType)) {
+                    if (null != pc.getArgs()[1]) {
+                        // For float value like "-100.003", query like "c_float <= -100.003" returns nothing.
+                        // Should replace upper bound with "c_float <= -100"
+                        pc = new ParameterContext(pc.getParameterMethod(),
+                            new Object[] {pc.getArgs()[0], Math.ceil((Double) pc.getArgs()[1])});
+                    }
+                }
+
+                params.put(i + 1, pc);
+            }
+            rowValues.add(rowValue);
+            batchParams.add(params);
+        }
+        return batchParams;
+    }
+
     /**
      * Build batch insert parameter, from the results of select
      *
      * @param cursor result cursor of select
      * @return batch parameters for insert
      */
-    public static List<Map<Integer, ParameterContext>> buildBatchParam(Cursor cursor) {
+    public static List<Map<Integer, ParameterContext>> buildBatchParam(Cursor cursor, boolean useBinary,
+                                                                       Set<String> notConvertColumns) {
         final List<Map<Integer, ParameterContext>> batchParams = new ArrayList<>();
 
         Row row;
@@ -120,8 +161,11 @@ public class Transformer {
 
             final Map<Integer, ParameterContext> params = new HashMap<>(columns.size());
             for (int i = 0; i < columns.size(); i++) {
+                ColumnMeta columnMeta = columns.get(i);
+                String colName = columnMeta.getName();
+                boolean canConvert = useBinary && (notConvertColumns == null || !notConvertColumns.contains(colName));
 
-                final ParameterContext parameterContext = buildColumnParam(row, i);
+                final ParameterContext parameterContext = buildColumnParam(row, i, canConvert);
 
                 params.put(i + 1, parameterContext);
             }
@@ -131,6 +175,10 @@ public class Transformer {
         return batchParams;
     }
 
+    public static ParameterContext buildColumnParam(Row row, int i) {
+        return buildColumnParam(row, i, false);
+    }
+
     /**
      * Build column parameter for insert，from the results of select
      *
@@ -138,7 +186,7 @@ public class Transformer {
      * @param i column index, start from 0
      * @return ParameterContext for specified column
      */
-    public static ParameterContext buildColumnParam(Row row, int i) {
+    public static ParameterContext buildColumnParam(Row row, int i, boolean strToBinary) {
         DataType columnType = DataTypes.BinaryType;
         Object value = null;
         ParameterMethod method = ParameterMethod.setObject1;
@@ -146,9 +194,13 @@ public class Transformer {
             columnType = row.getParentCursorMeta().getColumnMeta(i).getDataType();
             value = row.getObject(i);
 
-            if (value instanceof ZeroDate || value instanceof ZeroTimestamp || value instanceof ZeroTime || value instanceof Decimal) {
+            if (value instanceof ZeroDate || value instanceof ZeroTimestamp || value instanceof ZeroTime
+                || value instanceof Decimal) {
                 // 针对 0000-00-00 的时间类型 setObject 会失败，setString 没问题
                 value = value.toString();
+                method = ParameterMethod.setString;
+            } else if (value instanceof Slice) {
+                value = ((Slice) value).toStringUtf8();
                 method = ParameterMethod.setString;
             } else if (value instanceof Slice) {
                 value = ((Slice) value).toStringUtf8();
@@ -181,6 +233,10 @@ public class Transformer {
                     // 使用 setBytes 标记，序列化时使用16进制字符串
                     value = row.getBytes(i);
                     method = ParameterMethod.setBytes;
+                } else if (strToBinary && DataTypeUtil.isStringType(columnType)) {
+                    // 字符串类型，直接select binary得到二进制数，直接setBytes，避免字符集转换带来的损失
+                    value = row.getBytes(i);
+                    method = ParameterMethod.setBytes;
                 }
             }
         } catch (TddlNestableRuntimeException e) {
@@ -200,7 +256,9 @@ public class Transformer {
     public static Map<Integer, ParameterContext> buildColumnParam(
         List<ColumnMeta> columnMetaList, List<String> values, Charset charset, PropUtil.LOAD_NULL_MODE defaultMode) {
         Preconditions.checkArgument(
-            values.size() == columnMetaList.size(), "The column's length less than the values' length");
+            values.size() == columnMetaList.size(),
+            String.format("The column's length is %s, while the value's length is %s", columnMetaList.size(),
+                values.size()));
         final Map<Integer, ParameterContext> parameterContexts = new HashMap<>();
         ParameterMethod method = null;
         for (int i = 0; i < columnMetaList.size(); i++) {

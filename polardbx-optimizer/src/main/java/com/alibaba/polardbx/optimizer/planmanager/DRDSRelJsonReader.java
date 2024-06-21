@@ -36,6 +36,7 @@ import org.apache.calcite.rel.RelCollations;
 import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelInput;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelPartitionWise;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.CorrelationId;
 import org.apache.calcite.rel.core.GroupConcatAggregateCall;
@@ -173,7 +174,6 @@ public class DRDSRelJsonReader {
         Integer relatedId = null;
         if (jsonRel.get("relatedId") instanceof Integer) {
             relatedId = (Integer) jsonRel.get("relatedId");
-            ;
         } else {
             relatedId = null;
         }
@@ -442,6 +442,10 @@ public class DRDSRelJsonReader {
                 return relJson.toDistribution((Map<String, Object>) get("distribution"));
             }
 
+            public RelPartitionWise getPartitionWise() {
+                return relJson.toPartitionWise((Map<String, Object>) get("partitionWise"));
+            }
+
             public ImmutableList<ImmutableList<RexLiteral>> getTuples(String tag) {
                 //noinspection unchecked
                 final List<List> jsonTuples = (List) get(tag);
@@ -485,8 +489,8 @@ public class DRDSRelJsonReader {
             public ImmutableSet<CorrelationId> getVariablesSet() {
                 if (jsonRel.get("variablesSet") != null) {
                     Set<CorrelationId> correlationIdSet = new HashSet<>();
-                    for (Object id : (List)jsonRel.get("variablesSet")) {
-                        correlationIdSet.add(new CorrelationId(((Number)id).intValue()));
+                    for (Object id : (List) jsonRel.get("variablesSet")) {
+                        correlationIdSet.add(new CorrelationId(((Number) id).intValue()));
                     }
                     return ImmutableSet.copyOf(correlationIdSet);
                 } else {
@@ -497,6 +501,7 @@ public class DRDSRelJsonReader {
             public void setLastRel(RelNode relNode) {
                 that.setLastRel(relNode);
             }
+
             public RelNode getLastRel() {
                 return that.getLastRel();
             }
@@ -748,6 +753,10 @@ public class DRDSRelJsonReader {
                 return relJson.toDistribution((Map<String, Object>) get("distribution"));
             }
 
+            public RelPartitionWise getPartitionWise() {
+                return relJson.toPartitionWise((Map<String, Object>) get("partitionWise"));
+            }
+
             public ImmutableList<ImmutableList<RexLiteral>> getTuples(String tag) {
                 //noinspection unchecked
                 final List<List> jsonTuples = (List) get(tag);
@@ -791,8 +800,8 @@ public class DRDSRelJsonReader {
             public ImmutableSet<CorrelationId> getVariablesSet() {
                 if (jsonRel.get("variablesSet") != null) {
                     Set<CorrelationId> correlationIdSet = new HashSet<>();
-                    for (Object id : (List)jsonRel.get("variablesSet")) {
-                        correlationIdSet.add(new CorrelationId(((Number)id).intValue()));
+                    for (Object id : (List) jsonRel.get("variablesSet")) {
+                        correlationIdSet.add(new CorrelationId(((Number) id).intValue()));
                     }
                     return ImmutableSet.copyOf(correlationIdSet);
                 } else {
@@ -803,6 +812,7 @@ public class DRDSRelJsonReader {
             public void setLastRel(RelNode relNode) {
                 that.setLastRel(relNode);
             }
+
             public RelNode getLastRel() {
                 return that.getLastRel();
             }
@@ -846,6 +856,7 @@ public class DRDSRelJsonReader {
     public RelNode getLastRel() {
         return lastRel;
     }
+
     public void setLastRel(RelNode lastRel) {
         this.lastRel = lastRel;
     }

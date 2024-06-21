@@ -51,7 +51,9 @@ public class MoveTableChecker extends Checker {
                             TableMeta gsiTableMeta, long batchSize,
                             long speedMin,
                             long speedLimit,
-                            long parallelism, SqlSelect.LockMode primaryLock,
+                            long parallelism,
+                            boolean useBinary,
+                            SqlSelect.LockMode primaryLock,
                             SqlSelect.LockMode gsiLock,
                             PhyTableOperation planSelectWithMaxPrimary,
                             PhyTableOperation planSelectWithMaxGsi,
@@ -66,7 +68,7 @@ public class MoveTableChecker extends Checker {
                             Map<String, Set<String>> targetTargetTables,
                             Map<String, String> sourceTargetGroupMap) {
         super(schemaName, tableName, indexName, primaryTableMeta, gsiTableMeta, batchSize, speedMin, speedLimit,
-            parallelism,
+            parallelism, useBinary,
             primaryLock, gsiLock, planSelectWithMaxPrimary, planSelectWithMaxGsi, planSelectWithMinAndMaxPrimary,
             planSelectWithMinAndMaxGsi, planSelectWithInTemplate, planSelectWithIn, planSelectMaxPk, indexColumns,
             primaryKeysId, rowComparator);
@@ -76,8 +78,8 @@ public class MoveTableChecker extends Checker {
     }
 
     public static Checker create(String schemaName, String tableName, String indexName, long batchSize, long speedMin,
-                                 long speedLimit,
-                                 long parallelism, SqlSelect.LockMode primaryLock, SqlSelect.LockMode gsiLock,
+                                 long speedLimit, long parallelism, boolean useBinary,
+                                 SqlSelect.LockMode primaryLock, SqlSelect.LockMode gsiLock,
                                  ExecutionContext ec,
                                  Map<String, Set<String>> sourceTargetTables,
                                  Map<String, Set<String>> targetTargetTables,
@@ -93,9 +95,9 @@ public class MoveTableChecker extends Checker {
             .map(ColumnMeta::getName)
             .collect(Collectors.toList());
 
-        Extractor.ExtractorInfo info = Extractor.buildExtractorInfo(ec, schemaName, tableName, indexName);
+        Extractor.ExtractorInfo info = Extractor.buildExtractorInfo(ec, schemaName, tableName, indexName, false);
 
-        final PhysicalPlanBuilder builder = new PhysicalPlanBuilder(schemaName, ec);
+        final PhysicalPlanBuilder builder = new PhysicalPlanBuilder(schemaName, useBinary, ec);
 
         final Pair<SqlSelect, PhyTableOperation> selectWithIn = builder
             .buildSelectWithInForChecker(baseTableMeta, info.getTargetTableColumns(), info.getPrimaryKeys(),
@@ -126,6 +128,7 @@ public class MoveTableChecker extends Checker {
             speedMin,
             speedLimit,
             parallelism,
+            useBinary,
             primaryLock,
             gsiLock,
             builder.buildSelectForBackfill(info.getSourceTableMeta(), info.getTargetTableColumns(),

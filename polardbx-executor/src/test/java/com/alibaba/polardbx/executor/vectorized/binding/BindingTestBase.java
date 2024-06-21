@@ -23,8 +23,6 @@ import com.alibaba.polardbx.executor.vectorized.VectorizedExpression;
 import com.alibaba.polardbx.executor.vectorized.VectorizedExpressionUtils;
 import com.alibaba.polardbx.executor.vectorized.build.VectorizedExpressionBuilder;
 import com.alibaba.polardbx.gms.config.impl.MetaDbInstConfigManager;
-import com.alibaba.polardbx.optimizer.config.table.statistic.MockStatisticDatasource;
-import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
 import com.alibaba.polardbx.gms.metadb.table.IndexStatus;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.PlannerContext;
@@ -35,6 +33,8 @@ import com.alibaba.polardbx.optimizer.config.table.Field;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager;
 import com.alibaba.polardbx.optimizer.config.table.SchemaManager;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
+import com.alibaba.polardbx.optimizer.config.table.statistic.MockStatisticDatasource;
+import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
 import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.TddlJavaTypeFactoryImpl;
@@ -86,6 +86,7 @@ import org.junit.Assert;
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.InputStream;
+import java.util.Collection;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
@@ -181,6 +182,7 @@ public class BindingTestBase {
     protected Map<String, String> expectedPlans;
 
     protected BindingTestBase() {
+        ConfigDataMode.setMode(ConfigDataMode.Mode.MOCK);
         this.executionContext = new ExecutionContext();
         this.fp = new FastsqlParser();
         this.typeFactory = new TddlTypeFactoryImpl(TddlRelDataTypeSystemImpl.getInstance());
@@ -399,6 +401,11 @@ public class BindingTestBase {
                     this.hashCode());
                 throw new RuntimeException(error);
             }
+        }
+
+        @Override
+        public Collection<TableMeta> getAllTables() {
+            return tableMetaMap.values();
         }
 
         @Override

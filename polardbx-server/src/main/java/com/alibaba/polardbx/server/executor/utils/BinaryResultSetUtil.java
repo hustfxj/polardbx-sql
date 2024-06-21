@@ -18,6 +18,7 @@ package com.alibaba.polardbx.server.executor.utils;
 
 import com.alibaba.druid.proxy.jdbc.ResultSetMetaDataProxy;
 import com.alibaba.polardbx.common.charset.CharsetName;
+import com.alibaba.polardbx.common.encdb.EncdbException;
 import com.alibaba.polardbx.common.exception.NotSupportException;
 import com.alibaba.polardbx.matrix.jdbc.TResultSetMetaData;
 import com.alibaba.polardbx.net.buffer.ByteBufferHolder;
@@ -35,6 +36,7 @@ import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
 import com.alibaba.polardbx.optimizer.planmanager.PreparedStmtCache;
 import com.alibaba.polardbx.server.ServerConnection;
 import com.alibaba.polardbx.server.conn.ResultSetCachedObj;
+import com.alibaba.polardbx.server.encdb.EncdbResultSet;
 import com.alibaba.polardbx.server.util.StringUtil;
 import com.mysql.jdbc.Field;
 
@@ -59,6 +61,10 @@ public class BinaryResultSetUtil {
                                                        AtomicLong affectRow, PreparedStmtCache preparedStmtCache,
                                                        long sqlSelectLimit)
         throws SQLException, IllegalAccessException {
+        if (rs instanceof EncdbResultSet) {
+            throw new EncdbException("Encdb only support text protocol");
+        }
+
         // 先执行一次next，因为存在lazy-init处理，可能写了packet head包出去，但实际获取数据时出错导致客户端出现lost
         // connection，没有任何其他异常
         boolean existNext = rs.next();
@@ -77,13 +83,15 @@ public class BinaryResultSetUtil {
      * Only return header packet (without data).
      */
     public static IPacketOutputProxy resultSetToHeaderPacket(ResultSetCachedObj resultSetCachedObj,
-                                                             ServerConnection c, PreparedStmtCache preparedStmtCache)
+                                                             ServerConnection c, PreparedStmtCache preparedStmtCache,
+                                                             AtomicLong affectRows)
         throws SQLException, IllegalAccessException {
         // Call the resultSet.next() to actually execute the physical sql
         // and generate data. If the result set is empty, set the last row flag.
         final ResultSet rs = resultSetCachedObj.getResultSet();
         resultSetCachedObj.setLastRow(!rs.next());
         resultSetCachedObj.setFirstRow(true);
+        affectRows.set(resultSetCachedObj.getRowCount());
 
         final MysqlBinaryResultSetPacket packet = new MysqlBinaryResultSetPacket();
         final Set<Integer> undecidedTypeIndexes = new HashSet<>();
@@ -125,12 +133,15 @@ public class BinaryResultSetUtil {
             // For the first row, the rs.next() is already called when the header packet is sent.
             // So do not call it again or we will miss the first row of data.
             if (!resultSetCachedObj.isFirstRow()) {
-                resultSetCachedObj.setLastRow(!rs.next());
+                if (!resultSetCachedObj.isLastRow()) {
+                    resultSetCachedObj.setLastRow(!rs.next());
+                }
             } else {
                 resultSetCachedObj.setFirstRow(false);
             }
 
             if (resultSetCachedObj.isLastRow()) {
+                resultSetCachedObj.close();
                 break;
             }
 
@@ -223,8 +234,6 @@ public class BinaryResultSetUtil {
                         packet.fieldPackets[i].orgName =
                             StringUtil.encode_0(((TResultSetMetaData) metaData).getOriginColumnName(j),
                                 javaCharset);
-                        packet.fieldPackets[i].orgName =
-                            StringUtil.encode_0(metaData.getColumnName(j), javaCharset);
                         packet.fieldPackets[i].name =
                             StringUtil.encode_0(metaData.getColumnLabel(j), javaCharset);
                         packet.fieldPackets[i].orgTable =
@@ -291,7 +300,6 @@ public class BinaryResultSetUtil {
             do {
                 if (sqlSelectLimit != ResultSetUtil.NO_SQL_SELECT_LIMIT
                     && sqlSelectLimit < ResultSetUtil.MAX_SQL_SELECT_LIMIT && sqlSelectLimit-- <= 0L) {
-                    rs.close();
                     break;
                 }
                 final BinaryRowDataPacket row =

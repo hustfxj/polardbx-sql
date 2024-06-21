@@ -19,7 +19,23 @@ package com.alibaba.polardbx.common.utils;
 
 public enum InstanceRole {
 
+    /**
+     * 云上主实例
+     */
     MASTER,
 
-    LEARNER
+    /**
+     * 行存只读实例
+     */
+    ROW_SLAVE,
+
+    /**
+     * 列存只读实例
+     */
+    COLUMNAR_SLAVE,
+
+    /**
+     * MOCK模式
+     */
+    FAST_MOCK
 }

@@ -23,7 +23,7 @@ import com.alibaba.polardbx.common.utils.time.MySQLTimeConverter;
 import com.alibaba.polardbx.common.utils.time.core.MySQLTimeVal;
 import com.alibaba.polardbx.common.utils.time.core.MysqlDateTime;
 import com.alibaba.polardbx.common.utils.time.parser.TimeParserFlags;
-import com.alibaba.polardbx.common.charset.CharsetHandler;
+import com.alibaba.polardbx.optimizer.config.table.charset.CharsetHandler;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
 import com.alibaba.polardbx.rpc.compatible.XResultSet;
 import com.alibaba.polardbx.rpc.result.XResult;
@@ -41,6 +41,8 @@ import java.util.List;
 
 public abstract class AbstractStorageField implements StorageField {
     protected static final int UNSET_PACKET_LEN = -1;
+
+    protected static final long NULL_HASH_CODE = 0L;
     /**
      * The field type of partition key.
      */

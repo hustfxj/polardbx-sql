@@ -16,22 +16,30 @@
 
 package com.alibaba.polardbx.executor.ddl.job.factory;
 
+import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
-import com.alibaba.polardbx.executor.ddl.job.task.basic.RenamePartitionTablePhyDdlTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.RenameTableAddMetaTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.RenameTablePhyDdlTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.RenameTableSyncTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.RenameTableUpdateMetaTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.RenameTableValidateTask;
-import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.UnBindingArchiveTableMetaByArchiveTableTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.TableSyncTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.UnBindingArchiveTableMetaDirectTask;
+import com.alibaba.polardbx.executor.ddl.job.task.gsi.ValidateTableVersionTask;
 import com.alibaba.polardbx.executor.ddl.job.validator.GsiValidator;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJobFactory;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
-import com.alibaba.polardbx.gms.topology.DbInfoManager;
+import com.alibaba.polardbx.optimizer.OptimizerContext;
+import com.alibaba.polardbx.optimizer.archive.CheckOSSArchiveUtil;
+import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.google.common.collect.Lists;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 public class RecycleOssTableJobFactory extends DdlJobFactory {
@@ -40,13 +48,19 @@ public class RecycleOssTableJobFactory extends DdlJobFactory {
     private final String schemaName;
     private final String logicalTableName;
     private final String newLogicalTableName;
+    private final boolean needRenamePhyTable;
     private final ExecutionContext executionContext;
+
+    private String sourceSchemaName;
+
+    private String sourceTableName;
 
     public RecycleOssTableJobFactory(PhysicalPlanData physicalPlanData, ExecutionContext executionContext) {
         this.physicalPlanData = physicalPlanData;
         this.schemaName = physicalPlanData.getSchemaName();
         this.logicalTableName = physicalPlanData.getLogicalTableName();
         this.newLogicalTableName = physicalPlanData.getNewLogicalTableName();
+        this.needRenamePhyTable = physicalPlanData.isRenamePhyTable();
         this.executionContext = executionContext;
     }
 
@@ -59,29 +73,47 @@ public class RecycleOssTableJobFactory extends DdlJobFactory {
     protected ExecutableDdlJob doCreate() {
         DdlTask validateTask = new RenameTableValidateTask(schemaName, logicalTableName, newLogicalTableName);
 
-        DdlTask unBindingTask = new UnBindingArchiveTableMetaByArchiveTableTask(schemaName, logicalTableName);
+        List<DdlTask> tasks = Lists.newArrayList();
+        tasks.add(validateTask);
+        Optional<Pair<String, String>> source = CheckOSSArchiveUtil.getTTLSource(schemaName, logicalTableName);
+        source.ifPresent(x -> {
+            sourceSchemaName = x.getKey();
+            sourceTableName = x.getValue();
+            TableMeta tm =
+                OptimizerContext.getContext(sourceSchemaName).getLatestSchemaManager().getTable(sourceTableName);
 
+            // validate version
+            Map<String, Long> tableVersions = new HashMap<>();
+            tableVersions.put(sourceTableName, tm.getVersion());
+            ValidateTableVersionTask validateTableVersionTask =
+                new ValidateTableVersionTask(sourceSchemaName, tableVersions);
+
+            // unbinding task
+            DdlTask unBindingTask = new UnBindingArchiveTableMetaDirectTask(sourceSchemaName, sourceTableName,
+                schemaName, logicalTableName);
+            TableSyncTask tableSyncTask = new TableSyncTask(sourceSchemaName, sourceTableName);
+            tasks.add(validateTableVersionTask);
+            tasks.add(unBindingTask);
+            tasks.add(tableSyncTask);
+        });
         DdlTask addMetaTask = new RenameTableAddMetaTask(schemaName, logicalTableName, newLogicalTableName);
-
-        DdlTask phyDdlTask;
-        boolean isNewPartitionDb = DbInfoManager.getInstance().isNewPartitionDb(schemaName);
-        if (isNewPartitionDb) {
-            phyDdlTask = new RenamePartitionTablePhyDdlTask(schemaName, physicalPlanData);
-        } else {
-            phyDdlTask = new RenameTablePhyDdlTask(schemaName, physicalPlanData).onExceptionTryRecoveryThenRollback();
-        }
-        DdlTask updateMetaTask = new RenameTableUpdateMetaTask(schemaName, logicalTableName, newLogicalTableName);
+        DdlTask phyDdlTask = new RenameTablePhyDdlTask(schemaName, physicalPlanData);
+        DdlTask updateMetaTask =
+            new RenameTableUpdateMetaTask(schemaName, logicalTableName, newLogicalTableName, needRenamePhyTable);
         DdlTask syncTask = new RenameTableSyncTask(schemaName, logicalTableName, newLogicalTableName);
+        TableSyncTask tableSyncTask = new TableSyncTask(schemaName, logicalTableName);
+        tasks.add(addMetaTask);
+        if (needRenamePhyTable) {
+            tasks.add(phyDdlTask);
+        }
+        tasks.addAll(Lists.newArrayList(
+            updateMetaTask,
+            syncTask,
+            tableSyncTask
+        ));
 
         ExecutableDdlJob executableDdlJob = new ExecutableDdlJob();
-        executableDdlJob.addSequentialTasks(Lists.newArrayList(
-            validateTask,
-            unBindingTask,
-            addMetaTask,
-            phyDdlTask,
-            updateMetaTask,
-            syncTask
-        ));
+        executableDdlJob.addSequentialTasks(tasks);
         executableDdlJob.labelAsHead(validateTask);
         return executableDdlJob;
     }
@@ -90,6 +122,9 @@ public class RecycleOssTableJobFactory extends DdlJobFactory {
     protected void excludeResources(Set<String> resources) {
         resources.add(concatWithDot(schemaName, logicalTableName));
         resources.add(concatWithDot(schemaName, newLogicalTableName));
+        if (sourceSchemaName != null && sourceTableName != null) {
+            resources.add(concatWithDot(sourceSchemaName, sourceTableName));
+        }
     }
 
     @Override

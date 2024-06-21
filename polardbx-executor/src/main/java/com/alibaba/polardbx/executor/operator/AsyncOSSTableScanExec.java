@@ -19,6 +19,7 @@ package com.alibaba.polardbx.executor.operator;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.bloomfilter.BloomFilterInfo;
+import com.alibaba.polardbx.executor.archive.reader.OSSColumnTransformer;
 import com.alibaba.polardbx.executor.archive.reader.SimpleOSSPhysicalTableReadResult;
 import com.alibaba.polardbx.executor.chunk.Chunk;
 import com.alibaba.polardbx.executor.chunk.MutableChunk;
@@ -73,6 +74,7 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         this.resultSetHandler = new SimpleOSSPhysicalTableReadResult(inProjectDataTypeList, context, ossTableScan);
     }
 
+    @Override
     public synchronized void initWaitFuture(ListenableFuture<List<BloomFilterInfo>> listListenableFuture) {
         this.client.initWaitFuture(listListenableFuture);
     }
@@ -101,7 +103,6 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
 
         // open prefetch threads
         client.executePrefetchThread();
-
         createBlockBuilders();
     }
 
@@ -109,7 +110,11 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
     Chunk doSourceNextChunk() {
         long fetchStartNano = System.nanoTime();
         try {
-            return fetchChunk();
+            Chunk chunk = fetchChunk();
+            if (chunk == null || chunk.getPositionCount() == 0) {
+                return null;
+            }
+            return chunk;
         } finally {
             fetchTimeCost.addAndGet(System.nanoTime() - fetchStartNano);
         }
@@ -131,8 +136,21 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
                 }
 
                 // if there are results in a chunk(using statistics), return the result directly
-                if (resultFromOSS.isChunk()) {
+                if (resultFromOSS.isChunk() && !resultFromOSS.isDelta()) {
                     return resultFromOSS.getChunk();
+                }
+
+                // read chunk result from delta cache
+                if (resultFromOSS.isChunk() && resultFromOSS.isDelta()) {
+                    Chunk result = resultFromOSS.getChunk();
+                    if (result == null) {
+                        // may impossible.
+                        return null;
+                    }
+
+                    int selSize = resultFromOSS.getSelSize();
+                    int[] selection = resultFromOSS.getSelection();
+                    return doConsumeChunk(result, selSize, selection);
                 }
 
                 // fetch the IO results.
@@ -142,13 +160,16 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
                     // Driver call the is_blocked.
                     return null;
                 }
-                return doConsumeBatch(batch);
+                int selSize = resultFromOSS.getSelSize();
+                int[] selection = resultFromOSS.getSelection();
+                return doConsumeBatch(
+                    batch, resultFromOSS.getOssColumnTransformer(), selSize, selection);
             }
         } finally {
             // restore the buffer to producer.
             if (resultFromOSS != null && resultFromOSS.shouldRecycle()) {
                 try {
-                    client.recycle(resultFromOSS.getBatch());
+                    client.recycle(resultFromOSS);
                 } catch (InterruptedException e) {
                     throw GeneralUtil.nestedException(e);
                 }
@@ -159,16 +180,38 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         while ((resultFromOSS = client.popResult()) != null) {
             try {
                 // if there are results in a chunk(using statistics), return the result directly
-                if (resultFromOSS.isChunk()) {
+                if (resultFromOSS.isChunk() && !resultFromOSS.isDelta()) {
                     return resultFromOSS.getChunk();
                 }
+
+                // read chunk result from delta cache
+                if (resultFromOSS.isChunk() && resultFromOSS.isDelta()) {
+                    Chunk result = resultFromOSS.getChunk();
+                    if (result == null) {
+                        // may impossible.
+                        return null;
+                    }
+
+                    int selSize = resultFromOSS.getSelSize();
+                    int[] selection = resultFromOSS.getSelection();
+                    return doConsumeChunk(result, selSize, selection);
+                }
+
                 // fetch the IO results.
-                return doConsumeBatch(resultFromOSS.getBatch());
+                VectorizedRowBatch batch = resultFromOSS.getBatch();
+                if (batch == null) {
+                    // impossible.
+                    return null;
+                }
+                int selSize = resultFromOSS.getSelSize();
+                int[] selection = resultFromOSS.getSelection();
+                return doConsumeBatch(
+                    batch, resultFromOSS.getOssColumnTransformer(), selSize, selection);
             } finally {
                 // restore the buffer to producer.
                 if (resultFromOSS != null && resultFromOSS.shouldRecycle()) {
                     try {
-                        client.recycle(resultFromOSS.getBatch());
+                        client.recycle(resultFromOSS);
                     } catch (InterruptedException e) {
                         throw GeneralUtil.nestedException(e);
                     }
@@ -183,15 +226,37 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
     }
 
     @Nullable
-    private Chunk doConsumeBatch(VectorizedRowBatch batch) {
+    private Chunk doConsumeBatch(VectorizedRowBatch batch,
+                                 OSSColumnTransformer ossColumnTransformer,
+                                 int selSize, int[] selection) {
         Chunk chunk;
         if (condition == null) {
             // for unconditional table scan
-            chunk = resultSetHandler.next(batch, inProjectDataTypeList, blockBuilders, context);
+            chunk = resultSetHandler.next(batch, ossColumnTransformer, inProjectDataTypeList, blockBuilders, context,
+                selSize, selection);
         } else {
             // for conditional table scan
-            chunk = resultSetHandler.next(batch, inProjectDataTypeList, blockBuilders, condition,
-                preAllocatedChunk, filterBitmap, outProject, context);
+            chunk = resultSetHandler.next(batch, ossColumnTransformer, inProjectDataTypeList, blockBuilders, condition,
+                preAllocatedChunk, filterBitmap, outProject, context, selSize, selection);
+        }
+
+        if (chunk != null) {
+            // reset block builders.
+            reset();
+            return chunk;
+        }
+        return null;
+    }
+
+    private Chunk doConsumeChunk(Chunk inputChunk, int selSize, int[] selection) {
+        Chunk chunk;
+        if (condition == null) {
+            // for unconditional table scan
+            chunk = resultSetHandler.next(inputChunk, blockBuilders, context, selSize, selection);
+        } else {
+            // for conditional table scan
+            chunk = resultSetHandler.next(inputChunk, inProjectDataTypeList, condition,
+                preAllocatedChunk, filterBitmap, outProject, context, selSize, selection);
         }
 
         if (chunk != null) {
@@ -232,6 +297,7 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         return condition;
     }
 
+    @Override
     public void setCondition(VectorizedExpression condition) {
         this.condition = condition;
     }
@@ -240,6 +306,7 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         return preAllocatedChunk;
     }
 
+    @Override
     public void setPreAllocatedChunk(MutableChunk preAllocatedChunk) {
         this.preAllocatedChunk = preAllocatedChunk;
     }
@@ -248,6 +315,7 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         return filterBitmap;
     }
 
+    @Override
     public void setFilterBitmap(int[] filterBitmap) {
         this.filterBitmap = filterBitmap;
     }
@@ -256,6 +324,7 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         return outProject;
     }
 
+    @Override
     public void setOutProject(int[] outProject) {
         this.outProject = outProject;
     }
@@ -264,6 +333,7 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         return filterInputTypes;
     }
 
+    @Override
     public void setFilterInputTypes(List<DataType<?>> filterInputTypes) {
         this.filterInputTypes = filterInputTypes;
     }
@@ -272,6 +342,7 @@ public class AsyncOSSTableScanExec extends AbstractOSSTableScanExec {
         return filterOutputTypes;
     }
 
+    @Override
     public void setFilterOutputTypes(List<DataType<?>> filterOutputTypes) {
         this.filterOutputTypes = filterOutputTypes;
     }

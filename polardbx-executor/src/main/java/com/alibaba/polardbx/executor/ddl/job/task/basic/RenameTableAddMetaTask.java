@@ -17,7 +17,6 @@
 package com.alibaba.polardbx.executor.ddl.job.task.basic;
 
 import com.alibaba.fastjson.annotation.JSONCreator;
-import com.alibaba.polardbx.executor.ddl.job.meta.CommonMetaChanger;
 import com.alibaba.polardbx.executor.ddl.job.meta.TableMetaChanger;
 import com.alibaba.polardbx.executor.ddl.job.task.BaseGmsTask;
 import com.alibaba.polardbx.executor.ddl.job.task.util.TaskName;
@@ -42,19 +41,23 @@ public class RenameTableAddMetaTask extends BaseGmsTask {
 
     @Override
     protected void executeImpl(Connection metaDbConnection, ExecutionContext executionContext) {
-        if (!executionContext.needToRenamePhyTables()) {
-            return;
-        }
-
         TableMetaChanger.addNewTableName(metaDbConnection, schemaName, logicalTableName, newLogicalTableName);
         FailPoint.injectRandomExceptionFromHint(executionContext);
         FailPoint.injectRandomSuspendFromHint(executionContext);
-        CommonMetaChanger.finalOperationsOnRenameTableSuccess(schemaName, logicalTableName, newLogicalTableName);
     }
 
     @Override
     protected void rollbackImpl(Connection metaDbConnection, ExecutionContext executionContext) {
         TableMetaChanger.removeNewTableName(metaDbConnection, schemaName, logicalTableName);
+    }
+
+    @Override
+    protected void duringTransaction(Connection metaDbConnection, ExecutionContext executionContext) {
+        executeImpl(metaDbConnection, executionContext);
+    }
+
+    @Override
+    protected void onExecutionSuccess(ExecutionContext executionContext) {
     }
 
 }

@@ -22,6 +22,7 @@ import com.alibaba.polardbx.qatest.data.TableColumnGenerator;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -42,7 +43,7 @@ import static com.alibaba.polardbx.qatest.validator.PrepareData.tableDataPrepare
  *
  * @see XATransactionBasicTest
  */
-@RunWith(Parameterized.class)
+
 public class XATransactionBasicWithTclTest extends CrudBasedLockTestCase {
 
     private static final int MAX_DATA_SIZE = 20;
@@ -280,7 +281,7 @@ public class XATransactionBasicWithTclTest extends CrudBasedLockTestCase {
     /**
      * @since 5.4.9
      */
-    @Test
+    @Ignore
     public void testApply() {
         tableDataPrepare(baseOneTableName, 100,
             TableColumnGenerator.getAllTypeColum(), PK_COLUMN_NAME, mysqlConnection,

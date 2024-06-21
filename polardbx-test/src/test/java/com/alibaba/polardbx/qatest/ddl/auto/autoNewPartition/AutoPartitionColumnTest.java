@@ -469,7 +469,7 @@ public class AutoPartitionColumnTest extends BaseAutoPartitionNewPartition {
                 MessageFormat.format("alter table `{0}` add column `{1}` int(1024);", TABLE_NAME, addedColumn);
             JdbcUtil
                 .executeUpdateFailed(tddlConnection, alter,
-                    "Not all physical DDLs have been executed successfully");
+                    "Display width out of range for column 'addedx'");
 
             // Assert no column.
             Assert.assertFalse(JdbcUtil.showCreateTable(tddlConnection, TABLE_NAME).contains(addedColumn));
@@ -775,9 +775,9 @@ public class AutoPartitionColumnTest extends BaseAutoPartitionNewPartition {
         System.out.println(idGen.get() + " rows added.");
 
         // Assert that column default changed and covered in GSI.
-        Assert.assertTrue(JdbcUtil.showCreateTable(tddlConnection, TABLE_NAME).contains("`c0` int(11),"));
-        Assert.assertTrue(JdbcUtil.showCreateTable(tddlConnection, CGSI_NAME).contains("`c0` int(11),"));
-        Assert.assertTrue(JdbcUtil.showCreateTable(tddlConnection, UCGSI_NAME).contains("`c0` int(11),"));
+        Assert.assertTrue(showCreateTable(tddlConnection, TABLE_NAME).contains("`c0` int(11),"));
+        Assert.assertTrue(showCreateTable(tddlConnection, CGSI_NAME).contains("`c0` int(11),"));
+        Assert.assertTrue(showCreateTable(tddlConnection, UCGSI_NAME).contains("`c0` int(11),"));
 
         // Assert that data identical.
         selectContentSameAssert(selectPrimary + " order by `seller_id`", selectGSI + " order by `seller_id`", null,
@@ -799,16 +799,12 @@ public class AutoPartitionColumnTest extends BaseAutoPartitionNewPartition {
             // Go bad alter.
             JdbcUtil.executeUpdateFailed(tddlConnection,
                 MessageFormat.format("alter table `{0}` alter `c0` set default {1}", TABLE_NAME, "'hehe'"),
-                "Not all physical DDLs have been executed successfully");
+                "Invalid default value for 'c0'");
 
             // Assert that default not changed.
-            Assert.assertTrue(
-                JdbcUtil.showCreateTable(tddlConnection, TABLE_NAME).contains("`c0` int(11) DEFAULT NULL,"));
-            Assert
-                .assertTrue(JdbcUtil.showCreateTable(tddlConnection, CGSI_NAME)
-                    .contains("`c0` int(11) DEFAULT NULL,"));
-            Assert.assertTrue(
-                JdbcUtil.showCreateTable(tddlConnection, UCGSI_NAME).contains("`c0` int(11) DEFAULT NULL,"));
+            Assert.assertTrue(showCreateTable(tddlConnection, TABLE_NAME).contains("`c0` int(11) DEFAULT NULL,"));
+            Assert.assertTrue(showCreateTable(tddlConnection, CGSI_NAME).contains("`c0` int(11) DEFAULT NULL,"));
+            Assert.assertTrue(showCreateTable(tddlConnection, UCGSI_NAME).contains("`c0` int(11) DEFAULT NULL,"));
         }
     }
 
@@ -827,7 +823,7 @@ public class AutoPartitionColumnTest extends BaseAutoPartitionNewPartition {
             // Go bad alter.
             JdbcUtil.executeUpdateFailed(tddlConnection,
                 MessageFormat.format("alter table `{0}` alter `t` set default {1}", TABLE_NAME, "'haha'"),
-                "Not all physical DDLs have been executed successfully");
+                "Invalid default value for 't'");
 
             // Assert that default not changed.
             Assert.assertTrue(JdbcUtil.showCreateTable(tddlConnection, TABLE_NAME)

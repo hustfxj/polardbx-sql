@@ -64,6 +64,7 @@ import com.alibaba.polardbx.optimizer.core.rel.ddl.data.gsi.CreateTableWithGsiPr
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.gsi.TruncateGlobalIndexPreparedData;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.gsi.TruncateTableWithGsiPreparedData;
 import com.alibaba.polardbx.optimizer.core.row.Row;
+import com.alibaba.polardbx.optimizer.locality.LocalityInfoUtils;
 import com.alibaba.polardbx.optimizer.parse.FastsqlParser;
 import com.alibaba.polardbx.optimizer.parse.custruct.FastSqlConstructUtils;
 import com.alibaba.polardbx.optimizer.parse.visitor.ContextParameters;
@@ -85,6 +86,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 
+import static com.alibaba.polardbx.common.cdc.ICdcManager.DEFAULT_DDL_VERSION_ID;
 import static com.alibaba.polardbx.executor.ddl.job.factory.CreateTableJobFactory.CREATE_TABLE_SYNC_TASK;
 import static com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcTruncateWithRecycleMarkTask.CDC_RECYCLE_HINTS;
 
@@ -114,7 +116,7 @@ public class LogicalTruncateTableHandler extends LogicalCommonDdlHandler {
                 }
             }
         } else {
-            if (logicalTruncateTable.isWithGsi()) {
+            if (logicalTruncateTable.isWithGsi() || logicalTruncateTable.hasColumnarIndex()) {
                 return buildTruncateTableWithGsiJob(logicalTruncateTable, true, executionContext);
             } else {
                 return buildTruncatePartitionTableJob(logicalTruncateTable, executionContext);
@@ -127,7 +129,7 @@ public class LogicalTruncateTableHandler extends LogicalCommonDdlHandler {
         String logicalTableName = logicalDdlPlan.getTableName();
         TableValidator.validateTableName(logicalTableName);
         TableValidator.validateTableExistence(logicalDdlPlan.getSchemaName(), logicalTableName, executionContext);
-        return super.validatePlan(logicalDdlPlan, executionContext);
+        return false;
     }
 
     private DdlJob buildTruncateTableJob(LogicalTruncateTable logicalTruncateTable, ExecutionContext executionContext) {
@@ -203,14 +205,20 @@ public class LogicalTruncateTableHandler extends LogicalCommonDdlHandler {
         Map<String, List<List<String>>> tableTopology = createTableBuilder.getTableTopology();
         List<PhyDdlTableOperation> physicalPlans = createTableBuilder.getPhysicalPlans();
 
-        PhysicalPlanData physicalPlanData = DdlJobDataConverter.convertToPhysicalPlanData(tableTopology, physicalPlans);
+        PhysicalPlanData physicalPlanData =
+            DdlJobDataConverter.convertToPhysicalPlanData(tableTopology, physicalPlans, executionContext);
 
         return new CreateTableJobFactory(
             createTablePreparedData.isAutoPartition(),
             createTablePreparedData.isTimestampColumnDefault(),
-            createTablePreparedData.getBinaryColumnDefaultValues(),
+            createTablePreparedData.getSpecialDefaultValues(),
+            createTablePreparedData.getSpecialDefaultValueFlags(),
+            createTablePreparedData.getAddedForeignKeys(),
             physicalPlanData,
-            executionContext
+            DEFAULT_DDL_VERSION_ID,
+            executionContext,
+            true,
+            null
         ).create();
     }
 
@@ -312,10 +320,17 @@ public class LogicalTruncateTableHandler extends LogicalCommonDdlHandler {
                     entry.getValue().getIndexTablePreparedData().getPartitionInfo());
             }
 
-            rewritePartitions(sqlCreateTable.getGlobalKeys(), gsiPartitionInfoMap, executionContext);
-            rewritePartitions(sqlCreateTable.getGlobalUniqueKeys(), gsiPartitionInfoMap, executionContext);
-            rewritePartitions(sqlCreateTable.getClusteredKeys(), gsiPartitionInfoMap, executionContext);
-            rewritePartitions(sqlCreateTable.getClusteredUniqueKeys(), gsiPartitionInfoMap, executionContext);
+            sqlCreateTable.setGlobalKeys(
+                rewritePartitions(sqlCreateTable.getGlobalKeys(), gsiPartitionInfoMap, executionContext));
+            sqlCreateTable.setGlobalUniqueKeys(
+                rewritePartitions(sqlCreateTable.getGlobalUniqueKeys(), gsiPartitionInfoMap, executionContext));
+            sqlCreateTable.setClusteredKeys(
+                rewritePartitions(sqlCreateTable.getClusteredKeys(), gsiPartitionInfoMap, executionContext));
+            sqlCreateTable.setClusteredUniqueKeys(
+                rewritePartitions(sqlCreateTable.getClusteredUniqueKeys(), gsiPartitionInfoMap, executionContext));
+
+            // skip columnar indexes
+            sqlCreateTable.setColumnarKeys(null);
         }
 
         ExecutionPlan createTablePlan = Planner.getInstance().getPlan(sqlCreateTable, plannerContext);
@@ -381,7 +396,7 @@ public class LogicalTruncateTableHandler extends LogicalCommonDdlHandler {
         if (partitionInfo == null) {
             return null;
         } else {
-            return LocalityDesc.parse(partitionInfo.getLocality());
+            return LocalityInfoUtils.parse(partitionInfo.getLocality());
         }
     }
 
@@ -400,11 +415,15 @@ public class LogicalTruncateTableHandler extends LogicalCommonDdlHandler {
         return result;
     }
 
-    private void rewritePartitions(List<Pair<SqlIdentifier, SqlIndexDefinition>> keys,
-                                   Map<String, PartitionInfo> gsiPartitionInfoMap, ExecutionContext executionContext) {
+    private List<Pair<SqlIdentifier, SqlIndexDefinition>> rewritePartitions(
+        List<Pair<SqlIdentifier, SqlIndexDefinition>> keys,
+        Map<String, PartitionInfo> gsiPartitionInfoMap,
+        ExecutionContext executionContext) {
         if (null == keys) {
-            return;
+            return keys;
         }
+
+        final List<Pair<SqlIdentifier, SqlIndexDefinition>> result = new ArrayList<>();
         for (Pair<SqlIdentifier, SqlIndexDefinition> key : keys) {
             String indexName = key.getKey().getLastName();
             PartitionInfo partitionInfo = gsiPartitionInfoMap.get(indexName);
@@ -412,9 +431,15 @@ public class LogicalTruncateTableHandler extends LogicalCommonDdlHandler {
                 MySqlCreateTableParser createParser = new MySqlCreateTableParser(
                     new MySqlExprParser(partitionInfo.showCreateTablePartitionDefInfo(true)));
                 SQLPartitionBy partitionBy = createParser.parsePartitionBy();
-                SqlNode partitioning = FastSqlConstructUtils.convertPartitionBy(partitionBy, new ContextParameters(false), executionContext);
-                key.getValue().setPartitioning(partitioning);
+                SqlNode partitioning =
+                    FastSqlConstructUtils.convertPartitionBy(partitionBy, new ContextParameters(false),
+                        executionContext);
+                result.add(Pair.of(key.getKey(), key.getValue().replacePartitioning(partitioning)));
+            } else {
+                result.add(key);
             }
         }
+
+        return result;
     }
 }

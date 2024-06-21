@@ -21,8 +21,10 @@ import com.alibaba.polardbx.gms.metadb.table.IndexStatus;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager.GsiMetaBean;
 import com.alibaba.polardbx.optimizer.exception.TableNotFoundException;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
+import com.google.common.collect.Lists;
 
 import java.sql.Connection;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -30,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 /**
  * 用来描述一个逻辑表由哪些key-val组成的 <br/>
@@ -43,6 +46,12 @@ public interface SchemaManager extends Lifecycle {
     public static final String DUAL = "dual";
 
     public TableMeta getTable(String tableName);
+
+    default List<TableMeta> getAllUserTables() {
+        return Lists.newArrayList();
+    }
+
+    public Collection<TableMeta> getAllTables();
 
     public default TableMeta getTableWithNull(String tableName) {
         if (tableName == null) {
@@ -71,7 +80,7 @@ public interface SchemaManager extends Lifecycle {
 
     public GsiMetaBean getGsi(String primaryOrIndexTableName, EnumSet<IndexStatus> statusSet);
 
-    default Set<String> guessGsi(String unwrappedName) {
+    default Set<String> guessGsi(String unwrappedName, Predicate<GsiMetaManager.GsiIndexMetaBean> filter) {
         return Collections.emptySet();
     }
 
@@ -98,15 +107,30 @@ public interface SchemaManager extends Lifecycle {
 
     default void toNewVersionInTrx(List<String> tableNameList,
                                    boolean preemtive, long initWait, long interval, TimeUnit timeUnit,
-                                   boolean allowTwoVersion) {
+                                   long connId, boolean allowTwoVersion, boolean sameTableGroup) {
         throw new AssertionError("NOT SUPPORTED");
     }
 
-    default void toNewVersionInTrx(List<String> tableNameList, boolean allowTwoVersion) {
+    default void toNewVersionInTrx(List<String> tableNameList, long connId, boolean allowTwoVersion) {
         throw new AssertionError("NOT SUPPORTED");
     }
 
     default void toNewVersionForTableGroup(String tableName, boolean allowTwoVersion) {
+        throw new AssertionError("NOT SUPPORTED");
+    }
+
+    default void toNewVersionInTrx(List<String> tableNameList,
+                                   boolean preemptive, long initWait, long interval, TimeUnit timeUnit,
+                                   long connId, boolean allowTwoVersion, boolean sameTableGroup, long trxId) {
+        throw new AssertionError("NOT SUPPORTED");
+    }
+
+    default void toNewVersionInTrx(List<String> tableNameList, long connId, boolean allowTwoVersion, long trxId) {
+        throw new AssertionError("NOT SUPPORTED");
+    }
+
+
+    default public Map<String, Long> getStaleTables(List<String> tableNameList, Connection conn) {
         throw new AssertionError("NOT SUPPORTED");
     }
 }

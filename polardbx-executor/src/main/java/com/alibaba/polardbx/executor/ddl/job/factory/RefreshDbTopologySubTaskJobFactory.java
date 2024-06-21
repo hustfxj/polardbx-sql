@@ -22,6 +22,7 @@ import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.config.table.ComplexTaskMetaManager;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.PhyDdlTableOperation;
+import com.alibaba.polardbx.optimizer.core.rel.ddl.data.AlterTableGroupBasePreparedData;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.AlterTableGroupItemPreparedData;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.tablegroup.AlterTableGroupSnapShotUtils;
@@ -33,17 +34,19 @@ import java.util.Set;
 
 public class RefreshDbTopologySubTaskJobFactory extends AlterTableGroupSubTaskJobFactory {
 
-    public RefreshDbTopologySubTaskJobFactory(DDL ddl, AlterTableGroupItemPreparedData preparedData,
+    public RefreshDbTopologySubTaskJobFactory(DDL ddl, AlterTableGroupBasePreparedData parentPreparedData,
+                                              AlterTableGroupItemPreparedData preparedData,
                                               List<PhyDdlTableOperation> phyDdlTableOperations,
                                               Map<String, List<List<String>>> tableTopology,
                                               Map<String, Set<String>> targetTableTopology,
                                               Map<String, Set<String>> sourceTableTopology,
-                                              List<Pair<String, String>> orderedTargetTableLocations,
+                                              Map<String, Pair<String, String>> orderedTargetTableLocations,
                                               String targetPartition,
                                               boolean skipBackfill,
                                               ExecutionContext executionContext) {
-        super(ddl, preparedData, phyDdlTableOperations, tableTopology, targetTableTopology, sourceTableTopology,
-            orderedTargetTableLocations, targetPartition, skipBackfill, ComplexTaskMetaManager.ComplexTaskType.REFRESH_TOPOLOGY, executionContext);
+        super(ddl, parentPreparedData, preparedData, phyDdlTableOperations, tableTopology, targetTableTopology,
+            sourceTableTopology, orderedTargetTableLocations, targetPartition, skipBackfill,
+            ComplexTaskMetaManager.ComplexTaskType.REFRESH_TOPOLOGY, executionContext);
     }
 
     @Override
@@ -60,13 +63,24 @@ public class RefreshDbTopologySubTaskJobFactory extends AlterTableGroupSubTaskJo
             OptimizerContext.getContext(schemaName).getPartitionInfoManager().getPartitionInfo(tableName);
         List<PartitionGroupRecord> inVisiblePartitionGroupRecords = preparedData.getInvisiblePartitionGroups();
 
-        PartitionInfo newPartInfo = AlterTableGroupSnapShotUtils
-            .getNewPartitionInfoForCopyPartition(curPartitionInfo, inVisiblePartitionGroupRecords, this.executionContext);
-        //checkPartitionCount(newPartInfo);
-        return newPartInfo;
+        return AlterTableGroupSnapShotUtils
+            .getNewPartitionInfo(
+                null,
+                curPartitionInfo,
+                false,
+                ddl.getSqlNode(),
+                null,
+                null,
+                null,
+                null,
+                inVisiblePartitionGroupRecords,
+                null,
+                executionContext);
     }
 
     @Override
-    public boolean isBroadcast() { return true; }
+    public boolean isBroadcast() {
+        return true;
+    }
 
 }

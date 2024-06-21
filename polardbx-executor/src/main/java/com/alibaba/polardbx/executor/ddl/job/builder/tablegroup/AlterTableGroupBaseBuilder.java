@@ -18,9 +18,9 @@ package com.alibaba.polardbx.executor.ddl.job.builder.tablegroup;
 
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
+import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
-import com.alibaba.polardbx.gms.partition.TablePartRecordInfoContext;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupAccessor;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupConfig;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupRecord;
@@ -39,7 +39,6 @@ import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
 import org.apache.calcite.rel.core.DDL;
 
 import java.sql.Connection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -61,6 +60,8 @@ public class AlterTableGroupBaseBuilder {
     protected Map<String, Map<String, Set<String>>> sourceTablesTopology = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
     protected Map<String, Map<String, Set<String>>> targetTablesTopology = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
     protected Map<String, List<String>> newPhysicalTables = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+    protected Map<String, Map<String, String>> newPartitionToPhysicalTableMap =
+        new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
     /**
      * orderedTargetTablesLocations is used to store all the locations of target new added phy tables
@@ -68,10 +69,11 @@ public class AlterTableGroupBaseBuilder {
      * <p>
      * key:logTb
      * val:
-     * val:list of locations
-     * a item is [phyTbl, grpKey]
+     * val:map of locations
+     * a item is <partitionName,<phyTbl, grpKey>>
      */
-    protected Map<String, List<Pair<String, String>>> orderedTargetTablesLocations = new HashMap<>();
+    protected Map<String, Map<String, Pair<String, String>>> orderedTargetTablesLocations =
+        new TreeMap<>(String::compareToIgnoreCase);
 
     public AlterTableGroupBaseBuilder(DDL ddl, AlterTableGroupBasePreparedData preparedData,
                                       ExecutionContext executionContext) {
@@ -92,6 +94,7 @@ public class AlterTableGroupBaseBuilder {
         for (String tableName : allTables) {
             AlterTableGroupItemPreparedData alterTableGroupItemPreparedData =
                 createAlterTableGroupItemPreparedData(tableName, groupDetailInfoExRecords);
+            alterTableGroupItemPreparedData.setOperateOnSubPartition(preparedData.isOperateOnSubPartition());
             AlterTableGroupItemBuilder itemBuilder =
                 new AlterTableGroupItemBuilder(relDdl, alterTableGroupItemPreparedData, executionContext);
             List<PhyDdlTableOperation> phyDdlTableOperations = itemBuilder.build().getPhysicalPlans();
@@ -108,7 +111,7 @@ public class AlterTableGroupBaseBuilder {
         TableGroupConfig tableGroupConfig =
             OptimizerContext.getContext(preparedData.getSchemaName()).getTableGroupInfoManager()
                 .getTableGroupConfigByName(preparedData.getTableGroupName());
-        return tableGroupConfig.getAllTables().stream().map(o -> o.getTableName()).collect(Collectors.toList());
+        return tableGroupConfig.getAllTables();
     }
 
     public Map<String, List<PhyDdlTableOperation>> getNewPartitionsPhysicalPlansMap() {
@@ -131,7 +134,7 @@ public class AlterTableGroupBaseBuilder {
         return tablesPreparedData;
     }
 
-    public Map<String, List<Pair<String, String>>> getOrderedTargetTablesLocations() {
+    public Map<String, Map<String, Pair<String, String>>> getOrderedTargetTablesLocations() {
         return orderedTargetTablesLocations;
     }
 
@@ -144,6 +147,11 @@ public class AlterTableGroupBaseBuilder {
             OptimizerContext.getContext(preparedData.getSchemaName()).getPartitionInfoManager()
                 .getPartitionInfo(tableName);
         PartitionSpec partitionSpec = partitionInfo.getPartitionBy().getPartitions().get(0);
+        if (partitionSpec.getLocation() == null &&
+            partitionInfo.getPartitionBy().getSubPartitionBy() != null &&
+            GeneralUtil.isNotEmpty(partitionSpec.getSubPartitions())) {
+            partitionSpec = partitionSpec.getSubPartitions().get(0);
+        }
         alterTableGroupItemPreparedData.setDefaultPartitionSpec(partitionSpec);
         alterTableGroupItemPreparedData.setGroupDetailInfoExRecords(groupDetailInfoExRecords);
         alterTableGroupItemPreparedData.setTableGroupName(preparedData.getTableGroupName());
@@ -203,14 +211,17 @@ public class AlterTableGroupBaseBuilder {
                 int[] minPostfix = new int[1];
                 int maxPostfix = 1;
                 for (String tableName : allLogicalTableNames) {
-                    minPostfix[0] = tableGroupRecord.getInited() - preparedData.getNewPartitionNames().size();
+                    minPostfix[0] = tableGroupRecord.getInited() - preparedData.getInvisiblePartitionGroups().size();
                     minPostfix[0] = Math.max(minPostfix[0], 0);
                     PartitionInfo partitionInfo =
                         OptimizerContext.getContext(schemaName).getPartitionInfoManager().getPartitionInfo(tableName);
                     List<String> physicalTables = PartitionInfoUtil
-                        .getNextNPhyTableNames(partitionInfo, preparedData.getNewPartitionNames().size(), minPostfix);
+                        .getNextNPhyTableNames(partitionInfo, preparedData.getInvisiblePartitionGroups().size(),
+                            minPostfix);
                     maxPostfix = Math.max(minPostfix[0], maxPostfix);
                     newPhysicalTables.put(tableName, physicalTables);
+//                    Map<String, String> partitionToPhysicalTableMap = new HAshMap
+//                    newPartitionToPhysicalTableMap.put(tableName, physicalTables.)
                 }
                 accessor.updateInitedById(tableGroupRecord.getId(), maxPostfix);
                 conn.commit();

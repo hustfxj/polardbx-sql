@@ -16,13 +16,20 @@
 
 package com.alibaba.polardbx.transaction.jdbc;
 
+import com.alibaba.polardbx.common.constants.TransactionAttribute;
+import com.alibaba.polardbx.common.eventlogger.EventLogger;
+import com.alibaba.polardbx.common.eventlogger.EventType;
 import com.alibaba.polardbx.common.exception.NotSupportException;
 import com.alibaba.polardbx.common.jdbc.BytesSql;
 import com.alibaba.polardbx.common.jdbc.ConnectionStats;
 import com.alibaba.polardbx.common.jdbc.IConnection;
 import com.alibaba.polardbx.common.jdbc.ReadViewConn;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
+import com.alibaba.polardbx.common.utils.TStringUtil;
+import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.rpc.pool.XConnection;
+import com.alibaba.polardbx.transaction.TransactionManager;
+import com.mysql.cj.x.protobuf.PolarxExecPlan;
 
 import java.sql.Array;
 import java.sql.Blob;
@@ -49,25 +56,34 @@ public class DeferredConnection extends ReadViewConn {
     protected final boolean serverDiscards;
     protected final IConnection conn;
     /**
-     * The trace id of the last sql executed by this physical connection.
+     * For Auto-Savepoint.
      */
-    protected String traceId = null;
+    protected String autoSavepointMark = null;
+    public final static String INVALID_AUTO_SAVEPOINT = "INVALID";
 
     //    protected List<String> deferSqls;
     protected List<BytesSql> deferBytesSqls;
     protected int discardResults;
+    private final boolean xProtoOptForAutoSp;
 
     public DeferredConnection(IConnection conn, final boolean serverDiscards) {
         this.conn = conn;
         this.serverDiscards = serverDiscards;
+        this.xProtoOptForAutoSp = false;
     }
 
-    public String getTraceId() {
-        return traceId;
+    public DeferredConnection(IConnection conn, final boolean serverDiscards, boolean xProtoOptForAutoSp) {
+        this.conn = conn;
+        this.serverDiscards = serverDiscards;
+        this.xProtoOptForAutoSp = xProtoOptForAutoSp;
     }
 
-    public void setTraceId(String traceId) {
-        this.traceId = traceId;
+    public String getAutoSavepointMark() {
+        return autoSavepointMark;
+    }
+
+    public void setAutoSavepointMark(String autoSavepointMark) {
+        this.autoSavepointMark = autoSavepointMark;
     }
 
     @Override
@@ -253,7 +269,7 @@ public class DeferredConnection extends ReadViewConn {
 
     @Override
     public void close() throws SQLException {
-        traceId = null;
+        autoSavepointMark = null;
         super.close();
         conn.close();
     }
@@ -646,6 +662,81 @@ public class DeferredConnection extends ReadViewConn {
             return conn.getRealConnection();
         } else {
             return conn;
+        }
+    }
+
+    @Override
+    public void discard(Throwable t) {
+        if (conn != null) {
+            conn.discard(t);
+        }
+    }
+
+    public void setAutoSavepoint(String spName, String schemaName) throws SQLException {
+        long lastLogTime = TransactionAttribute.LAST_LOG_AUTO_SP_TIME.get();
+        if (TransactionManager.shouldWriteEventLog(lastLogTime)
+            && TransactionAttribute.LAST_LOG_AUTO_SP_TIME.compareAndSet(lastLogTime, System.nanoTime())) {
+            EventLogger.log(EventType.AUTO_SP, "Found use of auto savepoint set");
+        }
+        if (isSupportXOptForAutoSp(schemaName)) {
+            lastLogTime = TransactionAttribute.LAST_LOG_AUTO_SP_OPT_TIME.get();
+            if (TransactionManager.shouldWriteEventLog(lastLogTime)
+                && TransactionAttribute.LAST_LOG_AUTO_SP_OPT_TIME.compareAndSet(lastLogTime, System.nanoTime())) {
+                EventLogger.log(EventType.AUTO_SP_OPT, "Found use of auto savepoint opt set");
+            }
+            this.flushUnsent();
+            this.unwrap(XConnection.class).handleAutoSavepoint(spName, PolarxExecPlan.AutoSp.Operation.SET, true);
+        } else {
+            this.executeLater("SAVEPOINT " + TStringUtil.backQuote(spName));
+        }
+    }
+
+    public void releaseAutoSavepoint(String spName, String schemaName, boolean ignoreResult) throws SQLException {
+        long lastLogTime = TransactionAttribute.LAST_LOG_AUTO_SP_RELEASE.get();
+        if (TransactionManager.shouldWriteEventLog(lastLogTime)
+            && TransactionAttribute.LAST_LOG_AUTO_SP_RELEASE.compareAndSet(lastLogTime, System.nanoTime())) {
+            EventLogger.log(EventType.AUTO_SP, "Found use of auto savepoint release");
+        }
+        if (isSupportXOptForAutoSp(schemaName)) {
+            this.flushUnsent();
+            this.unwrap(XConnection.class)
+                .handleAutoSavepoint(spName, PolarxExecPlan.AutoSp.Operation.RELEASE, ignoreResult);
+        } else {
+            if (ignoreResult) {
+                this.executeLater("RELEASE SAVEPOINT " + TStringUtil.backQuote(spName));
+            } else {
+                try (Statement stmt = createStatement()) {
+                    stmt.execute("RELEASE SAVEPOINT " + TStringUtil.backQuote(spName));
+                }
+            }
+        }
+    }
+
+    public void rollbackAutoSavepoint(String spName, String schemaName) throws SQLException {
+        long lastLogTime = TransactionAttribute.LAST_LOG_AUTO_SP_ROLLBACK.get();
+        if (TransactionManager.shouldWriteEventLog(lastLogTime)
+            && TransactionAttribute.LAST_LOG_AUTO_SP_ROLLBACK.compareAndSet(lastLogTime, System.nanoTime())) {
+            EventLogger.log(EventType.AUTO_SP, "Found use of auto savepoint rollback");
+        }
+        if (isSupportXOptForAutoSp(schemaName)) {
+            this.flushUnsent();
+            this.unwrap(XConnection.class).handleAutoSavepoint(spName, PolarxExecPlan.AutoSp.Operation.ROLLBACK, true);
+        } else {
+            this.executeLater("ROLLBACK TO SAVEPOINT " + TStringUtil.backQuote(spName));
+        }
+    }
+
+    private boolean isSupportXOptForAutoSp(String schemaName) throws SQLException {
+        return this.isWrapperFor(XConnection.class)
+            && xProtoOptForAutoSp
+            && ExecutorContext.getContext(schemaName).getStorageInfoManager().supportXOptForAutoSp()
+            && this.unwrap(XConnection.class).isXRPC();
+    }
+
+    @Override
+    public void forceRollback() throws SQLException {
+        if (conn != null) {
+            conn.forceRollback();
         }
     }
 }

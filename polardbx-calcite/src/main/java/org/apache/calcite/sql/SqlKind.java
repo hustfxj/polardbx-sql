@@ -16,8 +16,6 @@
  */
 package org.apache.calcite.sql;
 
-import com.sun.org.apache.bcel.internal.generic.PUSH;
-
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.Locale;
@@ -932,11 +930,12 @@ public enum SqlKind {
     LAST_VALUE,
 
     /**
-     * The {@code LAST_VALUE} aggregate function.
+     * The {@code NTH_VALUE} aggregate function.
      */
     NTH_VALUE,
+
     /**
-     * The {@code LAST_VALUE} aggregate function.
+     * The {@code N_TILE} aggregate function.
      */
     N_TILE,
 
@@ -1070,6 +1069,12 @@ public enum SqlKind {
      */
     BIT_XOR,
 
+    HYPER_LOGLOG,
+
+    PARTIAL_HYPER_LOGLOG,
+
+    FINAL_HYPER_LOGLOG,
+
     /**
      * TDDL ADD {@code  CHECK_SUM}
      */
@@ -1079,6 +1084,17 @@ public enum SqlKind {
      * TDDL ADD {@code  CHECK_SUM_MERGE}
      */
     CHECK_SUM_MERGE,
+
+    /**
+     * TDDL ADD {@code  CHECK_SUM_V2}
+     */
+    CHECK_SUM_V2,
+
+    /**
+     * TDDL ADD {@code  CHECK_SUM_V2_MERGE}
+     */
+    CHECK_SUM_V2_MERGE,
+
     // Group functions
 
     /**
@@ -1332,6 +1348,11 @@ public enum SqlKind {
     DROP_INDEX,
 
     /**
+     * {@code ALTER INDEX VISIBILITY} DDL statement.
+     */
+    ALTER_INDEX_VISIBILITY,
+
+    /**
      * {@code DROP FILE} DDL statement.
      */
     DROP_FILE,
@@ -1340,6 +1361,11 @@ public enum SqlKind {
      * {@code DROP PRIMARY KEY} DDL statement.
      */
     DROP_PRIMARY_KEY,
+
+    /**
+     * {@code DROP FOREIGN KEY} DDL statement.
+     */
+    DROP_FOREIGN_KEY,
 
     /**
      * {@code ADD PRIMARY KEY} DDL statement.
@@ -1376,6 +1402,8 @@ public enum SqlKind {
      */
     ADD_COLUMN,
 
+    ADD_SECURITY_POLICY,
+
     /**
      * {@code ENABLE KEYS} DDL statement.
      */
@@ -1397,6 +1425,14 @@ public enum SqlKind {
      */
     CREATE_DATABASE,
 
+    ALTER_DATABASE,
+
+    IMPORT_DATABASE,
+
+    IMPORT_SEQUENCE,
+
+    CREATE_JAVA_FUNCTION,
+
     CREATE_CCL_RULE,
 
     CREATE_CCL_TRIGGER,
@@ -1411,10 +1447,32 @@ public enum SqlKind {
 
     CONTINUE_SCHEDULE,
 
+    CREATE_SECURITY_LABEL,
+
+    DROP_SECURITY_LABEL,
+
+    CREATE_SECURITY_LABEL_COMPONENT,
+
+    DROP_SECURITY_LABEL_COMPONENT,
+
+    CREATE_SECURITY_POLICY,
+
+    DROP_SECURITY_POLICY,
+
+    GRANT_SECURITY_LABEL,
+
+    REVOKE_SECURITY_LABEL,
+
+    CREATE_SECURITY_ENTITY,
+
+    DROP_SECURITY_ENTITY,
+
     /**
      * {@code DROP DATABASE} DDL statement.
      */
     DROP_DATABASE,
+
+    DROP_JAVA_FUNCTION,
 
     DROP_CCL_RULE,
 
@@ -1446,6 +1504,11 @@ public enum SqlKind {
     ALTER_SYSTEM_RELOAD_STORAGE,
 
     /**
+     * ALTER SYSTEM leader hostport
+     */
+    ALTER_SYSTEM_LEADER,
+
+    /**
      * DDL statement not handled above.
      *
      * <p><b>Note to other projects</b>: If you are extending Calcite's SQL parser
@@ -1463,7 +1526,11 @@ public enum SqlKind {
 
     SHOW_TABLE_INFO,
 
+    SHOW_HOTKEY,
+
     SHOW_LOCALITY_INFO,
+
+    SHOW_PHYSICAL_DDL,
 
     SHOW_CREATE_DATABASE,
 
@@ -1479,11 +1546,17 @@ public enum SqlKind {
 
     SHOW_CREATE_FUNCTION,
 
+    SHOW_CHANGESET_STATS,
+
     SHOW_VARIABLES,
 
     SHOW_PROCESSLIST,
 
+    SHOW_TABLE_ACCESS,
+
     SHOW_TABLE_STATUS,
+
+    SHOW_TABLE_REPLICATE,
 
     SHOW_SLOW,
 
@@ -1508,6 +1581,8 @@ public enum SqlKind {
     SHOW_STATS,
 
     SHOW_TRACE,
+
+    SHOW_PRUNE_TRACE,
 
     SHOW_SEQUENCES,
 
@@ -1537,7 +1612,11 @@ public enum SqlKind {
 
     SHOW_PROFILE,
 
+    SHOW_PROFILES,
+
     SHOW_GLOBAL_INDEX,
+
+    SHOW_COLUMNAR_INDEX,
 
     SHOW_GLOBAL_DEADLOCKS,
 
@@ -1549,9 +1628,13 @@ public enum SqlKind {
 
     SHOW_TRANS,
 
+    SHOW_TRANS_STATS,
+
     SHOW_CCL_RULE,
 
     SHOW_CCL_TRIGGER,
+
+    SHOW_CDC_STORAGE,
 
     SHOW_BINARY_STREAMS,
 
@@ -1563,6 +1646,20 @@ public enum SqlKind {
 
     CHANGE_MASTER,
 
+    START_MASTER,
+
+    STOP_MASTER,
+
+    RESTART_MASTER,
+
+    REBALANCE_MASTER,
+
+    RESET_MASTER,
+
+    SET_CDC_GLOBAL,
+
+    FLUSH_LOGS,
+
     START_SLAVE,
 
     STOP_SLAVE,
@@ -1573,6 +1670,22 @@ public enum SqlKind {
 
     SHOW_SLAVE_STATUS,
 
+    REPLICA_HASH_CHECK,
+
+    START_REPLICA_CHECK,
+
+    PAUSE_REPLICA_CHECK,
+
+    CONTINUE_REPLICA_CHECK,
+
+    CANCEL_REPLICA_CHECK,
+
+    RESET_REPLICA_CHECK,
+
+    SHOW_REPLICA_CHECK_PROGRESS,
+
+    SHOW_REPLICA_CHECK_DIFF,
+
     DESCRIBE_COLUMNS,
 
     LOCK_TABLE,
@@ -1580,6 +1693,10 @@ public enum SqlKind {
     UNLOCK_TABLE,
 
     CHECK_TABLE,
+
+    CHECK_COLUMNAR_PARTITION,
+
+    CHECK_COLUMNAR_INDEX, // As a special DDL.
 
     CHECK_GLOBAL_INDEX, // As a special DDL.
 
@@ -1607,11 +1724,15 @@ public enum SqlKind {
 
     INSPECT_RULE_VERSION,
 
+    INSPECT_INDEX,
+
+    CHANGE_RULE_VERSION,
+
     REFRESH_LOCAL_RULES,
 
     CLEAR_SEQ_CACHE,
 
-    INSPECT_GROUP_SEQ_RANGE,
+    INSPECT_SEQ_RANGE,
 
     CONVERT_ALL_SEQUENCES,
 
@@ -1623,7 +1744,13 @@ public enum SqlKind {
 
     PAUSE_DDL_JOB,
 
+    PAUSE_REBALANCE_JOB,
+
     ROLLBACK_DDL_JOB,
+
+    TERMINATE_REBALANCE_JOB,
+
+    SKIP_REBALANCE_SUBJOB,
 
     REMOVE_DDL_JOB,
 
@@ -1645,6 +1772,7 @@ public enum SqlKind {
     SHOW_MOVE_DATABASE,
 
     PARTITION_BY,
+    SUBPARTITION_BY,
 
     RUNTIME_FILTER_BUILD,
     RUNTIME_FILTER,
@@ -1676,6 +1804,10 @@ public enum SqlKind {
      */
     TRUNCATE_PARTITION,
     /**
+     * partition management: reorganize partition
+     */
+    REORGANIZE_PARTITION,
+    /**
      * partition management: alter table group split partition
      */
     SPLIT_PARTITION,
@@ -1705,9 +1837,16 @@ public enum SqlKind {
     SPLIT_HOT_VALUE,
 
     /**
+     * subpartition management: modify subpartition
+     */
+    MODIFY_SUBPARTITION,
+
+    /**
      * partition management: create new tablegroup
      */
     CREATE_TABLEGROUP,
+
+    SHOW_CREATE_TABLEGROUP,
 
     /**
      * partition management: create new tablegroup
@@ -1726,9 +1865,16 @@ public enum SqlKind {
      */
     REBALANCE,
 
+    CREATE_STORAGE_POOL,
+    /**
+     * create storage pool
+     */
+    ALTER_STORAGE_POOL,
+
     /**
      * unarchive oss tables
      */
+    DROP_STORAGE_POOL,
     UNARCHIVE,
 
     /**
@@ -1752,6 +1898,11 @@ public enum SqlKind {
     DROP_FILESTORAGE,
 
     /**
+     * file storage management: clear fileStorage, which will only clear the meta-data of cold data storage
+     */
+    CLEAR_FILESTORAGE,
+
+    /**
      * alter table set tablegroup
      */
     ALTER_TABLE_SET_TABLEGROUP,
@@ -1765,6 +1916,10 @@ public enum SqlKind {
      */
     REFRESH_TOPOLOGY,
     /**
+     * refresh topology
+     */
+    REFRESH_MATERIALIZED_VIEW,
+    /**
      * allocate local partition
      */
     ALLOCATE_LOCAL_PARTITION,
@@ -1776,6 +1931,8 @@ public enum SqlKind {
      * REPARTITION_LOCAL_PARTITION
      */
     REPARTITION_LOCAL_PARTITION,
+
+    LOCAL_PARTITION,
 
     CREATE_FUNCTION,
 
@@ -1793,8 +1950,6 @@ public enum SqlKind {
 
     CREATE_TRIGGER,
 
-    DROP_TRIGGER,
-
     /**
      * partition management: create new joingroup
      */
@@ -1811,7 +1966,31 @@ public enum SqlKind {
     ALTER_JOINGROUP,
     MERGE_TABLEGROUP,
 
-    ALTER_TABLEGROUP_ADD_TABLE;
+    ALTER_TABLEGROUP_ADD_TABLE,
+
+    DROP_TRIGGER,
+
+    CREATE_ROLE,
+
+    DROP_ROLE,
+
+    CREATE_USER,
+
+    DROP_USER,
+
+    GRANT_PRIVILEGE,
+
+    GRANT_ROLE,
+
+    REVOKE_PRIVILEGE,
+
+    REVOKE_ROLE,
+
+    SET_PASSWORD,
+
+    ALTER_TABLE_DISCARD_TABLESPACE,
+    ALTER_TABLE_IMPORT_TABLESPACE,
+    ALTER_INSTANCE;
 
     //~ Static fields/initializers ---------------------------------------------
 
@@ -1833,6 +2012,7 @@ public enum SqlKind {
      * {@link #SHOW_VARIABLES        } ,
      * {@link #SHOW_PROCESSLIST      } ,
      * {@link #SHOW_TABLE_STATUS     } ,
+     * {@link #SHOW_TABLE_REPLICATE  } ,
      * {@link #SHOW_SLOW             } ,
      * {@link #SHOW_STC              } ,
      * {@link #SHOW_HTC              } ,
@@ -1856,6 +2036,7 @@ public enum SqlKind {
      * {@link #SHOW_GRANTS           } ,
      * {@link #DESCRIBE_COLUMNS      } ,
      * {@link #SHOW_AUTHORS          } ,
+     * {@link #SHOW_TABLE_ACCESS     } ,
      */
     public static final EnumSet<SqlKind> LOGICAL_SHOW_QUERY = EnumSet.of(SHOW_DATASOURCES,
         SHOW_NODE,
@@ -1870,6 +2051,7 @@ public enum SqlKind {
         SHOW_VARIABLES,
         SHOW_PROCESSLIST,
         SHOW_TABLE_STATUS,
+        SHOW_TABLE_REPLICATE,
         SHOW_SLOW,
         SHOW_STC,
         SHOW_HTC,
@@ -1892,18 +2074,25 @@ public enum SqlKind {
         SHOW_DDL_RESULTS,
         SHOW_SCHEDULE_RESULTS,
         SHOW_LOCALITY_INFO,
+        SHOW_PHYSICAL_DDL,
         SHOW_GRANTS,
         DESCRIBE_COLUMNS,
         SHOW_AUTHORS,
         SHOW_RECYCLEBIN,
         SHOW_INDEX,
         SHOW_PROFILE,
+        SHOW_PROFILES,
         SHOW_GLOBAL_INDEX,
+        SHOW_COLUMNAR_INDEX,
         SHOW_METADATA_LOCK,
         SHOW_TRANS,
+        SHOW_TRANS_STATS,
         SHOW_LOCAL_DEADLOCKS,
         SHOW_GLOBAL_DEADLOCKS,
-        SHOW_PARTITONS_HEATMAP);
+        SHOW_PARTITONS_HEATMAP,
+        SHOW_CHANGESET_STATS,
+        SHOW_CREATE_TABLEGROUP,
+        SHOW_TABLE_ACCESS);
 
     public static final EnumSet<SqlKind> LOGICAL_SHOW_WITH_TABLE = EnumSet.of(SHOW_CREATE_TABLE,
         SHOW_TOPOLOGY,
@@ -1913,19 +2102,27 @@ public enum SqlKind {
         DESCRIBE_COLUMNS,
         SHOW_PARTITIONS);
     public static final EnumSet<SqlKind> LOGICAL_SHOW_WITH_SCHEMA = EnumSet.of(SHOW_TABLES,
-        SHOW_LOCALITY_INFO
+        SHOW_LOCALITY_INFO, SHOW_PARTITIONS, SHOW_PHYSICAL_DDL
     );
 
     public static final EnumSet<SqlKind> LOGICAL_SHOW_BINLOG =
-        EnumSet.of(SHOW_BINARY_LOGS, SHOW_BINLOG_EVENTS, SHOW_MASTER_STATUS, SHOW_BINARY_STREAMS);
+        EnumSet.of(SHOW_BINARY_LOGS, SHOW_BINLOG_EVENTS, SHOW_MASTER_STATUS, SHOW_BINARY_STREAMS, SHOW_CDC_STORAGE);
 
     public static final EnumSet<SqlKind> LOGICAL_REPLICATION = EnumSet.of(CHANGE_MASTER,
-        START_SLAVE, STOP_SLAVE, CHANGE_REPLICATION_FILTER, SHOW_SLAVE_STATUS, RESET_SLAVE);
+        START_SLAVE, STOP_SLAVE, CHANGE_REPLICATION_FILTER, SHOW_SLAVE_STATUS, RESET_SLAVE, REPLICA_HASH_CHECK,
+        START_REPLICA_CHECK, PAUSE_REPLICA_CHECK, CONTINUE_REPLICA_CHECK, CANCEL_REPLICA_CHECK, RESET_REPLICA_CHECK,
+        SHOW_REPLICA_CHECK_PROGRESS, SHOW_REPLICA_CHECK_DIFF);
+
+    public static final EnumSet<SqlKind> LOGICAL_CDC_COMMAND =
+        EnumSet.of(START_MASTER, STOP_MASTER, RESTART_MASTER, REBALANCE_MASTER, RESET_MASTER, SET_CDC_GLOBAL,
+            FLUSH_LOGS);
 
     public static final EnumSet<SqlKind> SHOW_QUERY = concat(EnumSet.of(SHOW), LOGICAL_SHOW_QUERY);
 
     public static final EnumSet<SqlKind> TABLE_MAINTENANCE_QUERY = EnumSet.of(CHECK_TABLE,
         CHECK_GLOBAL_INDEX,
+        CHECK_COLUMNAR_INDEX,
+        CHECK_COLUMNAR_PARTITION,
         ANALYZE_TABLE,
         OPTIMIZE_TABLE);
 
@@ -1934,7 +2131,10 @@ public enum SqlKind {
         RECOVER_DDL_JOB,
         CONTINUE_DDL_JOB,
         PAUSE_DDL_JOB,
+        PAUSE_REBALANCE_JOB,
         ROLLBACK_DDL_JOB,
+        TERMINATE_REBALANCE_JOB,
+        SKIP_REBALANCE_SUBJOB,
         REMOVE_DDL_JOB,
         INSPECT_DDL_JOB_CACHE,
         CLEAR_DDL_JOB_CACHE,
@@ -1942,7 +2142,7 @@ public enum SqlKind {
         INSPECT_RULE_VERSION,
         REFRESH_LOCAL_RULES,
         CLEAR_SEQ_CACHE,
-        INSPECT_GROUP_SEQ_RANGE,
+        INSPECT_SEQ_RANGE,
         CONVERT_ALL_SEQUENCES,
         BASELINE,
         MOVE_DATABASE,
@@ -1983,6 +2183,14 @@ public enum SqlKind {
     public static final EnumSet<SqlKind> WINDOW_FUNCTION =
         EnumSet.of(LEAD, LAG, FIRST_VALUE, LAST_VALUE, NTILE, ROW_NUMBER,
             NTH_VALUE, RANK, PERCENT_RANK, DENSE_RANK, CUME_DIST);
+
+    /**
+     * aggregate function only used in window
+     */
+    public static final EnumSet<SqlKind> WINDOW_AGG =
+        EnumSet.of(LEAD, LAG, NTH_VALUE, FIRST_VALUE, LAST_VALUE,
+            NTILE, ROW_NUMBER, RANK, PERCENT_RANK, DENSE_RANK,
+            CUME_DIST);
 
     /**
      * Category consisting of all DML operators.
@@ -2035,39 +2243,49 @@ public enum SqlKind {
             CREATE_PROCEDURE, DROP_PROCEDURE, ALTER_PROCEDURE,
             CREATE_INDEX, ALTER_INDEX, DROP_INDEX, ALTER_RENAME_INDEX, RENAME_TABLE,
             SET_OPTION, OTHER_DDL, TRUNCATE_TABLE, RENAME_SEQUENCE, ALTER_RULE, ENABLE_KEYS, CREATE_DATABASE,
-            DROP_DATABASE,
-            MOVE_DATABASE, CHECK_GLOBAL_INDEX, ALTER_TABLEGROUP, CREATE_TABLEGROUP,
+            DROP_DATABASE, ALTER_DATABASE, IMPORT_DATABASE, IMPORT_SEQUENCE,
+            MOVE_DATABASE, CHECK_GLOBAL_INDEX, CHECK_COLUMNAR_INDEX, ALTER_TABLEGROUP, CREATE_TABLEGROUP,
+            CREATE_JAVA_FUNCTION, DROP_JAVA_FUNCTION,
             CHANGE_CONSENSUS_ROLE, ALTER_SYSTEM_SET_CONFIG, ALTER_TABLE_SET_TABLEGROUP,
-            REFRESH_TOPOLOGY, DROP_TABLEGROUP, ALTER_FILESTORAGE, DROP_FILESTORAGE, CREATE_FILESTORAGE,
+            REFRESH_TOPOLOGY, DROP_TABLEGROUP,
+            ALTER_FILESTORAGE, DROP_FILESTORAGE, CLEAR_FILESTORAGE, CREATE_FILESTORAGE,
             CREATE_JOINGROUP, DROP_JOINGROUP, ALTER_JOINGROUP,
-            OPTIMIZE_TABLE
+            OPTIMIZE_TABLE, ANALYZE_TABLE,
+            CREATE_STORAGE_POOL, ALTER_STORAGE_POOL, DROP_STORAGE_POOL, ALTER_INSTANCE
         ));
 
     public static final EnumSet<SqlKind> DDL_SUPPORTED_BY_NEW_ENGINE =
         EnumSet.of(RENAME_TABLE, TRUNCATE_TABLE, DROP_TABLE, CREATE_INDEX, DROP_INDEX, ALTER_TABLE, CREATE_TABLE,
-            ALTER_TABLEGROUP, ALTER_TABLE_SET_TABLEGROUP, REFRESH_TOPOLOGY, CHECK_GLOBAL_INDEX, ALTER_RULE,
-            MOVE_DATABASE, ALTER_FILESTORAGE, DROP_FILESTORAGE, CREATE_FILESTORAGE, CREATE_JOINGROUP, DROP_JOINGROUP,
-            ALTER_JOINGROUP, MERGE_TABLEGROUP,
-            ALTER_TABLEGROUP_ADD_TABLE, OPTIMIZE_TABLE, PUSH_DOWN_UDF, CREATE_FUNCTION, DROP_FUNCTION, ALTER_FUNCTION,
-            CREATE_PROCEDURE, DROP_PROCEDURE, ALTER_PROCEDURE);
+            ALTER_TABLEGROUP, ALTER_TABLE_SET_TABLEGROUP, REFRESH_TOPOLOGY, CHECK_GLOBAL_INDEX, CHECK_COLUMNAR_INDEX,
+            ALTER_RULE, MOVE_DATABASE, ALTER_FILESTORAGE, DROP_FILESTORAGE, CLEAR_FILESTORAGE, CREATE_FILESTORAGE,
+            CREATE_JOINGROUP, DROP_JOINGROUP, ALTER_JOINGROUP, MERGE_TABLEGROUP,
+            CREATE_VIEW, DROP_VIEW, CREATE_JAVA_FUNCTION, DROP_JAVA_FUNCTION, ANALYZE_TABLE,
+            ALTER_TABLEGROUP_ADD_TABLE, OPTIMIZE_TABLE, DROP_MATERIALIZED_VIEW, PUSH_DOWN_UDF,
+            CREATE_FUNCTION,
+            DROP_FUNCTION, ALTER_FUNCTION, CREATE_PROCEDURE, DROP_PROCEDURE, ALTER_PROCEDURE, ALTER_DATABASE,
+            IMPORT_DATABASE, IMPORT_SEQUENCE,
+            CREATE_STORAGE_POOL, ALTER_STORAGE_POOL, DROP_STORAGE_POOL, ALTER_INSTANCE);
 
     public static final EnumSet<SqlKind> SUPPORT_DDL =
         EnumSet.of(CREATE_TABLE, ALTER_TABLE, DROP_TABLE,
             CREATE_VIEW, ALTER_VIEW, DROP_VIEW,
             CREATE_MATERIALIZED_VIEW, ALTER_MATERIALIZED_VIEW,
             DROP_MATERIALIZED_VIEW,
+            CREATE_STORAGE_POOL, ALTER_STORAGE_POOL, DROP_STORAGE_POOL,
             CREATE_SEQUENCE, ALTER_SEQUENCE, DROP_SEQUENCE,
             CREATE_TRIGGER, DROP_TRIGGER,
             CREATE_FUNCTION, DROP_FUNCTION, ALTER_FUNCTION, PUSH_DOWN_UDF,
             CREATE_PROCEDURE, DROP_PROCEDURE, ALTER_PROCEDURE,
             CREATE_INDEX, ALTER_INDEX, DROP_INDEX, ALTER_RENAME_INDEX, RENAME_TABLE, TRUNCATE_TABLE, RENAME_SEQUENCE,
-            CREATE_DATABASE,
-            DROP_DATABASE, CHECK_GLOBAL_INDEX, MOVE_DATABASE,
+            CREATE_DATABASE, ALTER_DATABASE, IMPORT_DATABASE, IMPORT_SEQUENCE,
+            DROP_DATABASE, CHECK_GLOBAL_INDEX, CHECK_COLUMNAR_INDEX, MOVE_DATABASE,
+            CREATE_JAVA_FUNCTION, DROP_JAVA_FUNCTION,
             CHANGE_CONSENSUS_ROLE, ALTER_SYSTEM_SET_CONFIG,
             ALTER_TABLEGROUP,
             REBALANCE, ALLOCATE_LOCAL_PARTITION, REPARTITION_LOCAL_PARTITION,
             CREATE_JOINGROUP, DROP_JOINGROUP, ALTER_JOINGROUP, MERGE_TABLEGROUP, ALTER_TABLEGROUP_ADD_TABLE,
-            OPTIMIZE_TABLE);
+            OPTIMIZE_TABLE, ANALYZE_TABLE, ALTER_TABLE_DISCARD_TABLESPACE, ALTER_TABLE_IMPORT_TABLESPACE,
+            ALTER_INSTANCE);
 
     public static final EnumSet<SqlKind> SUPPORT_SHADOW_DDL =
         EnumSet.of(CREATE_TABLE, ALTER_TABLE, DROP_TABLE,
@@ -2083,8 +2301,11 @@ public enum SqlKind {
     public static final EnumSet<SqlKind> SUPPORT_SCHEDULE =
         EnumSet.of(CREATE_SCHEDULE, DROP_SCHEDULE, PAUSE_SCHEDULE, CONTINUE_SCHEDULE, FIRE_SCHEDULE);
 
+    public static final EnumSet<SqlKind> SUPPORT_LBAC_SECURITY =
+        EnumSet.of(SqlKind.CREATE_SECURITY_LABEL_COMPONENT, SqlKind.DROP_SECURITY_LABEL_COMPONENT, SqlKind.CREATE_SECURITY_LABEL, SqlKind.DROP_SECURITY_LABEL, SqlKind.CREATE_SECURITY_POLICY, SqlKind.DROP_SECURITY_POLICY, SqlKind.GRANT_SECURITY_LABEL, SqlKind.REVOKE_SECURITY_LABEL, SqlKind.CREATE_SECURITY_ENTITY, SqlKind.DROP_SECURITY_ENTITY);
+
     public static final EnumSet<SqlKind> SUPPORT_ALTER_SYSTEM_DAL =
-        EnumSet.of(ALTER_SYSTEM_REFRESH_STORAGE, ALTER_SYSTEM_RELOAD_STORAGE);
+        EnumSet.of(ALTER_SYSTEM_REFRESH_STORAGE, ALTER_SYSTEM_RELOAD_STORAGE, ALTER_SYSTEM_LEADER);
 
     /**
      * Category consisting of all DAL operators.
@@ -2096,9 +2317,11 @@ public enum SqlKind {
         SQL_TABLE_LOCK,
         SQL_TRANS,
         SUPPORT_CCL,
-        LOGICAL_REPLICATION,
         SUPPORT_SCHEDULE,
-        SUPPORT_ALTER_SYSTEM_DAL);
+        SUPPORT_ALTER_SYSTEM_DAL,
+        LOGICAL_REPLICATION,
+        LOGICAL_CDC_COMMAND,
+        SUPPORT_LBAC_SECURITY);
 
     /**
      * Category consisting of query node types.

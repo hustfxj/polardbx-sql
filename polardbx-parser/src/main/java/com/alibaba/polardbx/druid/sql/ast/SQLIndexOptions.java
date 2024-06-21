@@ -25,10 +25,6 @@ import java.util.List;
 
 /**
  * @version 1.0
- * @ClassName SQLIndexOptions
- * @description
- * @Author zzy
- * @Date 2019-06-04 11:48
  */
 public class SQLIndexOptions extends SQLObjectImpl {
 
@@ -38,6 +34,7 @@ public class SQLIndexOptions extends SQLObjectImpl {
     private SQLExpr comment;
     private String algorithm;
     private String lock;
+    private String dictionaryColumns;
     private List<SQLAssignItem> otherOptions = new ArrayList<SQLAssignItem>();
 
     public String getIndexType() {
@@ -108,7 +105,8 @@ public class SQLIndexOptions extends SQLObjectImpl {
         // Old parser code put it in options list.
         if (algorithm != null && getParent() != null && getParent() instanceof SQLIndexDefinition) {
             SQLIndexDefinition parent = (SQLIndexDefinition) getParent();
-            SQLAssignItem assignItem = new SQLAssignItem(new SQLIdentifierExpr("ALGORITHM"), new SQLIdentifierExpr(algorithm));
+            SQLAssignItem assignItem =
+                new SQLAssignItem(new SQLIdentifierExpr("ALGORITHM"), new SQLIdentifierExpr(algorithm));
             if (getParent() != null && getParent().getParent() != null) {
                 assignItem.setParent(getParent().getParent());
             } else {
@@ -136,6 +134,14 @@ public class SQLIndexOptions extends SQLObjectImpl {
             }
             parent.getCompatibleOptions().add(assignItem);
         }
+    }
+
+    public String getDictionaryColumns() {
+        return dictionaryColumns;
+    }
+
+    public void setDictionaryColumns(String dictionaryColumns) {
+        this.dictionaryColumns = dictionaryColumns;
     }
 
     public List<SQLAssignItem> getOtherOptions() {
@@ -167,6 +173,7 @@ public class SQLIndexOptions extends SQLObjectImpl {
         }
         options.algorithm = algorithm;
         options.lock = lock;
+        options.dictionaryColumns = dictionaryColumns;
         for (SQLAssignItem item : otherOptions) {
             SQLAssignItem item1 = item.clone();
             item1.setParent(parent);

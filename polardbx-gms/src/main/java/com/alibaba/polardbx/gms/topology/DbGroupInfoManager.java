@@ -19,12 +19,15 @@ package com.alibaba.polardbx.gms.topology;
 import com.alibaba.polardbx.common.model.Group;
 import com.alibaba.polardbx.common.model.lifecycle.AbstractLifecycle;
 import com.alibaba.polardbx.config.ConfigDataMode;
+import com.alibaba.polardbx.gms.listener.impl.MetaDbConfigManager;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbDataIdBuilder;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
+import com.alibaba.polardbx.gms.util.InstIdUtil;
 import com.alibaba.polardbx.gms.util.MetaDbLogUtil;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -40,6 +43,7 @@ public class DbGroupInfoManager extends AbstractLifecycle {
 
     private final static DbGroupInfoManager instance = new DbGroupInfoManager();
 
+    //!!!NOTE!!! the key(schema name) should convert to lower case
     private final static Map<String, Map<String, DbGroupInfoRecord>> cache = new ConcurrentHashMap<>();
 
     public static DbGroupInfoManager getInstance() {
@@ -70,6 +74,7 @@ public class DbGroupInfoManager extends AbstractLifecycle {
                 records.stream().collect(Collectors.toMap(x -> x.groupName, x -> x));
 
             // replace existed cache
+            schema = schema.toLowerCase();
             cache.put(schema, dbGroups);
             MetaDbLogUtil.META_DB_LOG.info(String.format("reload db group info for database %s: %s", schema, records));
         } catch (SQLException e) {
@@ -78,11 +83,21 @@ public class DbGroupInfoManager extends AbstractLifecycle {
     }
 
     public DbGroupInfoRecord queryGroupInfo(String schema, String groupName) {
+        schema = schema.toLowerCase();
         Map<String, DbGroupInfoRecord> dbGroup = cache.get(schema);
         if (dbGroup == null) {
             return null;
         }
         return dbGroup.get(groupName);
+    }
+
+    public List<DbGroupInfoRecord> queryGroupInfoBySchema(String schema) {
+        schema = schema.toLowerCase();
+        Map<String, DbGroupInfoRecord> dbGroup = cache.get(schema);
+        if (dbGroup == null) {
+            return null;
+        }
+        return new ArrayList<>(dbGroup.values());
     }
 
     public static boolean isNormalGroup(Group group) {
@@ -108,6 +123,7 @@ public class DbGroupInfoManager extends AbstractLifecycle {
             reloadGroupsOfDb(dbName);
         }
         for (String dbName : removed.keySet()) {
+            dbName = dbName.toLowerCase();
             cache.remove(dbName);
         }
 
@@ -116,6 +132,26 @@ public class DbGroupInfoManager extends AbstractLifecycle {
     public void onDbTopologyListener(String dataId) {
         String schema = MetaDbDataIdBuilder.resolveDbTopologyDataId(dataId);
         reloadGroupsOfDb(schema);
+    }
+
+    public void unbindListenersForAllGroupsOfDb(String schema) {
+        try (Connection conn = MetaDbDataSource.getInstance().getConnection()) {
+            DbGroupInfoAccessor dbGroupInfoAccessor = new DbGroupInfoAccessor();
+            dbGroupInfoAccessor.setConnection(conn);
+            String instId = InstIdUtil.getInstId();
+            List<DbGroupInfoRecord> records = dbGroupInfoAccessor.queryDbGroupByDbName(schema);
+            for (int i = 0; i < records.size(); i++) {
+                DbGroupInfoRecord dbGrp = records.get(i);
+                String grpName = dbGrp.groupName;
+                String grpDataId = MetaDbDataIdBuilder.getGroupConfigDataId(instId, schema, grpName);
+                MetaDbConfigManager.getInstance().unbindListener(grpDataId);
+            }
+            MetaDbLogUtil.META_DB_LOG.info(
+                String.format("unbind all listeners for groups info for database %s", schema));
+        } catch (SQLException e) {
+            MetaDbLogUtil.META_DB_LOG.error(
+                String.format("failed to unbind all listeners for groups of database %s: ", schema) + e);
+        }
     }
 
 }

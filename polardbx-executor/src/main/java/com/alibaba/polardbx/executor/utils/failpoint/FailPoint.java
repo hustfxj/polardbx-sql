@@ -16,8 +16,8 @@
 
 package com.alibaba.polardbx.executor.utils.failpoint;
 
-import com.google.common.base.Joiner;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
+import com.google.common.base.Joiner;
 import org.apache.commons.lang.math.RandomUtils;
 import org.apache.commons.lang3.StringUtils;
 
@@ -64,6 +64,16 @@ public class FailPoint {
         try {
             assert
                 !isKeyEnable(key)
+                : supply(runnable);
+        } catch (AssertionError e) {
+            //ignore
+        }
+    }
+
+    public static void inject(String key, ExecutionContext executionContext, Runnable runnable) {
+        try {
+            assert
+                !(isKeyEnable(key) && isKeyEnableFromHint(key, executionContext))
                 : supply(runnable);
         } catch (AssertionError e) {
             //ignore
@@ -138,7 +148,7 @@ public class FailPoint {
             int percentage = Integer.valueOf(v);
             int val = RandomUtils.nextInt(100);
             if (val <= percentage) {
-//                throw new RuntimeException("injected failure from " + key);
+                throw new RuntimeException("injected failure from " + key);
             }
         });
     }
@@ -148,7 +158,7 @@ public class FailPoint {
             int percentage = Integer.valueOf(v);
             int val = RandomUtils.nextInt(100);
             if (val <= percentage) {
-                // throw new RuntimeException("injected failure from " + key);
+                throw new RuntimeException("injected failure from " + key);
             }
         });
     }
@@ -189,6 +199,18 @@ public class FailPoint {
 
     public static void injectException(String key) {
         inject(key, () -> {
+            throw new RuntimeException("injected failure from " + key);
+        });
+    }
+
+    public static void injectExceptionFromHint(String key, ExecutionContext executionContext) {
+        injectFromHint(key, executionContext, () -> {
+            throw new RuntimeException("injected failure from " + key);
+        });
+    }
+
+    public static void injectExceptionFromHintWithKeyEnable(String key, ExecutionContext executionContext) {
+        inject(key, executionContext, () -> {
             throw new RuntimeException("injected failure from " + key);
         });
     }

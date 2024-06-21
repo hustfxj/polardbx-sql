@@ -138,7 +138,7 @@ public class LogicalShowHtcHandler extends HandlerCommon {
             } else {
                 loadStr = "-1";
             }
-        } catch (SigarException e) {
+        } catch (SigarException | UnsatisfiedLinkError e) {
             e.printStackTrace();
             loadStr = "-1";
         }
@@ -182,7 +182,7 @@ public class LogicalShowHtcHandler extends HandlerCommon {
                 obs.add(0);
                 obs.add(0);
             }
-        } catch (SigarException e) {
+        } catch (SigarException | UnsatisfiedLinkError e) {
             e.printStackTrace();
         }
         return obs;
@@ -205,11 +205,11 @@ public class LogicalShowHtcHandler extends HandlerCommon {
                     NetInterfaceStat ifstat = sigar.getNetInterfaceStat(name);
                     netRev += ifstat.getRxBytes();
                     netSend += ifstat.getTxBytes();
-                } catch (SigarNotImplementedException e) {
                 } catch (SigarException e) {
+                    // ignore
                 }
             }
-        } catch (Exception e) {
+        } catch (Exception | UnsatisfiedLinkError e) {
             e.printStackTrace();
         }
         map.put("netIn", netRev);

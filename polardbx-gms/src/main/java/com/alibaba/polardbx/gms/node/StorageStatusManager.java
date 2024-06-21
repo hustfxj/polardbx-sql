@@ -26,23 +26,23 @@ import com.alibaba.polardbx.gms.ha.impl.StorageHaManager;
 import com.alibaba.polardbx.gms.ha.impl.StorageInstHaContext;
 import com.alibaba.polardbx.gms.sync.GmsSyncManagerHelper;
 import com.alibaba.polardbx.gms.sync.RefreshStorageStatusSyncAction;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.gms.topology.DbTopologyManager;
-import com.alibaba.polardbx.gms.topology.ServerInstIdManager;
 import com.alibaba.polardbx.gms.topology.SystemDbHelper;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-
-import static com.alibaba.polardbx.gms.sync.SyncScope.ALL;
+import java.util.function.Supplier;
 
 public class StorageStatusManager extends AbstractLifecycle {
 
@@ -54,18 +54,13 @@ public class StorageStatusManager extends AbstractLifecycle {
 
     private static StorageStatusManager instance = new StorageStatusManager();
 
-    private static long KEEPALIVE_INTERVAR = 3L;
+    private static long KEEPALIVE_INTERVAL = 1L;
+
+    private static int WINDOW_SIZE = 3;
+
+    private static int UNNOTIFY_SYNC_THRESHOLD = 60;
 
     private Map<String, StorageStatus> statusMap = new HashMap<>();
-
-    /**
-     * 允许承担来自于主CN的请求路由给该只读实例集合
-     */
-    private Set<String> allowedReadLearnerIds = new HashSet<>();
-    /**
-     * 允许承担来自于主CN的请求路由给该只读DN集合
-     */
-    private Map<String, StorageStatus> allowReadLearnerStorageMap = new HashMap<>();
 
     public static StorageStatusManager getInstance() {
         if (!instance.isInited()) {
@@ -84,119 +79,164 @@ public class StorageStatusManager extends AbstractLifecycle {
             ScheduledExecutorService scheduledExecutorService = Executors.newSingleThreadScheduledExecutor(
                 new NamedThreadFactory("Storage-Status-Factory", true));
             scheduledExecutorService
-                .scheduleWithFixedDelay(new StorageLearnerStatusTask(), 0L, KEEPALIVE_INTERVAR,
+                .scheduleWithFixedDelay(new StorageLearnerStatusTask(), 0L, KEEPALIVE_INTERVAL,
                     TimeUnit.SECONDS);
         }
     }
 
     public void setStorageStatus(Map<String, StorageStatus> statusMap) {
-
         this.statusMap = statusMap;
-        Map<String, StorageStatus> allowReadLearnerStorageMap = new HashMap<>();
-        if (!ConfigDataMode.isMasterMode()) {
-            //pick the learners belong to the current pxc for the slave
-            String currentId = ServerInstIdManager.getInstance().getInstId();
-            Set<String> storageIds = ServerInstIdManager.getInstance().getInstId2StorageIds().get(currentId);
-
-            Iterator<Map.Entry<String, StorageStatus>> iterator = this.statusMap.entrySet().iterator();
-            while (iterator.hasNext()) {
-                Map.Entry<String, StorageStatus> iter = iterator.next();
-                if (storageIds.contains(iter.getKey())) {
-                    allowReadLearnerStorageMap.put(iter.getKey(), iter.getValue());
-                }
-            }
-        } else {
-            Iterator<Map.Entry<String, StorageStatus>> iterator = this.statusMap.entrySet().iterator();
-            while (iterator.hasNext()) {
-                Map.Entry<String, StorageStatus> iter = iterator.next();
-                StorageStatus ret = iter.getValue();
-                if (allowedReadLearnerIds.contains(ret.getInstId())) {
-                    allowReadLearnerStorageMap.put(iter.getKey(), iter.getValue());
-                }
-            }
-        }
-        this.allowReadLearnerStorageMap = allowReadLearnerStorageMap;
     }
 
     public Map<String, StorageStatus> getStorageStatus() {
         return statusMap;
     }
 
-    public Map<String, StorageStatus> getAllowReadLearnerStorageMap() {
-        return allowReadLearnerStorageMap;
-    }
-
     public class StorageLearnerStatusTask implements Runnable {
+
+        private LinkedList<Map<String, StorageStatus>> windowStatus = new LinkedList<Map<String, StorageStatus>>();
+
+        private int unnotifyNum = 0;
+
+        private Map<String, StorageStatus> calculateSendStatus(Map<String, StorageStatus> currentElement) {
+            if (windowStatus.size() >= WINDOW_SIZE) {
+                windowStatus.removeFirst();
+            }
+            windowStatus.addLast(currentElement);
+
+            Map<String, StorageStatus> maybeSendStatus = new HashMap<>();
+            if (windowStatus.size() >= WINDOW_SIZE) {
+                Map<String, List<StorageStatus>> storageIdStatus = new HashMap<>();
+                for (Map<String, StorageStatus> status : windowStatus) {
+                    for (Map.Entry<String, StorageStatus> entry : status.entrySet()) {
+                        storageIdStatus.computeIfAbsent(
+                            entry.getKey(), b -> new ArrayList<>()).add(entry.getValue());
+                    }
+                }
+                for (Map.Entry<String, List<StorageStatus>> entry : storageIdStatus.entrySet()) {
+                    StorageStatus lastStorageStatus = entry.getValue().get(entry.getValue().size() - 1);
+                    StorageStatus clone = lastStorageStatus.clone();
+                    boolean busy = entry.getValue().stream().anyMatch(t -> t.isBusy());
+                    boolean delay = entry.getValue().stream().anyMatch(t -> t.isDelay());
+                    clone.setBusy(busy);
+                    clone.setDelay(delay);
+                    maybeSendStatus.put(entry.getKey(), clone);
+                }
+            }
+            return maybeSendStatus;
+        }
 
         @Override
         public void run() {
 
             try {
                 if (LeaderStatusBridge.getInstance().hasLeadership()) {
+                    //1. detection the master && htap learner.
                     Map<String, StorageStatus> polarDBXStatusMap = new HashMap<>();
+                    //storageStatusMap only storageIds of master && htap-learner.
                     Map<String, StorageInstHaContext> storageStatusMap =
                         StorageHaManager.getInstance().getStorageHaCtxCache();
                     Iterator<StorageInstHaContext> iterator = storageStatusMap.values().stream().iterator();
                     while (iterator.hasNext()) {
                         StorageInstHaContext instHaContext = iterator.next();
                         if (instHaContext != null) {
-
-                            long delaySecond = 0;
-                            long activeSession = 0;
-                            Connection salveConn = null;
-                            try {
-                                if (instHaContext.isMasterMode()) {
-                                    salveConn = DbTopologyManager.getFollowerConnectionForStorage(instHaContext);
-                                } else {
-                                    salveConn = DbTopologyManager.getConnectionForStorage(instHaContext);
-                                }
-                                if (salveConn == null) {
-                                    continue;
-                                }
-
-                                Statement stmt = null;
-                                try {
-                                    stmt = salveConn.createStatement();
-                                    stmt.execute(SHOW_SLAVE_STATUS);
-                                    ResultSet result = stmt.getResultSet();
-                                    if (result.next()) {
-                                        Object ret = result.getObject("Seconds_Behind_Master");
-                                        boolean running = result.getBoolean("Slave_SQL_Running");
-                                        if (running) {
-                                            if (ret != null) {
-                                                delaySecond = Long.valueOf(String.valueOf(ret));
-                                            } else {
-                                                delaySecond = Integer.MAX_VALUE;
-                                                //logger.debug("Slave_SQL_Running maybe shutdown!");
-                                            }
-                                        } else {
-                                            delaySecond = Integer.MAX_VALUE;
-                                            //logger.debug("Slave_SQL_Running shutdown!");
-                                        }
+                            detection(() -> {
+                                    if (instHaContext.isMasterMode()) {
+                                        return DbTopologyManager.getFollowerConnectionForStorage(instHaContext);
+                                    } else {
+                                        return DbTopologyManager.getConnectionForStorage(instHaContext);
                                     }
-                                } finally {
-                                    if (stmt != null) {
-                                        stmt.close();
-                                    }
-                                }
+                                }, instHaContext.getInstId(), instHaContext.getStorageInstId(),
+                                polarDBXStatusMap);
+                        }
+                    }
 
-                                try {
-                                    stmt = salveConn.createStatement();
-                                    stmt.execute(ACTIVE_SESSION);
-                                    ResultSet result = stmt.getResultSet();
-                                    if (result.next()) {
-                                        activeSession += result.getLong(1);
-                                    }
-                                } finally {
-                                    if (stmt != null) {
-                                        stmt.close();
-                                    }
-                                }
+                    Map<String, StorageStatus> maybeSendStatus = null;
+                    if (polarDBXStatusMap.size() > 0) {
+                        maybeSendStatus = calculateSendStatus(polarDBXStatusMap);
+                    }
 
-                            } catch (Throwable e) {
-                                activeSession = 0;
+                    if (maybeSendStatus != null && maybeSendStatus.size() > 0) {
+                        boolean change = false;
+                        for (Map.Entry<String, StorageStatus> entry : maybeSendStatus.entrySet()) {
+                            StorageStatus storageStatus = entry.getValue();
+                            StorageStatus last = statusMap.get(entry.getKey());
+                            if (last == null || !last.satisfy(storageStatus)) {
+                                change = true;
+                                break;
+                            }
+                        }
+                        if (change) {
+                            unnotifyNum = 0;
+                        } else {
+                            unnotifyNum++;
+                        }
+                        if (change || unnotifyNum > UNNOTIFY_SYNC_THRESHOLD) {
+                            GmsSyncManagerHelper
+                                .sync(new RefreshStorageStatusSyncAction(polarDBXStatusMap),
+                                    SystemDbHelper.DEFAULT_DB_NAME,
+                                    SyncScope.NOT_COLUMNAR_SLAVE);
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                logger.error("check slave delay error!", t);
+            }
+        }
+
+        private void detection(Supplier<Connection> connectionSupplier, String instId, String storageId,
+                               Map<String, StorageStatus> polarDBXStatusMap) {
+            long delaySecond = 0;
+            long activeSession = 0;
+            Connection salveConn = null;
+            try {
+                salveConn = connectionSupplier.get();
+                Statement stmt = null;
+                if (salveConn == null) {
+                    return;
+                }
+                try {
+                    stmt = salveConn.createStatement();
+                    stmt.execute(SHOW_SLAVE_STATUS);
+                    ResultSet result = stmt.getResultSet();
+                    if (result.next()) {
+                        Object ret = result.getObject("Seconds_Behind_Master");
+                        boolean running = result.getBoolean("Slave_SQL_Running");
+                        if (running) {
+                            if (ret != null) {
+                                delaySecond = Long.valueOf(String.valueOf(ret));
+                            } else {
                                 delaySecond = Integer.MAX_VALUE;
-                                logger.warn("check slave status error for " + instHaContext.getStorageInstId(), e);
+                                //logger.debug("Slave_SQL_Running maybe shutdown!");
+                            }
+                        } else {
+                            delaySecond = Integer.MAX_VALUE;
+                            //logger.debug("Slave_SQL_Running shutdown!");
+                        }
+                    }
+                } finally {
+                    if (stmt != null) {
+                        stmt.close();
+                    }
+                }
+
+                try {
+                    stmt = salveConn.createStatement();
+                    stmt.execute(ACTIVE_SESSION);
+                    ResultSet result = stmt.getResultSet();
+                    if (result.next()) {
+                        activeSession += result.getLong(1);
+                    }
+                } finally {
+                    if (stmt != null) {
+                        stmt.close();
+                    }
+                }
+
+            } catch (Throwable e) {
+                activeSession = 0;
+                delaySecond = Integer.MAX_VALUE;
+                logger.warn("check slave status error for " + storageId, e);
                                 if (salveConn != null) {
                                     try {
                                         salveConn.close();
@@ -205,28 +245,22 @@ public class StorageStatusManager extends AbstractLifecycle {
                                         //ignore
                                     }
                                 }
-                            }
-                            boolean isBusy = activeSession >= DynamicConfig.getInstance().getBusyThreshold();
-                            boolean isDelay = delaySecond >= DynamicConfig.getInstance().getDelayThreshold();
-
-                            polarDBXStatusMap
-                                .put(instHaContext.getStorageInstId(), new StorageStatus(
-                                    instHaContext.getInstId(), delaySecond, activeSession, isBusy, isDelay));
-                        }
-                    }
-                    if (polarDBXStatusMap.size() > 0) {
-                        GmsSyncManagerHelper
-                            .sync(new RefreshStorageStatusSyncAction(polarDBXStatusMap), SystemDbHelper.DEFAULT_DB_NAME,
-                                ALL);
+                            }finally {
+                if (salveConn != null) {
+                    try {
+                        salveConn.close();
+                    } catch (Throwable t) {
+                        //ignore
                     }
                 }
-            } catch (Throwable t) {
-                logger.error("check slave delay error!", t);
             }
+            boolean isBusy = activeSession >= DynamicConfig.getInstance().getBusyThreshold();
+            boolean isDelay = delaySecond >= DynamicConfig.getInstance().getDelayThreshold();
+            if (isDelay) {
+//                logger.warn("The storage id " + storageId + " is delay");
+            }
+            polarDBXStatusMap.put(storageId,
+                new StorageStatus(instId, delaySecond, activeSession, isBusy, isDelay));
         }
-    }
-
-    public void allowedReadLearnerIds(Set<String> allowedReadLearnerIds) {
-        this.allowedReadLearnerIds = allowedReadLearnerIds;
     }
 }

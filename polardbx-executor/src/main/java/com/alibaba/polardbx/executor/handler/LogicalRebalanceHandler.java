@@ -22,22 +22,26 @@ import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.Assert;
-import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.executor.balancer.BalanceOptions;
 import com.alibaba.polardbx.executor.balancer.Balancer;
+import com.alibaba.polardbx.executor.balancer.action.ActionUtils;
 import com.alibaba.polardbx.executor.balancer.action.BalanceAction;
 import com.alibaba.polardbx.executor.balancer.policy.PolicyDrainNode;
 import com.alibaba.polardbx.executor.cursor.Cursor;
 import com.alibaba.polardbx.executor.cursor.impl.ArrayResultCursor;
 import com.alibaba.polardbx.executor.ddl.job.task.shared.EmptyTask;
+import com.alibaba.polardbx.executor.ddl.job.validator.TableValidator;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJob;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
 import com.alibaba.polardbx.executor.ddl.newengine.job.TransientDdlJob;
+import com.alibaba.polardbx.executor.ddl.util.ChangeSetUtils;
 import com.alibaba.polardbx.executor.handler.ddl.LogicalCommonDdlHandler;
+import com.alibaba.polardbx.executor.physicalbackfill.PhysicalBackfillUtils;
+import com.alibaba.polardbx.executor.scaleout.ScaleOutUtils;
 import com.alibaba.polardbx.executor.spi.IRepository;
 import com.alibaba.polardbx.gms.scheduler.DdlPlanAccessor;
 import com.alibaba.polardbx.gms.scheduler.DdlPlanRecord;
@@ -45,9 +49,11 @@ import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.alibaba.polardbx.gms.topology.DbInfoRecord;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.alibaba.polardbx.optimizer.config.schema.DefaultDbSchema;
+import com.alibaba.polardbx.optimizer.config.table.ComplexTaskMetaManager;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.BaseDdlOperation;
+import com.alibaba.polardbx.optimizer.locality.StoragePoolManager;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.sql.SqlRebalance;
@@ -58,6 +64,7 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
@@ -103,12 +110,30 @@ public class LogicalRebalanceHandler extends LogicalCommonDdlHandler {
 
         initSchemaName(ec);
 
+        final boolean useChangeSet = ChangeSetUtils.isChangeSetProcedure(ec);
+        final boolean usePhysicalBackfill = PhysicalBackfillUtils.isSupportForPhysicalBackfill(ec.getSchemaName(), ec);
+        if (useChangeSet && usePhysicalBackfill && !sqlRebalance.isExplain()) {
+            long currentMaxSlaveLatency = PhysicalBackfillUtils.getTheMaxSlaveLatency();
+            long configMaxSlaveLatency =
+                ec.getParamManager().getLong(ConnectionParams.PHYSICAL_BACKFILL_MAX_SLAVE_LATENCY);
+            if (currentMaxSlaveLatency > configMaxSlaveLatency) {
+                throw new TddlRuntimeException(ErrorCode.ERR_REBALANCE,
+                    "Seconds_Behind_Master is too large, please fix this problem before schedule this job");
+            }
+        }
+
+        if (useChangeSet && usePhysicalBackfill) {
+            PhysicalBackfillUtils.destroyDataSources();
+        }
+
         if (sqlRebalance.isLogicalDdl() && !sqlRebalance.isExplain()) {
             return handleLogicalRebalance(sqlRebalance, ec);
         }
 
         initDdlContext(logicalDdlPlan, ec);
 
+        // Validate the plan on file storage first
+        TableValidator.validateTableEngine(logicalDdlPlan, ec);
         // Validate the plan first and then return immediately if needed.
         if (TStringUtil.isEmpty(logicalDdlPlan.getSchemaName())) {
             logicalDdlPlan.setSchemaName(ec.getSchemaName());
@@ -206,11 +231,17 @@ public class LogicalRebalanceHandler extends LogicalCommonDdlHandler {
         if (sqlRebalance.isRebalanceTable()) {
             String tableName = RelUtils.stringValue(sqlRebalance.getTableName());
             actions = balancer.rebalanceTable(ec, tableName, options);
-        } else if(sqlRebalance.isRebalanceTableGroup()){
+        } else if (sqlRebalance.isRebalanceTableGroup()) {
             String tableGroupName = RelUtils.stringValue(sqlRebalance.getTableGroupName());
             actions = balancer.rebalanceTableGroup(ec, tableGroupName, options);
+        } else if (sqlRebalance.isRebalaceTenantDb()) {
+            String storagePoolName = RelUtils.stringValue(sqlRebalance.getStoragePoolName());
+            actions = balancer.rebalanceTenantDb(ec, storagePoolName, options);
         } else if (sqlRebalance.isRebalanceDatabase()) {
             actions = balancer.rebalanceDatabase(ec, options);
+        } else if (sqlRebalance.isRebalanceTenant()) {
+            String storagePoolName = RelUtils.stringValue(sqlRebalance.getStoragePoolName());
+            actions = balancer.rebalanceTenant(ec, storagePoolName, options);
         } else if (sqlRebalance.isRebalanceCluster()) {
             actions = balancer.rebalanceCluster(ec, options);
         } else {
@@ -221,11 +252,22 @@ public class LogicalRebalanceHandler extends LogicalCommonDdlHandler {
     }
 
     protected Cursor buildCursor(List<BalanceAction> actions, ExecutionContext ec) {
+        final boolean useChangeSet = ChangeSetUtils.isChangeSetProcedure(ec);
+        final boolean usePhysicalBackfill = PhysicalBackfillUtils.isSupportForPhysicalBackfill(ec.getSchemaName(), ec);
+        boolean physicalBackfill = useChangeSet && usePhysicalBackfill;
+
         ArrayResultCursor result = new ArrayResultCursor("Rebalance");
         result.addColumn("JOB_ID", DataTypes.LongType);
         result.addColumn("SCHEMA", DataTypes.StringType);
         result.addColumn("NAME", DataTypes.StringType);
         result.addColumn("ACTION", DataTypes.StringType);
+        result.addColumn("BACKFILL_ROWS", DataTypes.LongType);
+        double speed = 0;
+        if (physicalBackfill) {
+            result.addColumn("BACKFILL_DATA_SIZE", DataTypes.LongType);
+            result.addColumn("BACKFILL_ESTIMATED_TIME", DataTypes.DoubleType);
+            speed = PhysicalBackfillUtils.netWorkSpeedTest(ec);
+        }
 
         long jobId = 0;
         if (ec.getDdlContext() != null) {
@@ -236,7 +278,30 @@ public class LogicalRebalanceHandler extends LogicalCommonDdlHandler {
             final String schema = action.getSchema();
             final String name = action.getName();
             final String step = action.getStep();
-            result.addRow(new Object[] {jobId, schema, name, step});
+            final Long backfillRows = action.getBackfillRows();
+            if (physicalBackfill) {
+                final Long backfillData = action.getDiskSize();
+                DecimalFormat df = new DecimalFormat("#.00");
+                double backfillCost = 0;
+
+                double parallel;
+                if (DbInfoManager.getInstance().isNewPartitionDb(schema)) {
+                    parallel = ScaleOutUtils.getTableGroupTaskParallelism(ec);
+                } else {
+                    parallel = ScaleOutUtils.getScaleoutTaskParallelism(ec);
+                }
+                parallel = Math.min(action.getLogicalTableCount(), parallel);
+                parallel = Math.max(1, parallel * 0.75);
+                if (speed > 0 && backfillData > 0) {
+                    backfillCost = Double.parseDouble(df.format(3 * backfillData / 1024 / speed / parallel));
+                }
+
+                result.addRow(new Object[] {
+                    jobId, schema, name, step, backfillRows, backfillData, physicalBackfill ? backfillCost : null});
+            } else {
+                result.addRow(new Object[] {
+                    jobId, schema, name, step, backfillRows});
+            }
         }
 
         return result;
@@ -254,9 +319,16 @@ public class LogicalRebalanceHandler extends LogicalCommonDdlHandler {
         /**
          * Fast checker if the drain node can be deletable
          */
-        if (sqlRebalance.getDrainNode() != null && !sqlRebalance.isRebalanceTableGroup()) {
-            PolicyDrainNode.DrainNodeInfo drainNodeInfo = PolicyDrainNode.DrainNodeInfo.parse(sqlRebalance.getDrainNode());
-            drainNodeInfo.validate();
+        //TODO validate
+        if (sqlRebalance.getDrainNode() != null && (sqlRebalance.isRebalanceDatabase()
+            || sqlRebalance.isRebalanceDatabase()
+            || sqlRebalance.isRebalanceTenant() || sqlRebalance.isRebalaceTenantDb())) {
+            if (!(sqlRebalance.isRebalanceTenant() && sqlRebalance.getStoragePoolName().toString().equalsIgnoreCase(
+                StoragePoolManager.RECYCLE_STORAGE_POOL_NAME))) {
+                PolicyDrainNode.DrainNodeInfo drainNodeInfo =
+                    PolicyDrainNode.DrainNodeInfo.parse(sqlRebalance.getDrainNode());
+                drainNodeInfo.validate();
+            }
         }
 
         String lockResource = sqlRebalance.getKind().name();
@@ -274,23 +346,28 @@ public class LogicalRebalanceHandler extends LogicalCommonDdlHandler {
                     List<DdlPlanRecord> ddlPlanRecords = ddlPlanAccessor.queryByType(sqlRebalance.getKind().name());
                     long planId;
                     String resource = "";
-                    if(sqlRebalance.isRebalanceTableGroup()) {
+                    if (sqlRebalance.isRebalanceTableGroup()) {
                         resource = String.format("tablegroup:%s", sqlRebalance.getTableGroupName());
+                    } else if (sqlRebalance.isRebalanceTenant()) {
+                        resource =
+                            ActionUtils.genRebalanceTenantResourceName(sqlRebalance.getStoragePoolName().toString());
                     }
                     AtomicReference<Boolean> replicateRequest = new AtomicReference<>(false);
                     String finalResource = resource;
-                    ddlPlanRecords.forEach(o -> replicateRequest.updateAndGet(v -> v | o.getResource().equals(finalResource)));
+                    ddlPlanRecords.forEach(
+                        o -> replicateRequest.updateAndGet(v -> v | o.getResource().equals(finalResource)));
                     if (!replicateRequest.get() || sqlRebalance.isRebalanceTableGroup()) {
                         planId = ID_GENERATOR.nextId();
                         DdlPlanRecord ddlPlanRecord =
                             DdlPlanRecord.constructNewDdlPlanRecord(schemaName, planId,
                                 sqlRebalance.getKind().name(), sqlRebalance.toString());
-                            ddlPlanRecord.setResource(resource);
+                        ddlPlanRecord.setResource(resource);
                         ddlPlanAccessor.addDdlPlan(ddlPlanRecord);
                     } else {
 //                        Assert.assertTrue(ddlPlanRecords.size() == 1);
-                        List<DdlPlanRecord> matchDdlPlanRecords = ddlPlanRecords.stream().filter(o->o.getResource().equals(finalResource))
-                            .collect(Collectors.toList());
+                        List<DdlPlanRecord> matchDdlPlanRecords =
+                            ddlPlanRecords.stream().filter(o -> o.getResource().equals(finalResource))
+                                .collect(Collectors.toList());
                         Assert.assertTrue(matchDdlPlanRecords.size() == 1);
                         planId = matchDdlPlanRecords.get(0).getPlanId();
                     }

@@ -16,18 +16,19 @@
 
 package com.alibaba.polardbx.optimizer.partition.pruning;
 
-import com.alibaba.polardbx.common.charset.CharsetFactoryImpl;
-import com.alibaba.polardbx.common.charset.CharsetHandler;
+import com.alibaba.polardbx.optimizer.config.table.charset.CharsetFactoryImpl;
+import com.alibaba.polardbx.optimizer.config.table.charset.CharsetHandler;
 import com.alibaba.polardbx.common.charset.CharsetName;
 import com.alibaba.polardbx.common.charset.CollationName;
 import com.alibaba.polardbx.common.partition.MurmurHashUtils;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundVal;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundVal;
 import com.alibaba.polardbx.optimizer.partition.datatype.PartitionField;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlCollation;
+import org.apache.calcite.sql.type.SqlTypeName;
 
 import java.nio.charset.Charset;
 
@@ -67,6 +68,8 @@ public class SearchDatumHasher {
     protected boolean isKeyPartition = false;
 
     protected Boolean[] covertToBigIntField;
+
+    protected RelDataType hashBndValDataType = PartitionPrunerUtils.getTypeFactory().createSqlType(SqlTypeName.BIGINT);
 
     public SearchDatumHasher() {
     }
@@ -165,6 +168,50 @@ public class SearchDatumHasher {
 
     }
 
+    /**
+     * <pre>
+     *     Calc hash code of Long by user-defined function
+     * </pre>
+     */
+    public long calcHashCodeForUdfHashStrategy(ExecutionContext ec, SearchDatumInfo searchValDatum) {
+        PartitionBoundVal bndVal = searchValDatum.datumInfo[0];
+        long hashVal = bndVal.getValue().longValue();
+        return hashVal;
+    }
+
+    public Long[] calcHashCodeForCoHashStrategy(ExecutionContext ec, SearchDatumInfo searchValDatum) {
+
+        int partColCnt = searchValDatum.datumInfo.length;
+
+        Long[] hashCodeValArr = new Long[partColCnt];
+        for (int i = 0; i < partColCnt; i++) {
+            PartitionBoundVal oneFldBndVal = searchValDatum.datumInfo[i];
+            if (!oneFldBndVal.isNormalValue()) {
+                hashCodeValArr[i] = null;
+                continue;
+            }
+            /**
+             * Generate the hashcode according to original value
+             */
+            long[] seeds = new long[2];
+            /**
+             * reset seeds for each part col
+             */
+            seeds[0] = SearchDatumHasher.INIT_HASH_VALUE_1;
+            seeds[1] = SearchDatumHasher.INIT_HASH_VALUE_2;
+            long oneFiledHashCode = calcOneFiledHashCodeForKey(seeds, oneFldBndVal);
+
+            /**
+             * Use the hashcode generated above to build the hash value in search space
+             */
+            long finalHashVal = doMurmurHash(oneFiledHashCode);
+
+            hashCodeValArr[i] = new Long(finalHashVal);
+        }
+
+        return hashCodeValArr;
+    }
+
     protected long doMurmurHash(long multiFiledHashCode) {
         long finalHashVal = MurmurHashUtils.murmurHashWithZeroSeed(multiFiledHashCode);
 
@@ -218,6 +265,10 @@ public class SearchDatumHasher {
         } while (i < partCnt);
         long outputHashCode = seeds[0];
         return outputHashCode;
-
     }
+
+    public RelDataType getHashBndValDataType() {
+        return hashBndValDataType;
+    }
+
 }

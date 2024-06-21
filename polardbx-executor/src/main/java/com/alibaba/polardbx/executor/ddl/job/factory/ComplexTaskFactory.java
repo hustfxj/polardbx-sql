@@ -31,6 +31,7 @@ import com.alibaba.polardbx.executor.ddl.job.task.basic.TableSyncTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.TablesSyncTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.UpdateTablesVersionTask;
 import com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcMoveDatabaseDdlMarkTask;
+import com.alibaba.polardbx.executor.ddl.job.task.shared.EmptyLogTask;
 import com.alibaba.polardbx.executor.ddl.job.task.tablegroup.AlterComplexTaskUpdateJobStatusTask;
 import com.alibaba.polardbx.executor.ddl.job.task.tablegroup.AlterTableChangeTopologyRefreshMetaTask;
 import com.alibaba.polardbx.executor.ddl.job.task.tablegroup.AlterTableGroupCleanupTask;
@@ -163,8 +164,7 @@ public class ComplexTaskFactory {
         if (!skipBackFill) {
             taskList
                 .add(new AlterTableGroupBackFillTask(schemaName, logicalTableName, sourcePhyTables, targetPhyTables,
-                    isBroadcast,
-                    ComplexTaskMetaManager.ComplexTaskType.MOVE_PARTITION == taskType));
+                    isBroadcast, ComplexTaskMetaManager.ComplexTaskType.MOVE_PARTITION == taskType, false, false));
         }
         taskList.add(writeReOrgTask);
         taskList.add(
@@ -194,8 +194,7 @@ public class ComplexTaskFactory {
         TableGroupConfig tableGroupConfig = OptimizerContext.getContext(schemaName).getTableGroupInfoManager()
             .getTableGroupConfigByName(tableGroupName);
         if (complexTaskType != ComplexTaskMetaManager.ComplexTaskType.SET_TABLEGROUP) {
-            for (TablePartRecordInfoContext tablePartRecordInfoContext : tableGroupConfig.getAllTables()) {
-                String logicalTable = tablePartRecordInfoContext.getLogTbRec().getTableName();
+            for (String logicalTable : tableGroupConfig.getAllTables()) {
                 TableMeta tableMeta = executionContext.getSchemaManager(schemaName).getTable(logicalTable);
                 if (tableMeta.isGsi()) {
                     //all the gsi table version change will be behavior by primary table
@@ -310,6 +309,10 @@ public class ComplexTaskFactory {
         taskList
             .add(new TablesSyncTask(schemaName, logicalTableNames, enablePreemptiveMdl, initWait, interval,
                 TimeUnit.MILLISECONDS));
+        if (complexTaskType == ComplexTaskMetaManager.ComplexTaskType.MOVE_PARTITION) {
+            taskList.add(new EmptyLogTask(schemaName,
+                String.format("schema %s group %s stop double write", schemaName, tableGroupName)));
+        }
 
         taskList.add(alterTableGroupCleanupTask);
 
@@ -390,6 +393,7 @@ public class ComplexTaskFactory {
             complexTaskType == ComplexTaskMetaManager.ComplexTaskType.MOVE_PARTITION ||
             complexTaskType == ComplexTaskMetaManager.ComplexTaskType.ADD_PARTITION ||
             complexTaskType == ComplexTaskMetaManager.ComplexTaskType.DROP_PARTITION ||
+            complexTaskType == ComplexTaskMetaManager.ComplexTaskType.REORGANIZE_PARTITION ||
             complexTaskType == ComplexTaskMetaManager.ComplexTaskType.MODIFY_PARTITION) {
             alterTableRefreshMetaTask =
                 new AlterTableChangeTopologyRefreshMetaTask(schemaName, sourceTableGroup, targetTableGroupName,
@@ -505,6 +509,8 @@ public class ComplexTaskFactory {
         taskList
             .add(new TablesSyncTask(schemaName, logicalTableNames, enablePreemptiveMdl, initWait, interval,
                 TimeUnit.MILLISECONDS));
+        taskList.add(new EmptyLogTask(schemaName, String.format("schema %s group %s stop double write ", schemaName,
+            preparedData.getSourceTargetGroupMap())));
         taskList.add(moveDatabaseCleanupTask);
 
         return taskList;
@@ -602,7 +608,7 @@ public class ComplexTaskFactory {
 
         taskList
             .add(new MoveTableBackFillTask(schemaName, logicalTableName, sourcePhyTables, targetPhyTables,
-                sourceAndTargetGroupMap));
+                sourceAndTargetGroupMap, false, false));
         taskList.add(writeReOrgTask);
         taskList.add(
             new TableSyncTask(schemaName, relatedTables.get(0), enablePreemptiveMdl, initWait, interval,
@@ -624,7 +630,9 @@ public class ComplexTaskFactory {
 
         PartitionInfo partitionInfo =
             OptimizerContext.getContext(schemaName).getPartitionInfoManager().getPartitionInfo(logicalTableName);
+
         Map<String, List<List<String>>> tableTopology = new HashMap<>();
+
         for (Map.Entry<String, Set<String>> entry : sourceTables.entrySet()) {
             for (String val : entry.getValue()) {
                 List<String> phyTable = new ArrayList<>();
@@ -632,12 +640,15 @@ public class ComplexTaskFactory {
                 tableTopology.computeIfAbsent(entry.getKey(), o -> new ArrayList<>()).add(phyTable);
             }
         }
-        DdlPhyPlanBuilder
-            dropPhyTableBuilder = DropPhyTableBuilder.createBuilder(schemaName, logicalTableName, true, tableTopology,
-            executionContext).build();
+
+        DdlPhyPlanBuilder dropPhyTableBuilder =
+            DropPhyTableBuilder.createBuilder(schemaName, logicalTableName, true, tableTopology, executionContext)
+                .build();
         List<PhyDdlTableOperation> physicalPlans = dropPhyTableBuilder.getPhysicalPlans();
         physicalPlans.forEach(o -> o.setPartitionInfo(partitionInfo));
-        PhysicalPlanData physicalPlanData = DdlJobDataConverter.convertToPhysicalPlanData(tableTopology, physicalPlans);
+
+        PhysicalPlanData physicalPlanData =
+            DdlJobDataConverter.convertToPhysicalPlanData(tableTopology, physicalPlans, executionContext);
 
         return new DropTablePhyDdlTask(schemaName, physicalPlanData);
     }

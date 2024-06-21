@@ -22,7 +22,7 @@ import com.alibaba.polardbx.executor.operator.spill.SpillerFactory;
 import com.alibaba.polardbx.executor.operator.util.AggregateUtils;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
-import com.alibaba.polardbx.executor.calc.Aggregator;
+import com.alibaba.polardbx.optimizer.core.expression.calc.Aggregator;
 import com.alibaba.polardbx.optimizer.core.rel.HashAgg;
 import com.alibaba.polardbx.optimizer.memory.MemoryAllocatorCtx;
 import com.alibaba.polardbx.optimizer.utils.CalciteUtils;
@@ -33,9 +33,6 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class HashAggExecutorFactory extends ExecutorFactory {
-
-    public static final int MAX_HASH_TABLE_SIZE = 131064;
-    public static final int MIN_HASH_TABLE_SIZE = 1024;
 
     private HashAgg hashAgg;
     private int parallelism;
@@ -71,32 +68,21 @@ public class HashAggExecutorFactory extends ExecutorFactory {
     private synchronized List<Executor> createAllExecutors(ExecutionContext context) {
         if (executors.isEmpty()) {
             ImmutableBitSet gp = hashAgg.getGroupSet();
-            int[] groups = convertFrom(gp);
+            int[] groups = AggregateUtils.convertBitSet(gp);
 
             Integer expectedOutputRowCount = rowCount / (taskNumber * parallelism);
-            if (expectedOutputRowCount == null) {
-                expectedOutputRowCount = MIN_HASH_TABLE_SIZE;
-            } else if (expectedOutputRowCount > MAX_HASH_TABLE_SIZE) {
-                expectedOutputRowCount = MAX_HASH_TABLE_SIZE;
-            } else if (expectedOutputRowCount < MIN_HASH_TABLE_SIZE) {
-                expectedOutputRowCount = MIN_HASH_TABLE_SIZE;
-            }
+            int estimateHashTableSize = AggregateUtils.estimateHashTableSize(expectedOutputRowCount, context);
+
             for (int j = 0; j < parallelism; j++) {
                 MemoryAllocatorCtx memoryAllocator = context.getMemoryPool().getMemoryAllocatorCtx();
 
-                List<DataType> outputDataTypes = CalciteUtils.getTypes(hashAgg.getRowType());
                 List<Aggregator> aggregators =
-                    AggregateUtils.convertAggregators(inputDataTypes,
-                        outputDataTypes.subList(groups.length, groups.length + hashAgg.getAggCallList().size()),
-                        hashAgg.getAggCallList(), context, memoryAllocator);
+                    AggregateUtils.convertAggregators(hashAgg.getAggCallList(), context, memoryAllocator);
 
                 HashAggExec exec =
                     new HashAggExec(inputDataTypes, groups, aggregators, CalciteUtils.getTypes(hashAgg.getRowType()),
-                        expectedOutputRowCount, spillerFactory, context);
-                exec.setId(hashAgg.getRelatedId());
-                if (context.getRuntimeStatistics() != null) {
-                    RuntimeStatHelper.registerStatForExec(hashAgg, exec, context);
-                }
+                        estimateHashTableSize, spillerFactory, context);
+                registerRuntimeStat(exec, hashAgg, context);
                 executors.add(exec);
             }
         }

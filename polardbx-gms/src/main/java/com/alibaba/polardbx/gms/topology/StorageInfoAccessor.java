@@ -66,6 +66,9 @@ public class StorageInfoAccessor extends AbstractAccessor {
         "select " + ALL_STORAGE_INFO_COLUMNS + " from `" + STORAGE_INFO_TABLE
             + "` where storage_inst_id=? and status!=2";
 
+    private static final String SELECT_STORAGE_INFO =
+        "select " + ALL_STORAGE_INFO_COLUMNS + " from `" + STORAGE_INFO_TABLE + "` where status!=2";
+
     private static final String SELECT_STORAGE_INFO_BY_STORAGE_INST_ID_LIST =
         "select " + ALL_STORAGE_INFO_COLUMNS + " from `" + STORAGE_INFO_TABLE
             + "` where storage_inst_id in (%s) and status!=2 order by storage_inst_id";
@@ -75,8 +78,7 @@ public class StorageInfoAccessor extends AbstractAccessor {
             + "` where inst_kind=1 and status!=2 and storage_master_inst_id=?";
 
     private static final String SELECT_STORAGE_INFO_BY_INST_ID_AND_TYPE =
-        "select " + ALL_STORAGE_INFO_COLUMNS
-            + " from " + TStringUtil.backQuote(STORAGE_INFO_TABLE)
+        "select " + ALL_STORAGE_INFO_COLUMNS + " from " + TStringUtil.backQuote(STORAGE_INFO_TABLE)
             + " where inst_id=? and inst_kind=? and status!=2";
 
     private static final String SELECT_STORAGE_ID_LIST_BY_INST_ID_AND_INST_TYPE =
@@ -97,9 +99,6 @@ public class StorageInfoAccessor extends AbstractAccessor {
     private static final String GET_MASTER_INST_ID_FOR_SERVER =
         "select distinct inst_id, inst_kind from storage_info where status!=2 and inst_kind=0 limit 1";
 
-    private static final String GET_SLAVE_ALL_INST_ID_FOR_SERVER =
-        "select distinct inst_id, inst_kind from storage_info where status!=2 and inst_kind=1";
-
     private static final String GET_ALL_INST_ID_FOR_SERVER =
         "select distinct inst_id, storage_inst_id from storage_info where status!=2";
 
@@ -116,6 +115,11 @@ public class StorageInfoAccessor extends AbstractAccessor {
     private static final String UPDATE_STORAGE_STATUS =
         "update storage_info set status=? where storage_master_inst_id=?";
 
+    private static final String UPDATE_STORAGE_POOL_NAME =
+        "update storage_info set extras=? where storage_master_inst_id=?";
+
+    private static final String UPDATE_STORAGE_INFO_DELETABLE =
+        "update storage_info set deletable=? where storage_master_inst_id=?";
     private static final String COUNT_ALL_RW_STORAGES =
         "select count(distinct storage_inst_id) as rw_dn_cnt from storage_info where status=0 and inst_kind=0";
 
@@ -160,8 +164,44 @@ public class StorageInfoAccessor extends AbstractAccessor {
             int affected = MetaDbUtil.update(UPDATE_STORAGE_STATUS, updateParams, connection);
             if (affected == 0) {
                 throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE,
+                    String.format("Failed to update system table %s: no instId=%s exists", STORAGE_INFO_TABLE, instId));
+            }
+        } catch (Exception e) {
+            MetaDbLogUtil.META_DB_LOG.error("Failed to update the system table '" + STORAGE_INFO_TABLE + "'", e);
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
+                e.getMessage());
+        }
+    }
+
+    public void updateStoragePoolName(String storageInst, StorageInfoExtraFieldJSON extras) {
+        try {
+            Map<Integer, ParameterContext> updateParams = Maps.newHashMap();
+            MetaDbUtil.setParameter(1, updateParams, ParameterMethod.setString,
+                StorageInfoExtraFieldJSON.toJson(extras));
+            MetaDbUtil.setParameter(2, updateParams, ParameterMethod.setString, storageInst);
+            int affected = MetaDbUtil.update(UPDATE_STORAGE_POOL_NAME, updateParams, connection);
+            if (affected == 0) {
+                throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE,
                     String.format("Failed to update system table %s: no instId=%s exists",
-                        STORAGE_INFO_TABLE, instId));
+                        STORAGE_INFO_TABLE, storageInst));
+            }
+        } catch (Exception e) {
+            MetaDbLogUtil.META_DB_LOG.error("Failed to update the system table '" + STORAGE_INFO_TABLE + "'", e);
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
+                e.getMessage());
+        }
+    }
+
+    public void updateStorageInfoDeletable(String storageInst, boolean deletable) {
+        try {
+            Map<Integer, ParameterContext> updateParams = Maps.newHashMap();
+            MetaDbUtil.setParameter(1, updateParams, ParameterMethod.setBoolean, deletable);
+            MetaDbUtil.setParameter(2, updateParams, ParameterMethod.setString, storageInst);
+            int affected = MetaDbUtil.update(UPDATE_STORAGE_INFO_DELETABLE, updateParams, connection);
+            if (affected == 0) {
+                throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE,
+                    String.format("Failed to update system table %s: no instId=%s exists",
+                        STORAGE_INFO_TABLE, storageInst));
             }
         } catch (Exception e) {
             MetaDbLogUtil.META_DB_LOG.error("Failed to update the system table '" + STORAGE_INFO_TABLE + "'", e);
@@ -210,7 +250,8 @@ public class StorageInfoAccessor extends AbstractAccessor {
             // is_vip
             MetaDbUtil.setParameter(18, insertParams, ParameterMethod.setInt, storageInfoRecord.isVip);
             // extras
-            MetaDbUtil.setParameter(19, insertParams, ParameterMethod.setString, storageInfoRecord.extras);
+            MetaDbUtil.setParameter(19, insertParams, ParameterMethod.setString,
+                StorageInfoExtraFieldJSON.toJson(storageInfoRecord.extras));
             MetaDbUtil.insert(INSERT_IGNORE_NEW_STORAGE_INFO, insertParams, connection);
             return;
         } catch (Exception e) {
@@ -224,8 +265,8 @@ public class StorageInfoAccessor extends AbstractAccessor {
         try {
             Map<Integer, ParameterContext> params = new HashMap<>();
             MetaDbUtil.setParameter(1, params, ParameterMethod.setInt, instKind);
-            return MetaDbUtil
-                .query(SELECT_STORAGE_INFO_BY_STORAGE_TYPE, params, StorageInfoRecord.class, this.connection);
+            return MetaDbUtil.query(SELECT_STORAGE_INFO_BY_STORAGE_TYPE, params, StorageInfoRecord.class,
+                this.connection);
         } catch (Exception e) {
             if (!e.getMessage().contains("doesn't exist")) {
                 logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
@@ -239,8 +280,8 @@ public class StorageInfoAccessor extends AbstractAccessor {
         try {
             Map<Integer, ParameterContext> params = new HashMap<>();
             MetaDbUtil.setParameter(1, params, ParameterMethod.setString, storageInstId);
-            return MetaDbUtil
-                .query(SELECT_STORAGE_INFO_BY_STORAGE_INST_ID, params, StorageInfoRecord.class, this.connection);
+            return MetaDbUtil.query(SELECT_STORAGE_INFO_BY_STORAGE_INST_ID, params, StorageInfoRecord.class,
+                this.connection);
         } catch (Exception e) {
             logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
@@ -265,8 +306,8 @@ public class StorageInfoAccessor extends AbstractAccessor {
             }
             String selectSql = String.format(SELECT_STORAGE_INFO_BY_STORAGE_INST_ID_LIST, idListStr);
 
-            List<StorageInfoRecord> storageInfoRecords = MetaDbUtil
-                .query(selectSql, params, StorageInfoRecord.class, this.connection);
+            List<StorageInfoRecord> storageInfoRecords =
+                MetaDbUtil.query(selectSql, params, StorageInfoRecord.class, this.connection);
 
             Map<String, List<StorageInfoRecord>> storageInfoRecMap = new HashMap<>();
             for (int i = 0; i < storageInfoRecords.size(); i++) {
@@ -286,9 +327,8 @@ public class StorageInfoAccessor extends AbstractAccessor {
         try {
             Map<Integer, ParameterContext> params = new HashMap<>();
             MetaDbUtil.setParameter(1, params, ParameterMethod.setString, masterStorageInstId);
-            return MetaDbUtil
-                .query(SELECT_SLAVE_STORAGE_INFOS_BY_MASTER_STORAGE_INST_ID, params, StorageInfoRecord.class,
-                    this.connection);
+            return MetaDbUtil.query(SELECT_SLAVE_STORAGE_INFOS_BY_MASTER_STORAGE_INST_ID, params,
+                StorageInfoRecord.class, this.connection);
         } catch (Exception e) {
             logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
@@ -300,9 +340,7 @@ public class StorageInfoAccessor extends AbstractAccessor {
         try {
             Map<Integer, ParameterContext> params = new HashMap<>();
             MetaDbUtil.setParameter(1, params, ParameterMethod.setString, instId);
-            return MetaDbUtil
-                .query(SELECT_STORAGE_INFOS_BY_INST_ID, params, StorageInfoRecord.class,
-                    this.connection);
+            return MetaDbUtil.query(SELECT_STORAGE_INFOS_BY_INST_ID, params, StorageInfoRecord.class, this.connection);
         } catch (Exception e) {
             logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
@@ -314,9 +352,18 @@ public class StorageInfoAccessor extends AbstractAccessor {
         try {
             Map<Integer, ParameterContext> params = new HashMap<>();
             MetaDbUtil.setParameter(1, params, ParameterMethod.setString, instId);
-            return MetaDbUtil
-                .query(SELECT_ALIVE_STORAGE_INFOS_BY_INST_ID, params, StorageInfoRecord.class,
-                    this.connection);
+            return MetaDbUtil.query(SELECT_ALIVE_STORAGE_INFOS_BY_INST_ID, params, StorageInfoRecord.class,
+                this.connection);
+        } catch (Exception e) {
+            logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
+                e.getMessage());
+        }
+    }
+
+    public List<StorageInfoRecord> getAliveStorageInfos() {
+        try {
+            return MetaDbUtil.query(SELECT_STORAGE_INFO, null, StorageInfoRecord.class, this.connection);
         } catch (Exception e) {
             logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
@@ -330,8 +377,8 @@ public class StorageInfoAccessor extends AbstractAccessor {
             MetaDbUtil.setParameter(1, params, ParameterMethod.setString, instId);
             MetaDbUtil.setParameter(2, params, ParameterMethod.setInt, instKind);
 
-            return MetaDbUtil.query(SELECT_STORAGE_INFO_BY_INST_ID_AND_TYPE,
-                params, StorageInfoRecord.class, this.connection);
+            return MetaDbUtil.query(SELECT_STORAGE_INFO_BY_INST_ID_AND_TYPE, params, StorageInfoRecord.class,
+                this.connection);
         } catch (Exception e) {
             logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
@@ -354,36 +401,6 @@ public class StorageInfoAccessor extends AbstractAccessor {
                     return null;
                 }
                 return storageInstIdList.get(0);
-            } catch (Throwable ex) {
-                throw ex;
-            } finally {
-                if (rs != null) {
-                    rs.close();
-                }
-                if (stmt != null) {
-                    stmt.close();
-                }
-            }
-
-        } catch (Exception e) {
-            logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
-            throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
-                e.getMessage());
-        }
-    }
-
-    public List<String> getServerReadOnlyInstIdSetFromStorageInfo() {
-        try {
-            PreparedStatement stmt = null;
-            ResultSet rs = null;
-            try {
-                stmt = this.connection.prepareStatement(GET_SLAVE_ALL_INST_ID_FOR_SERVER);
-                rs = stmt.executeQuery();
-                List<String> storageInstIdList = Lists.newArrayList();
-                while (rs.next()) {
-                    storageInstIdList.add(rs.getString(1));
-                }
-                return storageInstIdList;
             } catch (Throwable ex) {
                 throw ex;
             } finally {
@@ -429,6 +446,28 @@ public class StorageInfoAccessor extends AbstractAccessor {
                     stmt.close();
                 }
             }
+        } catch (Exception e) {
+            logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,
+                e.getMessage());
+        }
+    }
+
+    public List<StorageInfoRecord> getStorageInfoForReadOnly(Set<String> instIds) {
+        StringBuilder sqlBuilder = new StringBuilder();
+        sqlBuilder.append(SELECT_STORAGE_INFO);
+        sqlBuilder.append(" and (");
+        int index = 0;
+        for (String instId : instIds) {
+            if (index != 0) {
+                sqlBuilder.append(" or ");
+            }
+            sqlBuilder.append(" inst_id= ").append("'" + instId + "'");
+            index++;
+        }
+        sqlBuilder.append(" )");
+        try {
+            return MetaDbUtil.query(sqlBuilder.toString(), StorageInfoRecord.class, connection);
         } catch (Exception e) {
             logger.error("Failed to query the system table '" + STORAGE_INFO_TABLE + "'", e);
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query", STORAGE_INFO_TABLE,

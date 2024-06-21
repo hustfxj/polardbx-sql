@@ -41,6 +41,8 @@ import java.util.Map;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
+import static com.alibaba.polardbx.optimizer.config.table.ComplexTaskMetaManager.ComplexTaskStatus.PUBLIC;
+
 /**
  * Created by luoyanxin.
  *
@@ -112,6 +114,8 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
          */
         WRITE_REORG(3),
         READY_TO_PUBLIC(4),
+        CHANGE_SET_START(5),
+        DOING_CHECKER(6),
         ABSENT(7),
 
         /**
@@ -150,6 +154,10 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
                 return WRITE_REORG;
             case 4:
                 return READY_TO_PUBLIC;
+            case 5:
+                return CHANGE_SET_START;
+            case 6:
+                return DOING_CHECKER;
             case 7:
                 return ABSENT;
             case 10:
@@ -180,6 +188,9 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
 
         public static final EnumSet<ComplexTaskStatus> WRITABLE =
             EnumSet.of(WRITE_ONLY, WRITE_REORG, READY_TO_PUBLIC);
+
+        public static final EnumSet<ComplexTaskStatus> BACKFILL_IN_PROGRESS =
+            EnumSet.of(CREATING, DELETE_ONLY, WRITE_ONLY);
 
         public static final EnumSet<ComplexTaskStatus> NEED_SWITCH_DATASOURCE =
             EnumSet.of(SOURCE_WRITE_ONLY, SOURCE_DELETE_ONLY, SOURCE_ABSENT);
@@ -214,6 +225,10 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
 
         public boolean isPublic() {
             return PUBLIC == this;
+        }
+
+        public boolean isBackfillInProgress() {
+            return BACKFILL_IN_PROGRESS.contains(this);
         }
     }
 
@@ -251,6 +266,22 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
             List<ComplexTaskOutlineRecord> complexTaskOutlineRecords =
                 complexTaskOutlineAccessor
                     .getAllScaleOutComplexTaskBySch(ComplexTaskType.MOVE_DATABASE.getValue(), schemaName);
+
+            return complexTaskOutlineRecords;
+        } catch (SQLException e) {
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_GET_CONNECTION,
+                e,
+                "cannot get table info from system table");
+        }
+    }
+
+    public static List<ComplexTaskOutlineRecord> getMovePartitionTasksBySchJob(String schemaName, Long jobId) {
+        try (Connection conn = MetaDbUtil.getConnection()) {
+            ComplexTaskOutlineAccessor complexTaskOutlineAccessor = new ComplexTaskOutlineAccessor();
+            complexTaskOutlineAccessor.setConnection(conn);
+            List<ComplexTaskOutlineRecord> complexTaskOutlineRecords =
+                complexTaskOutlineAccessor
+                    .getAllScaleOutComplexTaskBySchJob(ComplexTaskType.MOVE_PARTITION.getValue(), schemaName, jobId);
 
             return complexTaskOutlineRecords;
         } catch (SQLException e) {
@@ -355,7 +386,10 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
         MODIFY_PARTITION(8),
         REFRESH_TOPOLOGY(9),
         MOVE_DATABASE(10),
-        SPLIT_HOT_VALUE(11);
+        SPLIT_HOT_VALUE(11),
+        REORGANIZE_PARTITION(12),
+        TWO_PHASE_ALTER_TABLE(13),
+        ONLINE_MODIFY_COLUMN(14);
 
         private final int value;
 
@@ -383,6 +417,12 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
                 return MOVE_DATABASE;
             case 11:
                 return SPLIT_HOT_VALUE;
+            case 12:
+                return REORGANIZE_PARTITION;
+            case 13:
+                return TWO_PHASE_ALTER_TABLE;
+            case 14:
+                return ONLINE_MODIFY_COLUMN;
             default:
                 return null;
             }
@@ -515,6 +555,19 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
             }
         }
 
+        public boolean isBackfillInProgress() {
+            if (GeneralUtil.isEmpty(partitionTableMetaMap)) {
+                return false;
+            } else {
+                for (Map.Entry<String, ComplexTaskStatus> entry : partitionTableMetaMap.entrySet()) {
+                    if (entry.getValue().isBackfillInProgress()) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         public boolean isDeleteOnly(String partitionName) {
             if (GeneralUtil.isEmpty(partitionTableMetaMap) || partitionTableMetaMap.get(partitionName) == null) {
                 return false;
@@ -568,6 +621,19 @@ public class ComplexTaskMetaManager extends AbstractLifecycle {
                 }
             }
             return true;
+        }
+
+        public ComplexTaskStatus getFirstPartStatus() {
+            if (GeneralUtil.isEmpty(partitionTableMetaMap)) {
+                return PUBLIC;
+            } else {
+                for (Map.Entry<String, ComplexTaskStatus> entry : partitionTableMetaMap.entrySet()) {
+                    if (!entry.getValue().isPublic()) {
+                        return entry.getValue();
+                    }
+                }
+            }
+            return PUBLIC;
         }
 
         public String getSchemaName() {

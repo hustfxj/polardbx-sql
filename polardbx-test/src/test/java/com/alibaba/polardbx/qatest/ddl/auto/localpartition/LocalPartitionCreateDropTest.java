@@ -21,7 +21,8 @@ import com.alibaba.polardbx.druid.sql.ast.SQLPartitionByRange;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.parser.MySqlExprParser;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.druid.sql.parser.ParserException;
-import com.alibaba.polardbx.optimizer.partition.LocalPartitionDefinitionInfo;
+import com.alibaba.polardbx.optimizer.partition.common.LocalPartitionDefinitionInfo;
+import com.alibaba.polardbx.qatest.BinlogIgnore;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.After;
@@ -41,6 +42,7 @@ import java.time.LocalDate;
  * <p>
  * 4. 校验各个数值类型字面量的取值范围
  */
+@BinlogIgnore(ignoreReason = "drop local partition的动作目前无法透传给下游，导致binlog实验室上下游数据不一致，暂时忽略")
 public class LocalPartitionCreateDropTest extends LocalPartitionBaseTest {
 
     private String primaryTableName;
@@ -228,7 +230,7 @@ public class LocalPartitionCreateDropTest extends LocalPartitionBaseTest {
             + "PIVOTDATE NOW()\n"
             + ";", primaryTableName, gsi1TableName);
         JdbcUtil.executeSuccess(tddlConnection, createTableSql);
-        validateLocalPartitionCount(tddlConnection, primaryTableName, 7);
+        validateLocalPartitionCount(tddlConnection, primaryTableName, 8);
 
         String dropTableSql = String.format("DROP TABLE %s", primaryTableName);
         JdbcUtil.executeSuccess(tddlConnection, dropTableSql);
@@ -510,6 +512,7 @@ public class LocalPartitionCreateDropTest extends LocalPartitionBaseTest {
                 + "\tPARTITION p20210901 VALUES LESS THAN ('2021-09-01') COMMENT '',\n"
                 + "\tPARTITION p20211001 VALUES LESS THAN ('2021-10-01') COMMENT '',\n"
                 + "\tPARTITION p20211101 VALUES LESS THAN ('2021-11-01') COMMENT '',\n"
+                + "\tPARTITION p20211201 VALUES LESS THAN ('2021-12-01') COMMENT '',\n"
                 + "\tPARTITION pmax VALUES LESS THAN MAXVALUE COMMENT ''\n"
                 + ")");
     }

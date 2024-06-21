@@ -22,7 +22,7 @@ import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
-import com.alibaba.polardbx.optimizer.partition.PartitionLocation;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionLocation;
 import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.rule.TableRule;
@@ -33,6 +33,7 @@ import org.apache.commons.lang3.StringUtils;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Created by luoyanxin.
@@ -110,6 +111,18 @@ public class ComplexTaskPlanUtils {
         return complexTaskTableMetaBean.isReadyToPulic(partitionName);
     }
 
+    public static boolean isBackfillInProgress(TableMeta tableMeta) {
+        if (!ConfigDataMode.isPolarDbX()) {
+            return false;
+        }
+        ComplexTaskMetaManager.ComplexTaskTableMetaBean complexTaskTableMetaBean =
+            tableMeta.getComplexTaskTableMetaBean();
+        if (complexTaskTableMetaBean == null) {
+            return false;
+        }
+        return complexTaskTableMetaBean.isBackfillInProgress();
+    }
+
     public static boolean isScaleOutWriteDebugOpen(ExecutionContext executionContext) {
 
         final String scaleOutDebugInfo =
@@ -183,12 +196,21 @@ public class ComplexTaskPlanUtils {
         });
     }
 
+    public static boolean isAnyUGsi(RelOptTable primary, ExecutionContext ec,
+                                    Function<TableMeta, Boolean> gsiChecker) {
+        final List<TableMeta> indexes = GlobalIndexMeta.getIndex(primary, ec);
+        return indexes.stream()
+            .anyMatch(
+                gsiMeta -> gsiMeta.getGsiTableMetaBean() != null && !gsiMeta.getGsiTableMetaBean().gsiMetaBean.nonUnique
+                    && gsiChecker.apply(gsiMeta));
+    }
+
     public static String getPartNameFromGroupAndTable(TableMeta tableMeta, String groupName, String phyTableName) {
         PartitionInfo partitionInfo = tableMeta.getPartitionInfo();
         if (partitionInfo == null) {
             return StringUtils.EMPTY;
         }
-        for (PartitionSpec partitionSpec : partitionInfo.getPartitionBy().getPartitions()) {
+        for (PartitionSpec partitionSpec : partitionInfo.getPartitionBy().getPhysicalPartitions()) {
             PartitionLocation location = partitionSpec.getLocation();
             if (location.getPhyTableName().equalsIgnoreCase(phyTableName) && location.getGroupKey()
                 .equalsIgnoreCase(groupName)) {

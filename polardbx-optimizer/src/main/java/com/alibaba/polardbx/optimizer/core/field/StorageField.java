@@ -16,7 +16,7 @@
 
 package com.alibaba.polardbx.optimizer.core.field;
 
-import com.alibaba.polardbx.common.collation.CollationHandler;
+import com.alibaba.polardbx.optimizer.config.table.collation.CollationHandler;
 import com.alibaba.polardbx.common.type.MySQLStandardFieldType;
 import com.alibaba.polardbx.common.utils.time.core.MySQLTimeVal;
 import com.alibaba.polardbx.common.utils.time.core.MysqlDateTime;
@@ -105,6 +105,11 @@ public interface StorageField {
      * Get two hash value from field.
      */
     void hash(long[] numbers);
+
+    /**
+     * Get hash code of storage filed using Xxhash64
+     */
+    long xxHashCode();
 
     /**
      * Make sort key byte array from this field.

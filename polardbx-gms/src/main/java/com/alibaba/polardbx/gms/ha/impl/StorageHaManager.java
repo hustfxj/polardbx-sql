@@ -24,6 +24,7 @@ import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.model.lifecycle.AbstractLifecycle;
 import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.utils.AddressUtils;
+import com.alibaba.polardbx.common.utils.CaseInsensitive;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.TStringUtil;
@@ -70,6 +71,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -87,8 +89,27 @@ import java.util.stream.Collectors;
  */
 public class StorageHaManager extends AbstractLifecycle {
 
+    /**
+     * {@link UNAVAILABLE_ACCESS_FOR_LEARNER} only used for  removing the error connection pools which is from RO-DN in time.
+     * Once the RO-DN crash, CN probes the error connection which come from this DN, thus CN will reset the DN address
+     * by the {@link UNAVAILABLE_ACCESS_FOR_LEARNER}. Afterwards, the HA will be triggered, and the error connection pools
+     * will be removed.
+     * <p>
+     * If the RO-DN recover, CN will use available address which is different with the {@link UNAVAILABLE_ACCESS_FOR_LEARNER}.
+     * Afterwards, the HA will be triggered, and the available connection pools will be added.
+     * <p>
+     * Only used for auto removing the conn pools of all ro-dn list on polarx-master-inst
+     * by submitting StorageHaSwitchTask
+     * <pre>
+     *     see OptimizedGroupConfigManager.resetByPolarDBXDataSourceWrapper(java.util.List)
+     * </pre>
+     */
     public static final String UNAVAILABLE_URL_FOR_LEARNER = "unavailable_access_for_learner";
 
+    /**
+     * Only used for auto removing the conn pools of all ro-dn list on polarx-master-inst
+     * by submitting StorageHaSwitchTask
+     */
     public static final String UNAVAILABLE_ACCESS_FOR_LEARNER = UNAVAILABLE_URL_FOR_LEARNER + ":3306";
 
     public static final String AREA_TYPE_HA_SWITCHER = "HaSwitcher";
@@ -193,9 +214,10 @@ public class StorageHaManager extends AbstractLifecycle {
         @Override
         public void onHandleConfig(String dataId, long newOpVersion) {
             String instId = InstIdUtil.getInstIdFromStorageInfoDataId(dataId);
-            StorageHaManager.getInstance().updateStorageInstHaContext(instId);
             ServerInstIdManager.getInstance().loadAllInstIdAndStorageIdSet();
-            if (ServerInstIdManager.getInstance().isMasterInst()) {
+            ServerInstIdManager.getInstance().loadAllHtapInstIds();
+            StorageHaManager.getInstance().updateStorageInstHaContext(instId);
+            if (ConfigDataMode.isMasterMode()) {
                 StorageHaManager.getInstance().updateGroupConfigVersion();
             }
         }
@@ -238,13 +260,15 @@ public class StorageHaManager extends AbstractLifecycle {
             ExecutorUtil.createBufferedExecutor("CheckDnRoleTaskExecutor", checkDnRoleTaskExecutorPoolSize,
                 checkDnRoleTaskExecutorQueueSize);
 
-        registerStorageInfoConfigListener(InstIdUtil.getInstId());
-
-        if (!ServerInstIdManager.getInstance().isMasterInst()) {
-            String serverMasterInstId = ServerInstIdManager.getInstance().getMasterInstId();
-            registerStorageInfoConfigListener(serverMasterInstId);
-        } else {
+        if (ConfigDataMode.isMasterMode()) {
+            registerStorageInfoConfigListener(InstIdUtil.getInstId());
             registerLearnerStorageInstId();
+        } else {
+            if (ConfigDataMode.needDNResource()) {
+                registerStorageInfoConfigListener(InstIdUtil.getInstId());
+                String serverMasterInstId = ServerInstIdManager.getInstance().getMasterInstId();
+                registerStorageInfoConfigListener(serverMasterInstId);
+            }
         }
 
         if (ConfigDataMode.isMasterMode()) {
@@ -343,7 +367,7 @@ public class StorageHaManager extends AbstractLifecycle {
             groupDetailInfoAccessor.setConnection(metaDbConn);
             List<GroupDetailInfoRecord> groupDetailInfoRecords =
                 groupDetailInfoAccessor.getGroupDetailInfoByInstIdAndDbName(currInstId, dbName);
-            if (!ServerInstIdManager.getInstance().isMasterInst()) {
+            if (ConfigDataMode.isRowSlaveMode()) {
                 String masterInstId = ServerInstIdManager.getInstance().getMasterInstId();
                 List<GroupDetailInfoRecord> groupDetailInfoRecordsOfMasterInstId =
                     groupDetailInfoAccessor.getGroupDetailInfoByInstIdAndDbName(masterInstId, dbName);
@@ -372,6 +396,11 @@ public class StorageHaManager extends AbstractLifecycle {
 
     public static int getAndCheckXport(String addr, boolean isVip, StorageInstHaContext haCtx,
                                        StorageNodeHaInfo haInfo) {
+
+        if (UNAVAILABLE_ACCESS_FOR_LEARNER.equalsIgnoreCase(addr)) {
+            MetaDbLogUtil.META_DB_LOG.info("this is unavailable_access_for_learner, so the Xport not available.");
+            return -1;
+        }
         if (isVip) {
             if (XConfig.VIP_WITH_X_PROTOCOL) {
                 Pair<String, Integer> nodeIpPort = AddressUtils.getIpPortPairByAddrStr(addr);
@@ -812,7 +841,7 @@ public class StorageHaManager extends AbstractLifecycle {
 
     public final Map<String, StorageInstHaContext> refreshAndGetStorageInstHaContextCache() {
         MetaDbConfigManager.getInstance().sync(MetaDbDataIdBuilder.getStorageInfoDataId(InstIdUtil.getInstId()));
-        if (!ServerInstIdManager.getInstance().isMasterInst()) {
+        if (!ConfigDataMode.isMasterMode()) {
             MetaDbConfigManager.getInstance().sync(ServerInstIdManager.getInstance().getMasterInstId());
         }
         return storageHaCtxCache;
@@ -923,47 +952,6 @@ public class StorageHaManager extends AbstractLifecycle {
 
     protected void loadStorageHaContext() {
 
-//        Map<String, StorageInstHaContext> newStorageHaCtxCache = new ConcurrentHashMap<>();
-//        try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
-//
-//            StorageInfoAccessor storageInfoAccessor = new StorageInfoAccessor();
-//            storageInfoAccessor.setConnection(metaDbConn);
-//
-//            List<StorageInfoRecord> storageInfoRecords = new ArrayList<>();
-//
-//            // Get storage all nodes of one polardbx inst, current instId maybe a master/read-only inst
-//            loadAllStorageInfoForCurrentInst(storageInfoAccessor, InstIdUtil.getInstId(), storageInfoRecords);
-//
-//            // group storage node by storageInstId
-//            Map<String, List<StorageInfoRecord>> storageInstNodeInfoMap = new HashMap<>();
-//            for (int i = 0; i < storageInfoRecords.size(); i++) {
-//                StorageInfoRecord storageInfo = storageInfoRecords.get(i);
-//                String storageInstId = storageInfo.storageInstId;
-//                List<StorageInfoRecord> storageNodeList = storageInstNodeInfoMap.get(storageInstId);
-//                if (storageNodeList == null) {
-//                    storageNodeList = new ArrayList<>();
-//                    storageInstNodeInfoMap.put(storageInstId, storageNodeList);
-//                }
-//                storageNodeList.add(storageInfo);
-//            }
-//
-//            // init StorageInst HA context for each x-cluster group of storage nodes
-//            for (Map.Entry<String, List<StorageInfoRecord>> storageInstNodesItem : storageInstNodeInfoMap.entrySet()) {
-//                String storageInstId = storageInstNodesItem.getKey();
-//                List<StorageInfoRecord> storageInstNodes = storageInstNodesItem.getValue();
-//                StorageInstHaContext storageInstHaContext = buildStorageInstHaContext(storageInstNodes);
-//                newStorageHaCtxCache.put(storageInstId, storageInstHaContext);
-//                if (storageInstHaContext.storageKind == StorageInfoRecord.INST_KIND_META_DB) {
-//                    this.metaDbStorageHaCtx = storageInstHaContext;
-//                }
-//            }
-//            this.storageHaCtxCache = newStorageHaCtxCache;
-//        } catch (Throwable ex) {
-//            MetaDbLogUtil.META_DB_LOG.info(ex);
-//            throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC, ex,
-//                "Failed to init storage HA context from metaDb，err is " + ex.getMessage());
-//        }
-
         Map<String, StorageInstHaContext> newStorageHaCtxCache = loadStorageHaContextFromMetaDb();
         for (Map.Entry<String, StorageInstHaContext> haCtxItem : newStorageHaCtxCache.entrySet()) {
             StorageInstHaContext haContext = haCtxItem.getValue();
@@ -1008,16 +996,26 @@ public class StorageHaManager extends AbstractLifecycle {
     protected void loadAllStorageInfoForCurrentInst(StorageInfoAccessor storageInfoAccessor, String currInstId,
                                                     List<StorageInfoRecord> storageInfoRecords) {
 
-        // load storage infos for current inst
-        List<StorageInfoRecord> storageInfoRecordsOfCurrInstId =
-            storageInfoAccessor.getAliveStorageInfosByInstId(currInstId);
-        storageInfoRecords.addAll(storageInfoRecordsOfCurrInstId);
-
-        // if current inst is a slave inst, then load all storage info for server master inst id
-        if (!ServerInstIdManager.getInstance().isMasterInst()) {
+        // load storage infos for current inst, but should contain learner storages for master.
+        List<StorageInfoRecord> storageInfoRecordsOfCurrInstId = null;
+        if (ConfigDataMode.isMasterMode()) {
+            storageInfoRecordsOfCurrInstId =
+                storageInfoAccessor.getAliveStorageInfos();
+            storageInfoRecords.addAll(storageInfoRecordsOfCurrInstId);
+        } else if (ConfigDataMode.isRowSlaveMode()) {
+            storageInfoRecordsOfCurrInstId =
+                storageInfoAccessor.getAliveStorageInfosByInstId(currInstId);
+            storageInfoRecords.addAll(storageInfoRecordsOfCurrInstId);
             List<StorageInfoRecord> storageInfoRecordsOfServerMasterInstId =
-                storageInfoAccessor.getAliveStorageInfosByInstId(ServerInstIdManager.getInstance().getMasterInstId());
+                storageInfoAccessor.getAliveStorageInfosByInstId(
+                    ServerInstIdManager.getInstance().getMasterInstId());
             storageInfoRecords.addAll(storageInfoRecordsOfServerMasterInstId);
+        } else if (ConfigDataMode.isColumnarMode()) {
+            //fetch the StorageInfoRecord about GMS
+            List<StorageInfoRecord> storageList =
+                storageInfoAccessor.getStorageInfosByInstIdAndKind(ServerInstIdManager.getInstance().getMasterInstId(),
+                    StorageInfoRecord.INST_KIND_META_DB);
+            storageInfoRecords.addAll(storageList);
         }
     }
 
@@ -1181,6 +1179,7 @@ public class StorageHaManager extends AbstractLifecycle {
                     Set<HaSwitcher> haSwitcherSet = storageHaManager.groupSwitcherMap.get(haGroupKey);
 
                     if (haSwitcherSet == null || haSwitcherSet.isEmpty()) {
+                        CHECK_HA_LOGGER.warn("Can't Trigger HA Task for " + haGroupKey);
                         continue;
                     }
 
@@ -1324,6 +1323,16 @@ public class StorageHaManager extends AbstractLifecycle {
                         haContext.currXport = this.newXport;
                         haContext.user = this.newAvailableAddrUser;
                         haContext.encPasswd = this.newAvailableAddrEncPasswd;
+                    } else {
+                        if (!StringUtils.isEmpty(newAvailableAddr) && this.newAvailableAddr.equalsIgnoreCase(
+                            UNAVAILABLE_ACCESS_FOR_LEARNER)) {
+                            //learner is unavaliable, thus refresh the haContext
+                            haContext.currAvailableNodeAddr = this.newAvailableAddr;
+                            haContext.currIsVip = this.newIsVip;
+                            haContext.currXport = this.newXport;
+                            haContext.user = this.newAvailableAddrUser;
+                            haContext.encPasswd = this.newAvailableAddrEncPasswd;
+                        }
                     }
 
                     // change the status to NORMAL to wait for next switch task to retry if success is false
@@ -1378,6 +1387,17 @@ public class StorageHaManager extends AbstractLifecycle {
                     // haContext.haStatus = StorageInstHaContext.StorageHaStatus.NORMAL;
                     changeHaStatus(haContext, taskEx == null);
                     return false;
+                }
+            }
+
+            if (ConfigDataMode.isMasterMode() &&
+                storageInstKind == StorageInfoRecord.INST_KIND_SLAVE) {
+                if (haSwitchParams.instId != null &&
+                    !ServerInstIdManager.getInstance().getAllHTAPReadOnlyInstIdSet().contains(haSwitchParams.instId)) {
+                    //the learner storageId ha, but it not belong to the HTAP inst. Here ignore building datasource.
+                    logger.warn(
+                        storageInstId + "is ha, but it not belong to the HTAP inst. Here ignore building datasource!");
+                    return true;
                 }
             }
 
@@ -1571,6 +1591,10 @@ public class StorageHaManager extends AbstractLifecycle {
             .collect(Collectors.toList());
     }
 
+    public StorageInstHaContext getMetaDbStorageHaCtx() {
+        return metaDbStorageHaCtx;
+    }
+
     private List<StorageInstHaContext> getStorageNodesAndMetaDB() {
         List<StorageInstHaContext> nodes = new ArrayList<>(storageHaCtxCache.values());
         nodes.add(metaDbStorageHaCtx);
@@ -1607,11 +1631,33 @@ public class StorageHaManager extends AbstractLifecycle {
         if (instances.isEmpty()) {
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC, "could not find replica " + address);
         }
-        for (String instance : instances) {
+
+        List<String> targetDnIdList = new ArrayList<>();
+        if (instances.size() > 1 && newRole == StorageRole.LEADER) {
+            for (String instance : instances) {
+                StorageInstHaContext haCtx = storageHaCtxCache.get(instance);
+                if (haCtx != null && haCtx.isMasterMode()) {
+                    targetDnIdList.add(instance);
+                }
+            }
+            if (targetDnIdList.size() > 1) {
+                throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC,
+                    String.format("find more than one rw-storage for node[%s]", address));
+            }
+            if (targetDnIdList.size() == 0) {
+                throw new TddlRuntimeException(ErrorCode.ERR_GMS_GENERIC,
+                    String.format("no found target rw-storage for node[%s]", address));
+            }
+        } else {
+            targetDnIdList.addAll(instances);
+        }
+
+        for (String instance : targetDnIdList) {
             changeRoleOfStorageNode(instance, address, newRole);
         }
 
         logger.warn(String.format("change replica(%s) to %s", address, newRole));
+        MetaDbLogUtil.META_DB_LOG.warn(String.format("change replica(%s) to %s", address, newRole));
     }
 
     /**
@@ -1838,6 +1884,12 @@ public class StorageHaManager extends AbstractLifecycle {
             String storageInstId = oneDnRoleInfo.getKey();
 
             Pair<Boolean, String> checkHaRs = shouldHaFlags.get(storageInstId);
+            if (checkHaRs == null) {
+                haStorageInstInfo +=
+                    String.format("{dnId=%s,noFoundHaResult}", storageInstId);
+                continue;
+            }
+
             Boolean shouldHa = checkHaRs.getKey();
             String oldLeader = checkHaRs.getValue();
 
@@ -1939,115 +1991,142 @@ public class StorageHaManager extends AbstractLifecycle {
                 boolean forceHa =
                     ConfigDataMode.isMasterMode() && DynamicConfig.getInstance().enableFollowReadForPolarDBX()
                         != this.storageHaManager.allowFollowRead;
+
+                Map<String, Throwable> haSubmitExceptionMap = new TreeMap<>(CaseInsensitive.CASE_INSENSITIVE_ORDER);
                 for (String storageInstIdVal : storageInstNewRoleInfoMap.keySet()) {
+                    try {
+                        String newAvailableAddr = storageInstNewRoleInfoMap.get(storageInstIdVal).getKey();
+                        String newAvailableAddrUser = null;
+                        String newAvailableAddrEncPasswd = null;
 
-                    String newAvailableAddr = storageInstNewRoleInfoMap.get(storageInstIdVal).getKey();
-                    String newAvailableAddrUser = null;
-                    String newAvailableAddrEncPasswd = null;
-
-                    Map<String, StorageNodeHaInfo> addrWithRoleMap =
-                        storageInstNewRoleInfoMap.get(storageInstIdVal).getValue();
-                    StorageInstHaContext haCache = storageHaCache.get(storageInstIdVal);
-                    if (StringUtils.isEmpty(newAvailableAddr)) {
-                        haCache.isCurrAvailableNodeAddrHealthy = false;
-                    } else {
-                        StorageNodeHaInfo healthyVal = addrWithRoleMap.get(newAvailableAddr);
-                        haCache.isCurrAvailableNodeAddrHealthy = healthyVal != null && healthyVal.isHealthy;
-                        newAvailableAddrUser = healthyVal.getUser();
-                        newAvailableAddrEncPasswd = healthyVal.getEncPasswd();
-                    }
-
-                    boolean isMasterStorageInst = haCache.getStorageKind() != StorageInfoRecord.INST_KIND_SLAVE;
-                    boolean shouldHa = false;
-                    if (checkIfAvailableAddrChanged(newAvailableAddr, haCache.currAvailableNodeAddr)) {
-                        if (haCache.haStatus == StorageInstHaContext.StorageHaStatus.NORMAL) {
-                            shouldHa = true;
-                        }
-                    }
-
-                    if (!shouldHa && checkIfAvailableAddrUserPasswdChanged(haCache.user, newAvailableAddrUser,
-                        haCache.encPasswd, newAvailableAddrEncPasswd)) {
-                        if (haCache.haStatus == StorageInstHaContext.StorageHaStatus.NORMAL) {
-                            shouldHa = true;
-                        }
-                    }
-
-                    if (!shouldHa && ConfigDataMode.isMasterMode()
-                        && haCache.storageKind == StorageInfoRecord.INST_KIND_MASTER) {
-                        //check the new followers
-                        Set<String> newFollows = new HashSet<>();
-                        Set<String> oldFollows = new HashSet<>();
-
-                        if (addrWithRoleMap != null) {
-                            for (Map.Entry<String, StorageNodeHaInfo> entry : addrWithRoleMap.entrySet()) {
-                                if (entry.getValue().getRole() == StorageRole.FOLLOWER) {
-                                    newFollows.add(entry.getKey());
-                                }
+                        Map<String, StorageNodeHaInfo> addrWithRoleMap =
+                            storageInstNewRoleInfoMap.get(storageInstIdVal).getValue();
+                        StorageInstHaContext haCache = storageHaCache.get(storageInstIdVal);
+                        if (StringUtils.isEmpty(newAvailableAddr) || newAvailableAddr.equalsIgnoreCase(
+                            UNAVAILABLE_ACCESS_FOR_LEARNER)) {
+                            haCache.isCurrAvailableNodeAddrHealthy = false;
+                            //Set the user&passwd although the address is unavailable!
+                            newAvailableAddrUser = haCache.getUser();
+                            newAvailableAddrEncPasswd = haCache.getEncPasswd();
+                        } else {
+                            StorageNodeHaInfo healthyVal = addrWithRoleMap.get(newAvailableAddr);
+                            if (healthyVal == null) {
+                                String logMsg = String.format(
+                                    "No found the StorageRole Info for new available addr %s, its roleInfoMap size is %d",
+                                    newAvailableAddr, addrWithRoleMap.size());
+                                MetaDbLogUtil.META_DB_LOG.warn(logMsg);
+                                haCache.isCurrAvailableNodeAddrHealthy = false;
+                            } else {
+                                haCache.isCurrAvailableNodeAddrHealthy = healthyVal != null && healthyVal.isHealthy;
+                                newAvailableAddrUser = healthyVal.getUser();
+                                newAvailableAddrEncPasswd = healthyVal.getEncPasswd();
                             }
                         }
 
-                        Map<String, StorageNodeHaInfo> oldHaInfo = haCache.getAllStorageNodeHaInfoMap();
-                        if (oldHaInfo != null) {
-                            for (Map.Entry<String, StorageNodeHaInfo> entry : oldHaInfo.entrySet()) {
-                                if (entry.getValue().getRole() == StorageRole.FOLLOWER) {
-                                    oldFollows.add(entry.getKey());
-                                }
+                        boolean isMasterStorageInst = haCache.getStorageKind() != StorageInfoRecord.INST_KIND_SLAVE;
+                        boolean shouldHa = false;
+                        if (checkIfAvailableAddrChanged(newAvailableAddr, haCache.currAvailableNodeAddr)) {
+                            if (haCache.haStatus == StorageInstHaContext.StorageHaStatus.NORMAL) {
+                                shouldHa = true;
                             }
                         }
-                        if (!newFollows.equals(oldFollows)) {
-                            shouldHa = true;
+
+                        if (!shouldHa && checkIfAvailableAddrUserPasswdChanged(haCache.user, newAvailableAddrUser,
+                            haCache.encPasswd, newAvailableAddrEncPasswd)) {
+                            if (haCache.haStatus == StorageInstHaContext.StorageHaStatus.NORMAL) {
+                                shouldHa = true;
+                            }
                         }
-                        shouldHa = shouldHa || forceHa;
-                    }
 
-                    // Refresh all the HaInfos for all storageNode in memory
-                    haCache.allStorageNodeHaInfoMap = addrWithRoleMap;
+                        if (!shouldHa && ConfigDataMode.isMasterMode()
+                            && haCache.storageKind == StorageInfoRecord.INST_KIND_MASTER) {
+                            //check the new followers
+                            Set<String> newFollows = new HashSet<>();
+                            Set<String> oldFollows = new HashSet<>();
 
-                    /**
-                     * For all storageMasterInst, check if exists multi-leaders
-                     */
-                    if (shouldHa && isMasterStorageInst) {
+                            if (addrWithRoleMap != null) {
+                                for (Map.Entry<String, StorageNodeHaInfo> entry : addrWithRoleMap.entrySet()) {
+                                    if (entry.getValue().getRole() == StorageRole.FOLLOWER) {
+                                        newFollows.add(entry.getKey());
+                                    }
+                                }
+                            }
+
+                            Map<String, StorageNodeHaInfo> oldHaInfo = haCache.getAllStorageNodeHaInfoMap();
+                            if (oldHaInfo != null) {
+                                for (Map.Entry<String, StorageNodeHaInfo> entry : oldHaInfo.entrySet()) {
+                                    if (entry.getValue().getRole() == StorageRole.FOLLOWER) {
+                                        oldFollows.add(entry.getKey());
+                                    }
+                                }
+                            }
+                            if (!newFollows.equals(oldFollows)) {
+                                shouldHa = true;
+                                MetaDbLogUtil.META_DB_LOG.warn(String.format(
+                                    "Force HA due to the follows change from old follow storages [%s] to new follow storages [%s]",
+                                    oldFollows, newFollows));
+                            }
+                            shouldHa = shouldHa || forceHa;
+                        }
+
+                        // Refresh all the HaInfos for all storageNode in memory
+                        haCache.allStorageNodeHaInfoMap = addrWithRoleMap;
+
                         /**
-                         * Check if the roles of storage contain multi-leaders
+                         * For all storageMasterInst, check if exists multi-leaders
                          */
-                        int leaderCnt = 0;
-                        for (Map.Entry<String, StorageNodeHaInfo> addrRoleItem : addrWithRoleMap.entrySet()) {
-                            if (addrRoleItem.getValue().getRole() == StorageRole.LEADER) {
-                                leaderCnt++;
-                            }
-                        }
-                        if (leaderCnt > 1) {
+                        if (shouldHa && isMasterStorageInst) {
                             /**
-                             *  Find multi leader in roleMap, so current storage inst is not healthy,
-                             *  reject to submit ha task.
+                             * Check if the roles of storage contain multi-leaders
                              */
-                            shouldHa = false;
-                            MetaDbLogUtil.META_DB_LOG.warn(String.format(
-                                "Reject to do haTask for storage[%s] because of finding multi leaders, leader count is [%s]",
-                                storageInstIdVal, leaderCnt));
-                        }
-                    }
-
-                    // shouldHaFlags is used for doing HA logs
-                    shouldHaFlags.put(storageInstIdVal, new Pair<>(shouldHa,
-                        haCache.currAvailableNodeAddr == null ? "noAvailableAddr" : haCache.currAvailableNodeAddr));
-                    if (shouldHa) {
-                        // check newAvailableAddr is vip address or not
-                        boolean isVipAddr = true;
-                        for (Map.Entry<String, StorageNodeHaInfo> addrRoleInfo : storageInstNewRoleInfoMap.get(
-                            storageInstIdVal).getValue().entrySet()) {
-                            if (addrRoleInfo.getKey().equals(newAvailableAddr) && !addrRoleInfo.getValue().isVip()) {
-                                isVipAddr = false;
-                                break; // found one with same addr but not vip, means vip is set to actual leader addr
+                            int leaderCnt = 0;
+                            for (Map.Entry<String, StorageNodeHaInfo> addrRoleItem : addrWithRoleMap.entrySet()) {
+                                if (addrRoleItem.getValue().getRole() == StorageRole.LEADER) {
+                                    leaderCnt++;
+                                }
+                            }
+                            if (leaderCnt > 1) {
+                                /**
+                                 *  Find multi leader in roleMap, so current storage inst is not healthy,
+                                 *  reject to submit ha task.
+                                 */
+                                shouldHa = false;
+                                MetaDbLogUtil.META_DB_LOG.warn(String.format(
+                                    "Reject to do haTask for storage[%s] because of finding multi leaders, leader count is [%s]",
+                                    storageInstIdVal, leaderCnt));
                             }
                         }
 
-                        MetaDbLogUtil.META_DB_LOG.info(
-                            "XCluster StorageDB submitHaSwitchTask newAvailableAddr=" + newAvailableAddr + " isVip=" + (
-                                isVipAddr ? "true" : "false"));
+                        // shouldHaFlags is used for doing HA logs
+                        shouldHaFlags.put(storageInstIdVal, new Pair<>(shouldHa,
+                            haCache.currAvailableNodeAddr == null ? "noAvailableAddr" : haCache.currAvailableNodeAddr));
+                        if (shouldHa) {
+                            // check newAvailableAddr is vip address or not
+                            boolean isVipAddr = true;
+                            for (Map.Entry<String, StorageNodeHaInfo> addrRoleInfo : storageInstNewRoleInfoMap.get(
+                                storageInstIdVal).getValue().entrySet()) {
+                                if (addrRoleInfo.getKey().equals(newAvailableAddr) && !addrRoleInfo.getValue()
+                                    .isVip()) {
+                                    isVipAddr = false;
+                                    break; // found one with same addr but not vip, means vip is set to actual leader addr
+                                }
+                            }
 
-                        submitHaSwitchTask(newAvailableAddr, isVipAddr, newAvailableAddrUser, newAvailableAddrEncPasswd,
-                            addrWithRoleMap, haCache);
+                            MetaDbLogUtil.META_DB_LOG.info(
+                                "XCluster StorageDB submitHaSwitchTask newAvailableAddr=" + newAvailableAddr + " isVip="
+                                    + (
+                                    isVipAddr ? "true" : "false"));
+
+                            submitHaSwitchTask(newAvailableAddr, isVipAddr, newAvailableAddrUser,
+                                newAvailableAddrEncPasswd,
+                                addrWithRoleMap, haCache);
+                        }
+                    } catch (Throwable ex) {
+                        haSubmitExceptionMap.put(storageInstIdVal, ex);
+                        MetaDbLogUtil.META_DB_LOG.error(String.format(
+                            "StorageInst[%s] failed to submit its ha switch task, the error msg is %s",
+                            storageInstIdVal, ex.getMessage()), ex);
+                        haCheckEx = ex;
                     }
                 }
                 this.storageHaManager.allowFollowRead = DynamicConfig.getInstance().enableFollowReadForPolarDBX();

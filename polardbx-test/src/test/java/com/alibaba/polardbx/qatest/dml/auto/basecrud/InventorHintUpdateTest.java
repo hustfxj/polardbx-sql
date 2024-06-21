@@ -110,7 +110,7 @@ public class InventorHintUpdateTest extends AutoCrudBasedLockTestCase {
      */
     @Test
     public void updateTestForInventorHint() throws Exception {
-        if (isGalaxy()) {
+        if (isMySQL80()) {
             return;
         }
 
@@ -121,6 +121,9 @@ public class InventorHintUpdateTest extends AutoCrudBasedLockTestCase {
             "select integer_test from %s where pk = 1", baseOneTableName);
 
         String showTrace = String.format("show trace");
+
+        ResultSet rs = JdbcUtil.executeQuerySuccess(tddlConnection, "show variables like 'ENABLE_XA_TSO'");
+        boolean isXaTsoTrx = rs.next() && rs.getBoolean("Value");
 
         tddlConnection.setAutoCommit(false);
         JdbcUtil.setTxPolicy(transPolicy, tddlConnection);
@@ -138,7 +141,7 @@ public class InventorHintUpdateTest extends AutoCrudBasedLockTestCase {
                 statement1.execute(sql1);
                 throw new RuntimeException("Don't expect here!");
             } catch (Throwable t) {
-                if (transPolicy == ITransactionPolicy.TSO) {
+                if (transPolicy == ITransactionPolicy.TSO || (transPolicy == ITransactionPolicy.XA && isXaTsoTrx)) {
                     Assert.assertTrue(t.getMessage()
                         .contains("Don't support the Inventory Hint on current Transaction Policy"));
                 } else {
@@ -175,7 +178,7 @@ public class InventorHintUpdateTest extends AutoCrudBasedLockTestCase {
                 statement1.execute(sql1);
                 statement1.close();
             } catch (Throwable t) {
-                if (transPolicy == ITransactionPolicy.TSO) {
+                if (transPolicy == ITransactionPolicy.TSO || (transPolicy == ITransactionPolicy.XA && isXaTsoTrx)) {
                     Assert.assertTrue(t.getMessage()
                         .contains("Don't support the Inventory Hint on current Transaction Policy"));
                     statement1.close();
@@ -241,7 +244,7 @@ public class InventorHintUpdateTest extends AutoCrudBasedLockTestCase {
 
     @Test
     public void updateWithCommitHintOnShardingTable2() throws Exception {
-        if (isGalaxy() || baseOneTableName.contains(ONE_DB_ONE_TB_SUFFIX)) {
+        if (isMySQL80() || baseOneTableName.contains(ONE_DB_ONE_TB_SUFFIX)) {
             return;
         }
 

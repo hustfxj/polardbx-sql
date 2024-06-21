@@ -93,7 +93,13 @@ public class SqlFunction extends SqlOperator {
         NON_PUSHDOWN_FUNCTION.add("RELEASE_ALL_LOCKS");
         NON_PUSHDOWN_FUNCTION.add("IS_FREE_LOCK");
         NON_PUSHDOWN_FUNCTION.add("IS_USED_LOCK");
+        NON_PUSHDOWN_FUNCTION.add("HYPERLOGLOG");
         NON_PUSHDOWN_FUNCTION.add("PART_HASH");
+        SqlFunction.NON_PUSHDOWN_FUNCTION.add("LBAC_CHECK");
+        SqlFunction.NON_PUSHDOWN_FUNCTION.add("LBAC_READ");
+        SqlFunction.NON_PUSHDOWN_FUNCTION.add("LBAC_WRITE");
+        SqlFunction.NON_PUSHDOWN_FUNCTION.add("LBAC_WRITE_STRICT_CHECK");
+        SqlFunction.NON_PUSHDOWN_FUNCTION.add("LBAC_USER_WRITE_LABEL");
 
         // Time Function
         DYNAMIC_FUNCTION.add("CURDATE");
@@ -170,6 +176,24 @@ public class SqlFunction extends SqlOperator {
         // We leave sqlIdentifier as null to indicate
         // that this is a builtin.  Same for paramTypes.
         this(name, null, kind, returnTypeInference, operandTypeInference,
+            operandTypeChecker, null, category);
+
+        assert !((category == SqlFunctionCategory.USER_DEFINED_CONSTRUCTOR)
+            && (returnTypeInference == null));
+    }
+
+    // TODO whether we should remove this
+    public SqlFunction(
+        SqlIdentifier identifier,
+        String name,
+        SqlKind kind,
+        SqlReturnTypeInference returnTypeInference,
+        SqlOperandTypeInference operandTypeInference,
+        SqlOperandTypeChecker operandTypeChecker,
+        SqlFunctionCategory category) {
+        // We leave sqlIdentifier as null to indicate
+        // that this is a builtin.  Same for paramTypes.
+        this(name, identifier, kind, returnTypeInference, operandTypeInference,
             operandTypeChecker, null, category);
 
         assert !((category == SqlFunctionCategory.USER_DEFINED_CONSTRUCTOR)
@@ -447,6 +471,9 @@ public class SqlFunction extends SqlOperator {
 
     @Override
     public boolean canPushDown(boolean withScaleOut) {
+        if (withScaleOut && this instanceof SqlUserDefinedFunction) {
+            return false;
+        }
         return canPushDown();
     }
 

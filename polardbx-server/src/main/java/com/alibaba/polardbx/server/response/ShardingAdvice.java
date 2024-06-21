@@ -17,7 +17,6 @@
 package com.alibaba.polardbx.server.response;
 
 import com.alibaba.polardbx.Fields;
-import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.executor.whatIf.ShardingWhatIf;
 import com.alibaba.polardbx.net.buffer.ByteBufferHolder;
 import com.alibaba.polardbx.net.compress.IPacketOutputProxy;
@@ -40,11 +39,10 @@ import java.util.Map;
  */
 public class ShardingAdvice {
 
-
     private static final int FIELD_COUNT = 5;
     private static final ResultSetHeaderPacket header = PacketUtil.getHeader(FIELD_COUNT);
     private static final FieldPacket[] fields = new FieldPacket[FIELD_COUNT];
-    private static final EOFPacket eof = new EOFPacket();
+    private static final byte packetId = FIELD_COUNT + 1;
 
     static {
         int i = 0;
@@ -61,12 +59,10 @@ public class ShardingAdvice {
         fields[i++].packetId = ++packetId;
         fields[i] = PacketUtil.getField("MOST HARMFUL SQLs", Fields.FIELD_TYPE_VAR_STRING);
         fields[i++].packetId = ++packetId;
-        eof.packetId = ++packetId;
     }
 
-    public static void response(ServerConnection c, boolean hasMore,
-                                ShardResultForOutput result, ShardingWhatIf shardingWhatIf) {
-
+    public static boolean response(ServerConnection c, boolean hasMore,
+                                   ShardResultForOutput result, ShardingWhatIf shardingWhatIf) {
 
         ByteBufferHolder buffer = c.allocate();
         IPacketOutputProxy proxy = PacketOutputProxyFactory.getInstance().createProxy(c, buffer);
@@ -80,47 +76,50 @@ public class ShardingAdvice {
             proxy = field.write(proxy);
         }
 
+        byte tmpPacketId = packetId;
         // write eof
-        proxy = eof.write(proxy);
+        if (!c.isEofDeprecated()) {
+            EOFPacket eof = new EOFPacket();
+            eof.packetId = ++tmpPacketId;
+            proxy = eof.write(proxy);
+        }
 
         List<String> summary = shardingWhatIf.summarize();
         // write rows
-        byte packetId = eof.packetId;
-
         if (result.getSqls().size() == 0) {
             RowDataPacket row = new RowDataPacket(FIELD_COUNT);
-            row.add(StringUtil.encode(c.getSchema(), c.getCharset()));
-            row.add(StringUtil.encode("No valid sql cache found in current schema!", c.getCharset()));
+            row.add(StringUtil.encode(c.getSchema(), c.getResultSetCharset()));
+            row.add(StringUtil.encode("No valid sql cache found in current schema!", c.getResultSetCharset()));
             for (int i = 0; i < 3; i++) {
-                row.add(StringUtil.encode("", c.getCharset()));
+                row.add(StringUtil.encode("", c.getResultSetCharset()));
             }
-            row.packetId = ++packetId;
+            row.packetId = ++tmpPacketId;
             proxy = row.write(proxy);
-        } else if (summary == null){
+        } else if (summary == null) {
             RowDataPacket row = new RowDataPacket(FIELD_COUNT);
-            row.add(StringUtil.encode(c.getSchema(), c.getCharset()));
-            row.add(StringUtil.encode("No better sharding plan found for current workload!", c.getCharset()));
+            row.add(StringUtil.encode(c.getSchema(), c.getResultSetCharset()));
+            row.add(StringUtil.encode("No better sharding plan found for current workload!", c.getResultSetCharset()));
             for (int i = 0; i < 3; i++) {
-                row.add(StringUtil.encode("", c.getCharset()));
+                row.add(StringUtil.encode("", c.getResultSetCharset()));
             }
-            row.packetId = ++packetId;
+            row.packetId = ++tmpPacketId;
             proxy = row.write(proxy);
         } else {
             for (Map.Entry<String, StringBuilder> entry : result.display().entrySet()) {
                 RowDataPacket row = new RowDataPacket(FIELD_COUNT);
-                row.add(StringUtil.encode(entry.getKey(), c.getCharset()));
-                row.add(StringUtil.encode(entry.getValue().toString(), c.getCharset()));
+                row.add(StringUtil.encode(entry.getKey(), c.getResultSetCharset()));
+                row.add(StringUtil.encode(entry.getValue().toString(), c.getResultSetCharset()));
                 for (String info : summary) {
-                    row.add(StringUtil.encode(info, c.getCharset()));
+                    row.add(StringUtil.encode(info, c.getResultSetCharset()));
                 }
-                row.packetId = ++packetId;
+                row.packetId = ++tmpPacketId;
                 proxy = row.write(proxy);
             }
         }
 
         // write last eof
         EOFPacket lastEof = new EOFPacket();
-        lastEof.packetId = ++packetId;
+        lastEof.packetId = ++tmpPacketId;
         if (hasMore) {
             lastEof.status |= MySQLPacket.SERVER_MORE_RESULTS_EXISTS;
         }
@@ -128,5 +127,6 @@ public class ShardingAdvice {
 
         // post write
         proxy.packetEnd();
+        return true;
     }
 }

@@ -94,13 +94,18 @@ public class DataValidator {
 
     public static void explainResultMatchAssert(String sql, List<Object> param, Connection tddlConnection,
                                                 String expectPattern) {
+        explainResultMatchAssert(sql, param, tddlConnection, expectPattern, 1);
+    }
+
+    public static void explainResultMatchAssert(String sql, List<Object> param, Connection tddlConnection,
+                                                String expectPattern, int index) {
         PreparedStatement tddlPs = JdbcUtil.preparedStatementSet(sql, param, tddlConnection);
         String errorMess = null;
         String actualExplainResult = "";
         try {
             ResultSet rs = tddlPs.executeQuery();
             rs.next();
-            actualExplainResult = rs.getString(1);
+            actualExplainResult = rs.getString(index);
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -110,6 +115,27 @@ public class DataValidator {
         }
         Assert.assertTrue("expect pattern is " + expectPattern + "\n but actual is " + actualExplainResult,
             actualExplainResult.matches(expectPattern));
+
+    }
+
+    public static void explainResultStrictMatchAssert(String sql, List<Object> param, Connection tddlConnection,
+                                                      String expectPattern, int index) {
+        PreparedStatement tddlPs = JdbcUtil.preparedStatementSet(sql, param, tddlConnection);
+        String errorMess = null;
+        String actualExplainResult = "";
+        try {
+            ResultSet rs = tddlPs.executeQuery();
+            rs.next();
+            actualExplainResult = rs.getString(index);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            errorMess = e.getMessage();
+        } finally {
+            JdbcUtil.close(tddlPs);
+        }
+        Assert.assertTrue("expect pattern is " + expectPattern + "\n but actual is " + actualExplainResult,
+            actualExplainResult.equalsIgnoreCase(expectPattern));
 
     }
 
@@ -183,6 +209,24 @@ public class DataValidator {
             "expect pattern is " + expectPattern + "\n but actual is " + actualExplainResult + "\n sql is " + sql,
             actualExplainResult.matches(expectPattern));
 
+    }
+
+    public static String getExplainAllResult(String sql, List<Object> param, Connection tddlConnection) {
+        PreparedStatement tddlPs = JdbcUtil.preparedStatementSet(sql, param, tddlConnection);
+        String errorMess = null;
+        StringBuilder actualExplainResult = new StringBuilder();
+        try {
+            ResultSet rs = tddlPs.executeQuery();
+            while (rs.next()) {
+                actualExplainResult.append("\n").append(rs.getString(1));
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            errorMess = e.getMessage();
+        } finally {
+            JdbcUtil.close(tddlPs);
+        }
+        return actualExplainResult.toString();
     }
 
     /**
@@ -278,7 +322,8 @@ public class DataValidator {
             List<List<Object>> tddlResults = JdbcUtil.getAllResult(tddlRs, ignoreException);
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集", mysqlResults.size() != 0);
+                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集",
+                    mysqlResults.size() != 0);
             }
             final String show_warnings = "show warnings";
             mysqlPs1 = JdbcUtil.preparedStatementSet(show_warnings, param, mysqlConnection);
@@ -291,7 +336,9 @@ public class DataValidator {
                     }
                 }
             }
-            assertWithMessage(" 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param).that(mysqlResults)
+            assertWithMessage(
+                " 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param).that(
+                    mysqlResults)
                 .containsExactlyElementsIn(tddlResults);
 
         } catch (Exception e) {
@@ -359,7 +406,9 @@ public class DataValidator {
                 List<String> tddlColumnTypeNmaes = JdbcUtil.getAllTypeName(tddlRs, ignoreException);
                 System.out.println("mysql:" + mysqlColumnTypeNames);
                 System.out.println("tddl:" + tddlColumnTypeNmaes);
-                assertWithMessage(" #datatype#非顺序情况下：mysql 返回类型与tddl 返回类型不一致 \n sql 语句为：" + tddlSql + " 参数为 :" + param)
+                assertWithMessage(
+                    " #datatype#非顺序情况下：mysql 返回类型与tddl 返回类型不一致 \n sql 语句为：" + tddlSql + " 参数为 :"
+                        + param)
                     .that(
                         tddlColumnTypeNmaes).containsExactlyElementsIn(mysqlColumnTypeNames);
             }
@@ -368,9 +417,11 @@ public class DataValidator {
             List<List<Object>> tddlResults = JdbcUtil.getAllResult(tddlRs, ignoreException);
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + tddlSql + " 查询的结果集为空，请修改sql语句，保证有结果集", mysqlResults.size() != 0);
+                Assert.assertTrue("sql语句:" + tddlSql + " 查询的结果集为空，请修改sql语句，保证有结果集",
+                    mysqlResults.size() != 0);
             }
-            assertWithMessage(" 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + tddlSql + " 参数为 :" + param)
+            assertWithMessage(
+                " 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + tddlSql + " 参数为 :" + param)
                 .that(tddlResults)
                 .containsExactlyElementsIn(mysqlResults);
 
@@ -414,9 +465,12 @@ public class DataValidator {
             }
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集", mysqlResults.size() != 0);
+                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集",
+                    mysqlResults.size() != 0);
             }
-            assertWithMessage(" 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param).that(tddlResults)
+            assertWithMessage(
+                " 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param).that(
+                    tddlResults)
                 .containsExactlyElementsIn(mysqlResults);
         } catch (Exception e) {
             log.error(e.getMessage());
@@ -468,9 +522,11 @@ public class DataValidator {
             List<List<Object>> tddlResults = JdbcUtil.getAllResult(tddlRs);
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + mysqlSql + " 查询的结果集为空，请修改sql语句，保证有结果集", mysqlResults.size() != 0);
+                Assert.assertTrue("sql语句:" + mysqlSql + " 查询的结果集为空，请修改sql语句，保证有结果集",
+                    mysqlResults.size() != 0);
             }
-            assertWithMessage(" 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + mysqlSql + " 参数为 :" + param)
+            assertWithMessage(
+                " 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + mysqlSql + " 参数为 :" + param)
                 .that(tddlResults).containsExactlyElementsIn(mysqlResults); //.containsExactlyElementsIn(tddlResults);
         } catch (Exception e) {
             log.error(e.getMessage());
@@ -506,9 +562,11 @@ public class DataValidator {
             List<List<Object>> tddlResults = JdbcUtil.getAllResultIgnoreColumn(tddlRs, ignoreColumnIndex);
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + mysqlSql + " 查询的结果集为空，请修改sql语句，保证有结果集", mysqlResults.size() != 0);
+                Assert.assertTrue("sql语句:" + mysqlSql + " 查询的结果集为空，请修改sql语句，保证有结果集",
+                    mysqlResults.size() != 0);
             }
-            assertWithMessage(" 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + mysqlSql + " 参数为 :" + param)
+            assertWithMessage(
+                " 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + mysqlSql + " 参数为 :" + param)
                 .that(tddlResults).containsExactlyElementsIn(mysqlResults); //.containsExactlyElementsIn(tddlResults);
         } catch (Exception e) {
             log.error(e.getMessage());
@@ -549,9 +607,12 @@ public class DataValidator {
             List<List<Object>> tddlResults = JdbcUtil.getAllResult(tddlRs);
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集", mysqlResults.size() != 0);
+                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集",
+                    mysqlResults.size() != 0);
             }
-            assertWithMessage(" 顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param).that(tddlResults)
+            assertWithMessage(
+                " 顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param).that(
+                    tddlResults)
                 .containsExactlyElementsIn(mysqlResults)
                 .inOrder();
         } catch (Exception e) {
@@ -594,7 +655,8 @@ public class DataValidator {
             List<List<Object>> tddlResults = JdbcUtil.getAllResult(tddlRs);
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + sql + " ,param 为：" + param + "查询的结果集为空，请修改sql语句，保证有结果集",
+                Assert.assertTrue(
+                    "sql语句:" + sql + " ,param 为：" + param + "查询的结果集为空，请修改sql语句，保证有结果集",
                     mysqlResults.size() != 0);
             }
 
@@ -1278,11 +1340,13 @@ public class DataValidator {
             List<List<Object>> tddlResults = JdbcUtil.getAllResult(tddlRs);
             // 不允许为空结果集合
             if (!allowEmptyResultSet) {
-                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集", mysqlResults.size() != 0);
+                Assert.assertTrue("sql语句:" + sql + " 查询的结果集为空，请修改sql语句，保证有结果集",
+                    mysqlResults.size() != 0);
             }
             List<List<Object>> mysqlResultsFastJsonFormat = convertToFastJsonFormat(mysqlResults);
             List<List<Object>> tddlResultsFastJsonFormat = convertToFastJsonFormat(tddlResults);
-            assertWithMessage(" 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param)
+            assertWithMessage(
+                " 非顺序情况下：mysql 返回结果与tddl 返回结果不一致 \n sql 语句为：" + sql + " 参数为 :" + param)
                 .that(tddlResultsFastJsonFormat)
                 .containsExactlyElementsIn(mysqlResultsFastJsonFormat);
         } catch (Exception e) {

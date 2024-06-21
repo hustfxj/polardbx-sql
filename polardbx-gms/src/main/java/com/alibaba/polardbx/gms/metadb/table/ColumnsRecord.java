@@ -19,11 +19,13 @@ package com.alibaba.polardbx.gms.metadb.table;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.jdbc.ParameterMethod;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
+import lombok.Data;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Map;
 
+@Data
 public class ColumnsRecord extends ColumnsInfoSchemaRecord {
 
     public int jdbcType;
@@ -32,9 +34,15 @@ public class ColumnsRecord extends ColumnsInfoSchemaRecord {
     public long version;
     public int status;
     public long flag;
+    public String columnMappingName;
 
     public static final long FLAG_FILL_DEFAULT = 0x1;
     public static final long FLAG_BINARY_DEFAULT = 0x2; // If default value is hex string
+
+    public static final long FLAG_LOGICAL_GENERATED_COLUMN = 0x4; // If this column is CN generated column
+    public static final long FLAG_GENERATED_COLUMN = 0x8; // If this column is DN generated column
+
+    public static final long FLAG_DEFAULT_EXPR = 0x10; // If this column is default expression
 
     @Override
     public ColumnsRecord fill(ResultSet rs) throws SQLException {
@@ -45,6 +53,7 @@ public class ColumnsRecord extends ColumnsInfoSchemaRecord {
         this.version = rs.getLong("version");
         this.status = rs.getInt("status");
         this.flag = rs.getLong("flag");
+        this.columnMappingName = rs.getString("column_mapping_name");
         return this;
     }
 
@@ -58,6 +67,7 @@ public class ColumnsRecord extends ColumnsInfoSchemaRecord {
         MetaDbUtil.setParameter(++index, params, ParameterMethod.setLong, this.version);
         MetaDbUtil.setParameter(++index, params, ParameterMethod.setInt, this.status);
         MetaDbUtil.setParameter(++index, params, ParameterMethod.setLong, this.flag);
+        MetaDbUtil.setParameter(++index, params, ParameterMethod.setString, this.columnMappingName);
         return params;
     }
 
@@ -93,5 +103,41 @@ public class ColumnsRecord extends ColumnsInfoSchemaRecord {
 
     public void clearBinaryDefault() {
         flag &= ~FLAG_BINARY_DEFAULT;
+    }
+
+    public boolean isLogicalGeneratedColumn() {
+        return (flag & FLAG_LOGICAL_GENERATED_COLUMN) != 0L;
+    }
+
+    public void setLogicalGeneratedColumn() {
+        flag |= FLAG_LOGICAL_GENERATED_COLUMN;
+    }
+
+    public void clearLogicalGeneratedColumn() {
+        flag &= ~FLAG_LOGICAL_GENERATED_COLUMN;
+    }
+
+    public boolean isGeneratedColumn() {
+        return (flag & FLAG_GENERATED_COLUMN) != 0L;
+    }
+
+    public void setGeneratedColumn() {
+        flag |= FLAG_GENERATED_COLUMN;
+    }
+
+    public void clearGeneratedColumn() {
+        flag &= ~FLAG_GENERATED_COLUMN;
+    }
+
+    public boolean isDefaultExpr() {
+        return (flag & FLAG_DEFAULT_EXPR) != 0L;
+    }
+
+    public void setDefaultExpr() {
+        flag |= FLAG_DEFAULT_EXPR;
+    }
+
+    public void clearDefaultExpr() {
+        flag &= ~FLAG_DEFAULT_EXPR;
     }
 }

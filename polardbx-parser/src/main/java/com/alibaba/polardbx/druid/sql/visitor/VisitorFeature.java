@@ -38,7 +38,9 @@ public enum VisitorFeature {
 
     OutputNameQuote,
     OutputDistributedLiteralInCreateTableStmt,
-    OutputPlOnlyDefinition;
+    OutputPlOnlyDefinition,
+    OutputHashPartitionsByRange,
+    OutputMySQLIndentString;
 
     private VisitorFeature() {
         mask = (1 << ordinal());

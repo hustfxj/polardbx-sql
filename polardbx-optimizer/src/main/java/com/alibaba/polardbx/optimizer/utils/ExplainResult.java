@@ -83,7 +83,11 @@ public class ExplainResult {
         // the statistics needed by the sql
         STATISTICS,
         // show vectorized plan
-        VEC;
+        VEC,
+        // show statistic detail
+        COST_TRACE,
+        // show pipeline level stats
+        PIPELINE;
 
         public boolean isLogic() {
             return this == LOGIC || isSimple();
@@ -114,7 +118,11 @@ public class ExplainResult {
         }
 
         public boolean isCost() {
-            return this == COST;
+            return this == COST || this == COST_TRACE;
+        }
+
+        public boolean isCostTrace() {
+            return this == COST_TRACE;
         }
 
         public boolean isAnalyze() {
@@ -143,6 +151,10 @@ public class ExplainResult {
 
         public boolean isStatistics() {
             return this == STATISTICS;
+        }
+
+        public boolean isPipeline() {
+            return this == PIPELINE;
         }
 
         public boolean isA(EnumSet enumSet) {
@@ -174,6 +186,10 @@ public class ExplainResult {
         return er == null ? false : er.explainMode.isCost();
     }
 
+    public static boolean isExplainCostTrace(ExplainResult er) {
+        return er == null ? false : er.explainMode.isCostTrace();
+    }
+
     public static boolean isExplainAnalyze(ExplainResult er) {
         return er == null ? false : er.explainMode.isAnalyze();
     }
@@ -192,6 +208,10 @@ public class ExplainResult {
 
     public static boolean isExplainStatistics(ExplainResult er) {
         return er != null && er.explainMode.isStatistics();
+    }
+
+    public static boolean isExplainPipeline(ExplainResult er) {
+        return er != null && er.explainMode.isPipeline();
     }
 
     public static boolean isExplainVec(ExplainResult er) {

@@ -29,6 +29,10 @@ public class CostModelWeight {
 
     private double probeWeight = 1.1;
 
+    private double reverseSemiProbeWeight = 1.6;
+
+    private double reverseAntiProbeWeight = 1.85;
+
     private double mergeWeight = 1.2;
 
     private double nlWeight = 1.1;
@@ -36,6 +40,8 @@ public class CostModelWeight {
     private double hashAggWeight = 1.5;
 
     private double sortAggWeight = 1.0;
+
+    private double sortWindowWeight = 1.2;
 
     private double sortWeight = 1.05;
 
@@ -55,11 +61,15 @@ public class CostModelWeight {
 
     public static double SERIALIZE_DESERIALIZE_CPU_COST = 10;
 
+    public static double COLUMNAR_EXCHANGE_FACTOR = 0.5;
+
     public static final double SEQ_IO_PAGE_SIZE = 32 * 1024;
 
     public static final double RAND_IO_PAGE_SIZE = 4 * 1024;
 
     public static final double OSS_PAGE_SIZE = 1000;
+
+    public static final double OSS_MAX_ROWS_PER_FILE = 1000 * 1000;
 
     public static final double BLOOM_FILTER_READ_COST = 10;
 
@@ -74,6 +84,8 @@ public class CostModelWeight {
     public static final long TUPLE_HEADER_SIZE = 24;
 
     public static final int LOOKUP_START_UP_NET = 12;
+
+    public static final int GUESS_AGG_OUTPUT_NUM = 100;
 
     private CostModelWeight() {
     }
@@ -118,6 +130,22 @@ public class CostModelWeight {
         this.probeWeight = probeWeight;
     }
 
+    public double getReverseSemiProbeWeight() {
+        return reverseSemiProbeWeight;
+    }
+
+    public void setReverseSemiProbeWeight(double reverseSemiProbeWeight) {
+        this.reverseSemiProbeWeight = reverseSemiProbeWeight;
+    }
+
+    public double getReverseAntiProbeWeight() {
+        return reverseAntiProbeWeight;
+    }
+
+    public void setReverseAntiProbeWeight(double reverseAntiProbeWeight) {
+        this.reverseAntiProbeWeight = reverseAntiProbeWeight;
+    }
+
     public double getMergeWeight() {
         return mergeWeight;
     }
@@ -140,6 +168,14 @@ public class CostModelWeight {
 
     public void setSortAggWeight(double sortAggWeight) {
         this.sortAggWeight = sortAggWeight;
+    }
+
+    public double getSortWindowWeight() {
+        return sortWindowWeight;
+    }
+
+    public void setSortWindowWeight(double sortWindowWeight) {
+        this.sortWindowWeight = sortWindowWeight;
     }
 
     public double getSortWeight() {

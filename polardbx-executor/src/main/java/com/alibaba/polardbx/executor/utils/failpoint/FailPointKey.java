@@ -63,16 +63,45 @@ public interface FailPointKey {
     String FP_RANDOM_PHYSICAL_DDL_EXCEPTION = "FP_RANDOM_PHYSICAL_DDL_EXCEPTION";
 
     /**
-     * set @FP_PHYSICAL_DDL_EXCEPTION='true';
-     * 执行物理DDL时失败
+     * set @FP_BEFORE_PHYSICAL_DDL_EXCEPTION='true';
+     * 执行物理DDL之前全部分片失败
      */
-    String FP_PHYSICAL_DDL_EXCEPTION = "FP_PHYSICAL_DDL_EXCEPTION";
+    String FP_BEFORE_PHYSICAL_DDL_EXCEPTION = "FP_BEFORE_PHYSICAL_DDL_EXCEPTION";
 
     /**
-     * set @FP_PHYSICAL_DDL_PARTIAL_EXCEPTION='true';
-     * 执行物理DDL时失败
+     * set @FP_AFTER_PHYSICAL_DDL_EXCEPTION='true';
+     * 执行物理DDL之后全部分片失败
      */
-    String FP_PHYSICAL_DDL_PARTIAL_EXCEPTION = "FP_PHYSICAL_DDL_PARTIAL_EXCEPTION";
+    String FP_AFTER_PHYSICAL_DDL_EXCEPTION = "FP_AFTER_PHYSICAL_DDL_EXCEPTION";
+
+    /**
+     * set @FP_BEFORE_PHYSICAL_DDL_PARTIAL_EXCEPTION='true';
+     * 执行物理DDL之前部分分片失败
+     */
+    String FP_BEFORE_PHYSICAL_DDL_PARTIAL_EXCEPTION = "FP_BEFORE_PHYSICAL_DDL_PARTIAL_EXCEPTION";
+
+    /**
+     * set @FP_AFTER_PHYSICAL_DDL_PARTIAL_EXCEPTION='true';
+     * 执行物理DDL之后部分分片失败
+     */
+    String FP_AFTER_PHYSICAL_DDL_PARTIAL_EXCEPTION = "FP_AFTER_PHYSICAL_DDL_PARTIAL_EXCEPTION";
+
+    /**
+     * set @FP_NEW_SEQ_EXCEPTION_RIGHT_AFTER_PHY_CREATION='true';
+     * 创建New Seq的底层Seq后立即失败
+     */
+    String FP_NEW_SEQ_EXCEPTION_RIGHT_AFTER_PHY_CREATION = "FP_NEW_SEQ_EXCEPTION_RIGHT_AFTER_PHY_CREATION";
+
+    /**
+     * set @FP_PHYSICAL_DDL_TIMEOUT='1000';
+     * 执行物理DDL时超时（毫秒）
+     */
+    String FP_PHYSICAL_DDL_TIMEOUT = "FP_PHYSICAL_DDL_TIMEOUT";
+
+    /**
+     * changeset catchup task sleep time (ms)
+     */
+    String FP_CATCHUP_TASK_SUSPEND = "FP_CATCHUP_TASK_SUSPEND";
 
     /**
      * set @FP_RANDOM_BACKFILL_EXCEPTION='30';
@@ -234,8 +263,75 @@ public interface FailPointKey {
         "FP_INJECT_IGNORE_INTERRUPTED_TO_STATISTIC_SCHEDULE_JOB";
 
     /**
+     * set @FP_INJECT_STATISTIC_SCHEDULE_JOB_HLL_EXCEPTION='true';
+     * 注入统计信息定时采集任务的超时失败
+     */
+    String FP_INJECT_STATISTIC_SCHEDULE_JOB_HLL_EXCEPTION =
+        "FP_INJECT_STATISTIC_SCHEDULE_JOB_HLL_EXCEPTION";
+
+    /**
+     * set @FP_INJECT_IGNORE_INTERRUPTED_TO_LOCAL_PARTITION_SCHEDULE_JOB='true';
+     * 忽略 expire local partition 定时任务的中断
+     */
+    String FP_INJECT_IGNORE_INTERRUPTED_TO_LOCAL_PARTITION_SCHEDULE_JOB =
+        "FP_INJECT_IGNORE_INTERRUPTED_TO_LOCAL_PARTITION_SCHEDULE_JOB";
+
+    /**
+     * set @FP_INJECT_IGNORE_INNER_INTERRUPTION_TO_LOCAL_PARTITION='true';
+     * 忽略 local partition 子任务之间的中断
+     */
+    String FP_INJECT_IGNORE_INNER_INTERRUPTION_TO_LOCAL_PARTITION =
+        "FP_INJECT_IGNORE_INNER_INTERRUPTION_TO_LOCAL_PARTITION";
+
+    /**
+     * set @FP_LOCAL_PARTITION_SCHEDULED_JOB_ERROR='true';
+     * 向 expire local partition 定时任务注入中断
+     */
+    String FP_LOCAL_PARTITION_SCHEDULED_JOB_ERROR = "FP_LOCAL_PARTITION_SCHEDULED_JOB_ERROR";
+
+    /**
      * set @FP_TTL_PAUSE='20'
      * 调整expire local partition的超时时间，单位是秒
      */
     String FP_TTL_PAUSE = "FP_TTL_PAUSE";
+
+    /**
+     * Fail before creating tmp tables at status 0.
+     * No tmp table is created.
+     */
+    String FP_TRX_LOG_TB_FAILED_BEFORE_CREATE_TMP = "FP_TRX_LOG_TB_FAILED_BEFORE_CREATE_TMP";
+
+    /**
+     * Fail during creating tmp tables at status 0.
+     * At least one DN finishes creating tmp table.
+     * Status is still 0.
+     */
+    String FP_TRX_LOG_TB_FAILED_DURING_CREATE_TMP = "FP_TRX_LOG_TB_FAILED_DURING_CREATE_TMP";
+
+    /**
+     * Fail before switching tables at status 1.
+     */
+    String FP_TRX_LOG_TB_FAILED_BEFORE_SWITCH_TABLE = "FP_TRX_LOG_TB_FAILED_BEFORE_SWITCH_TABLE";
+
+    /**
+     * Fail during switching tables at status 1.
+     * At least one DN finishes switching tables.
+     * Status is still 1.
+     */
+    String FP_TRX_LOG_TB_FAILED_DURING_SWITCH_TABLE = "FP_TRX_LOG_TB_FAILED_DURING_SWITCH_TABLE";
+
+    /**
+     * Fail before dropping archive tables at status 2.
+     */
+    String FP_TRX_LOG_TB_FAILED_BEFORE_DROP_TABLE = "FP_TRX_LOG_TB_FAILED_BEFORE_DROP_TABLE";
+
+    /**
+     * Fail during switching tables at status 2.
+     * At least one DN finishes dropping archive tables.
+     * Status is still 2.
+     */
+    String FP_TRX_LOG_TB_FAILED_DURING_DROP_TABLE = "FP_TRX_LOG_TB_FAILED_DURING_DROP_TABLE";
+
+    String FP_UPDATE_TABLES_VERSION_ERROR = "FP_UPDATE_TABLES_VERSION_ERROR";
+
 }

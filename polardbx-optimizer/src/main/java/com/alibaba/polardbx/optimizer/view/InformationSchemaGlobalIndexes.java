@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.optimizer.view;
 
+import com.google.common.collect.Lists;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelInput;
@@ -61,6 +62,10 @@ public class InformationSchemaGlobalIndexes extends VirtualView {
         columns.add(new RelDataTypeFieldImpl("TB_PARTITION_COUNT", 12, typeFactory.createSqlType(SqlTypeName.INTEGER)));
         columns.add(new RelDataTypeFieldImpl("STATUS", 13, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
         columns.add(new RelDataTypeFieldImpl("SIZE_IN_MB", 14, typeFactory.createSqlType(SqlTypeName.DOUBLE)));
+        columns.add(new RelDataTypeFieldImpl("USE_COUNT", 15, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+        columns.add(new RelDataTypeFieldImpl("LAST_ACCESS_TIME", 16, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+        columns.add(new RelDataTypeFieldImpl("CARDINALITY", 17, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+        columns.add(new RelDataTypeFieldImpl("ROW_COUNT", 18, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
 
         return typeFactory.createStructType(columns);
     }
@@ -71,11 +76,22 @@ public class InformationSchemaGlobalIndexes extends VirtualView {
         return i == getTableSchemaIndex() || i == getTableNameIndex();
     }
 
-    public int getTableSchemaIndex() {
+    private static final List<Integer> INDEXABLE_COLUMNS;
+
+    static {
+        INDEXABLE_COLUMNS = Lists.newArrayList(getTableSchemaIndex(), getTableNameIndex());
+    }
+
+    @Override
+    List<Integer> indexableColumnList() {
+        return INDEXABLE_COLUMNS;
+    }
+
+    static public int getTableSchemaIndex() {
         return 0;
     }
 
-    public int getTableNameIndex() {
+    static public int getTableNameIndex() {
         return 1;
     }
 }

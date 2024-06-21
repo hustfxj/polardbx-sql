@@ -17,14 +17,15 @@
 package com.alibaba.polardbx.config.loader;
 
 import com.alibaba.polardbx.CobarServer;
+import com.alibaba.polardbx.common.TddlNode;
 import com.alibaba.polardbx.common.constants.IsolationLevel;
 import com.alibaba.polardbx.common.constants.TransactionAttribute;
 import com.alibaba.polardbx.common.model.lifecycle.AbstractLifecycle;
 import com.alibaba.polardbx.common.model.lifecycle.Lifecycle;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
-import com.alibaba.polardbx.common.properties.ConnectionProperties;
 import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.properties.MppConfig;
+import com.alibaba.polardbx.common.properties.SystemPropertiesHelper;
 import com.alibaba.polardbx.common.utils.AddressUtils;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.TStringUtil;
@@ -32,6 +33,7 @@ import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.config.ConfigException;
 import com.alibaba.polardbx.config.SystemConfig;
 import com.alibaba.polardbx.executor.balancer.Balancer;
+import com.alibaba.polardbx.executor.common.GsiStatisticsManager;
 import com.alibaba.polardbx.executor.utils.SchemaMetaUtil;
 import com.alibaba.polardbx.gms.config.impl.ConnPoolConfigManager;
 import com.alibaba.polardbx.gms.config.impl.MetaDbInstConfigManager;
@@ -41,7 +43,6 @@ import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
 import com.alibaba.polardbx.gms.metadb.schema.SchemaChangeManager;
 import com.alibaba.polardbx.gms.node.ServerInfoHelper;
 import com.alibaba.polardbx.gms.privilege.PolarPrivManager;
-import com.alibaba.polardbx.gms.statistics.FeatureUsageStatistics;
 import com.alibaba.polardbx.gms.topology.DbTopologyManager;
 import com.alibaba.polardbx.gms.topology.ReadOnlyInstConfigCleaner;
 import com.alibaba.polardbx.gms.topology.ServerInfoRecord;
@@ -51,10 +52,13 @@ import com.alibaba.polardbx.optimizer.config.meta.CostModelWeight;
 import com.alibaba.polardbx.optimizer.core.profiler.RuntimeStat;
 import com.alibaba.polardbx.optimizer.hint.util.HintUtil;
 import com.alibaba.polardbx.optimizer.locality.LocalityManager;
+import com.alibaba.polardbx.optimizer.locality.StoragePoolManager;
 import com.alibaba.polardbx.optimizer.memory.MemoryManager;
 import com.alibaba.polardbx.rpc.XConfig;
 import com.alibaba.polardbx.rpc.pool.XConnectionManager;
 import com.alibaba.polardbx.server.util.StringUtil;
+import com.alibaba.polardbx.transaction.ColumnarTsoManager;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.BooleanUtils;
@@ -67,7 +71,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import java.lang.management.RuntimeMXBean;
-import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.List;
@@ -165,7 +168,13 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         // 复制配置到system参数中
         System.setProperties(serverProps);
 
+        ConfigDataMode.setMode(ConfigDataMode.Mode.GMS);
         configSystem(serverProps);
+        DynamicConfig.getInstance().setSupportSingleDbMultiTbs(this.system.isSupportSingleDbMultiTbs());
+        DynamicConfig.getInstance().setSupportRemoveDdl(this.system.isSupportRemoveDdl());
+        DynamicConfig.getInstance().setSupportDropAutoSeq(this.system.isSupportDropAutoSeq());
+        DynamicConfig.getInstance().setAllowSimpleSequence(this.system.isAllowSimpleSequence());
+        DynamicConfig.getInstance().setColumnarOssDirectory(this.system.getColumnarOssDirectory());
 
         // Set private protocol port first(or we will fail to connect metaDB with Xproto).
         XConnectionManager.getInstance().setMetaDbPort(this.system.getMetaDbXprotoPort());
@@ -177,23 +186,19 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
     private void load() {
         Properties serverProps = loadServerProperty();
 
-        ConfigDataMode.setSupportSingleDbMultiTbs(this.system.isSupportSingleDbMultiTbs());
-        ConfigDataMode.setSupportDropAutoSeq(this.system.isSupportDropAutoSeq());
-        ConfigDataMode.setAllowSimpleSequence(this.system.isAllowSimpleSequence());
-        initPolarDbXComponents();
+        // mock by env or mock by meta db
+        if (!mockByEnv()) {
+            initPolarDbXComponents();
+        }
 
         /**
          * 初始化，并监听 MANAGER_CONFIG_DATAID:com.alibaba.polardbx.monitor
          */
-
         serverProps.putAll(system.toMapValues());
 
         // 复制配置到system参数中
         System.setProperties(serverProps);
         logger.info("Server Properties: " + serverProps.toString());
-
-        // 因为System.setProperties有更新，重新加载ConfigDataMode的值
-        ConfigDataMode.reload();
 
         MemoryManager.getInstance().adjustMemoryLimit(system.getGlobalMemoryLimit());
         logger.info("Global memory pool size: " + FileUtils.byteCountToDisplaySize(system.getGlobalMemoryLimit()));
@@ -203,6 +208,8 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         // Set private protocol port first(or we will fail to connect metaDB with Xproto).
         XConnectionManager.getInstance().setMetaDbPort(this.system.getMetaDbXprotoPort());
         XConnectionManager.getInstance().setStorageDbPort(this.system.getStorageDbXprotoPort());
+        XConnectionManager.getInstance().getInstId()
+            .set(ConfigDataMode.isPolarDbX() ? InstIdUtil.getInstId() : TddlNode.getInstId());
 
         // Init metadb datasource
         MetaDbDataSource
@@ -216,6 +223,10 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
 
         // Init ServerInstIdManager
         ServerInstIdManager.getInstance();
+
+        // load instRole and instType
+        int instType = ServerInstIdManager.getInstance().getInstType();
+        ConfigDataMode.setInstanceRole(instType);
 
         // Init MetaDbConfigManager
         MetaDbConfigManager.getInstance();
@@ -252,11 +263,17 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         // Init the polarx priv manager from meta db
         PolarPrivManager.getInstance();
 
-        // Init the cleaner of remvved read-only inst 
+        // Init the cleaner of remove read-only inst
         ReadOnlyInstConfigCleaner.getInstance();
 
-        // Init the stat of feature usage
-        FeatureUsageStatistics.init();
+        // Init columnar tso manager
+        ColumnarTsoManager.getInstance();
+
+        //Init the gsi statistics manager
+        GsiStatisticsManager.getInstance();
+
+        // Init storage pool manager
+        StoragePoolManager.getInstance();
     }
 
     protected void initPortInfoAndInstId() {
@@ -316,11 +333,6 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         String polarxRootPasswd = serverProps.getProperty("polarxRootPasswd");
         if (!StringUtil.isEmpty(polarxRootPasswd)) {
             this.system.setPolarxRootPasswd(polarxRootPasswd);
-        }
-
-        String maxConnection = serverProps.getProperty("maxConnection");
-        if (!StringUtil.isEmpty(maxConnection)) {
-            this.system.setMaxConnection(Integer.parseInt(maxConnection));
         }
 
         String serverPort = serverProps.getProperty("serverPort");
@@ -397,14 +409,9 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
             this.system.setEnableMpp(false);
         }
 
-        String coronaMode = serverProps.getProperty("coronaMode");
-        if (!StringUtil.isEmpty(coronaMode)) {
-            this.system.setCoronaMode(Integer.parseInt(coronaMode));
-        }
-
-        String maxAllowedPacket = serverProps.getProperty("maxAllowedPacket");
-        if (!StringUtil.isEmpty(maxAllowedPacket)) {
-            this.system.setMaxAllowedPacket(Integer.parseInt(maxAllowedPacket));
+        String nodeDiscoveryMode = serverProps.getProperty("nodeDiscoveryMode");
+        if (!StringUtil.isEmpty(nodeDiscoveryMode)) {
+            this.system.setNodeDiscoveryMode(nodeDiscoveryMode);
         }
 
         String socketRecvBuffer = serverProps.getProperty("socketRecvBuffer");
@@ -447,9 +454,9 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
             this.system.setProcessorKillExecutor(Integer.parseInt(processorKillExecutorCount));
         }
 
-        String timerExecutorCount = serverProps.getProperty("timerExecutor");
-        if (!StringUtil.isEmpty(timerExecutorCount)) {
-            this.system.setTimerExecutor(Integer.parseInt(timerExecutorCount));
+        String syncExecutor = serverProps.getProperty("syncExecutor");
+        if (!StringUtil.isEmpty(syncExecutor)) {
+            this.system.setSyncExecutor(Integer.parseInt(syncExecutor));
         }
 
         String managerExecutorCount = serverProps.getProperty("managerExecutor");
@@ -475,17 +482,6 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         String processorCheckPeriod = serverProps.getProperty("processorCheckPeriod");
         if (!StringUtil.isEmpty(processorCheckPeriod)) {
             this.system.setProcessorCheckPeriod(Integer.parseInt(processorCheckPeriod));
-        }
-
-        String txIsolation = serverProps.getProperty("txIsolation");
-        if (!StringUtil.isEmpty(txIsolation)) {
-            Integer tx = Integer.valueOf(txIsolation);
-            if (tx > 0 && IsolationLevel.fromInt(tx) == null) {
-                throw new IllegalArgumentException("unknown txIsolation code : " + tx);
-            }
-            ConfigDataMode.setTxIsolation(tx);
-        } else {
-            ConfigDataMode.setTxIsolation(TransactionAttribute.DEFAULT_ISOLATION_LEVEL_POLARX.getCode());
         }
 
         String parserCommentVersion = serverProps.getProperty("parserCommentVersion");
@@ -534,11 +530,6 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         String whiteIps = serverProps.getProperty("whiteIps");
         if (!StringUtil.isEmpty(whiteIps)) {
             this.system.setWhiteIps(whiteIps);
-        }
-
-        String slowSqlTime = serverProps.getProperty("slowSqlTime");
-        if (!StringUtil.isEmpty(slowSqlTime)) {
-            this.system.setSlowSqlTime(Long.valueOf(slowSqlTime));
         }
 
         String deadLockCheckPeriod = serverProps.getProperty("deadLockCheckPeriod");
@@ -611,6 +602,16 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
             CostModelWeight.INSTANCE.setProbeWeight(Double.valueOf(probeWeight));
         }
 
+        String reverseSemiProbeWeight = serverProps.getProperty("reverseSemiProbeWeight");
+        if (!TStringUtil.isEmpty(reverseSemiProbeWeight)) {
+            CostModelWeight.INSTANCE.setReverseSemiProbeWeight(Double.valueOf(reverseSemiProbeWeight));
+        }
+
+        String reverseAntiProbeWeight = serverProps.getProperty("reverseAntiProbeWeight");
+        if (!TStringUtil.isEmpty(reverseAntiProbeWeight)) {
+            CostModelWeight.INSTANCE.setReverseAntiProbeWeight(Double.valueOf(reverseAntiProbeWeight));
+        }
+
         String mergeWeight = serverProps.getProperty("mergeWeight");
         if (!TStringUtil.isEmpty(mergeWeight)) {
             CostModelWeight.INSTANCE.setMergeWeight(Double.valueOf(mergeWeight));
@@ -624,6 +625,11 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         String sortAggWeight = serverProps.getProperty("sortAggWeight");
         if (!TStringUtil.isEmpty(sortAggWeight)) {
             CostModelWeight.INSTANCE.setSortAggWeight(Double.valueOf(sortAggWeight));
+        }
+
+        String sortWindowWeight = serverProps.getProperty("sortWindowWeight");
+        if (!TStringUtil.isEmpty(sortWindowWeight)) {
+            CostModelWeight.INSTANCE.setSortWindowWeight(Double.valueOf(sortWindowWeight));
         }
 
         String sortWeight = serverProps.getProperty("sortWeight");
@@ -647,10 +653,9 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         }
 
         /* ========mpp system engine config======== */
-        for (Field field : ConnectionProperties.class.getDeclaredFields()) {
+        for (String key : SystemPropertiesHelper.getConnectionProperties()) {
             try {
-                String key = field.get(ConnectionProperties.class).toString();
-                if (key != null && key.toUpperCase().startsWith("MPP_")) {
+                if (key.startsWith("MPP_")) {
                     MppConfig.getInstance().loadValue(logger, key, serverProps.getProperty(key));
                 }
                 DynamicConfig.getInstance().loadValue(logger, key, serverProps.getProperty(key));
@@ -706,6 +711,14 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
 
         String balanceWindow = serverProps.getProperty(ConnectionParams.BALANCER_WINDOW.getName());
         this.system.setBalanceWindow(balanceWindow);
+
+        String allowMoveBalancedSingleTable =
+            serverProps.getProperty(ConnectionParams.ALLOW_MOVING_BALANCED_SINGLE_TABLE.getName());
+        if (!StringUtil.isEmpty(allowMoveBalancedSingleTable)) {
+            this.system.setAllowMovingBalancedSingeTable(BooleanUtils.toBoolean(allowMoveBalancedSingleTable));
+        } else {
+            this.system.setAllowMovingBalancedSingeTable(false);
+        }
 
         String dropDatabaseAfterSwitchDatasource = serverProps.getProperty("dropDatabaseAfterSwitchDatasource");
         if (!StringUtil.isEmpty(dropDatabaseAfterSwitchDatasource)) {
@@ -801,6 +814,10 @@ public final class ServerLoader extends AbstractLifecycle implements Lifecycle {
         String secretKey = serverProps.getProperty("secretKey");
         if (!StringUtil.isEmpty(secretKey)) {
             this.system.setSecretKey(secretKey);
+        }
+        String columnarOssDirectory = serverProps.getProperty("columnar_oss_directory");
+        if (!StringUtil.isEmpty(columnarOssDirectory)) {
+            this.system.setColumnarOssDirectory(columnarOssDirectory);
         }
     }
 

@@ -16,11 +16,11 @@
 
 package com.alibaba.polardbx.optimizer.config.table;
 
-import com.alibaba.polardbx.druid.sql.SQLUtils;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.config.ConfigDataMode;
+import com.alibaba.polardbx.druid.sql.SQLUtils;
 import com.alibaba.polardbx.gms.metadb.table.IndexStatus;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
@@ -28,9 +28,11 @@ import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager.GsiIndexMetaBean;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager.GsiTableMetaBean;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
+import com.alibaba.polardbx.optimizer.core.planner.rule.util.CBOUtil;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
 import com.alibaba.polardbx.optimizer.sql.sql2rel.TddlSqlToRelConverter;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
+import com.google.common.collect.ImmutableList;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.sql.validate.SqlValidatorImpl;
 import org.apache.calcite.util.Pair;
@@ -70,6 +72,10 @@ public class GlobalIndexMeta {
     }
 
     public static List<TableMeta> getIndex(RelOptTable primary, EnumSet<IndexStatus> status, ExecutionContext ec) {
+        if (null != CBOUtil.getDrdsViewTable(primary)) {
+            // No index for view
+            return ImmutableList.of();
+        }
         final Pair<String, String> schemaTable = RelUtils.getQualifiedTableName(primary);
 
         return getIndex(schemaTable.right, schemaTable.left, status, ec);
@@ -81,6 +87,12 @@ public class GlobalIndexMeta {
 
     public static List<TableMeta> getIndex(String tableName, String schemaName,
                                            EnumSet<IndexStatus> statuses, ExecutionContext ec) {
+        return getIndex(tableName, schemaName, statuses, ec, false);
+    }
+
+    public static List<TableMeta> getIndex(String tableName, String schemaName,
+                                           EnumSet<IndexStatus> statuses, ExecutionContext ec,
+                                           boolean includingColumnar) {
         final List<TableMeta> result = new ArrayList<>();
 
         SchemaManager sm;
@@ -97,7 +109,15 @@ public class GlobalIndexMeta {
         if (null != gsiTableMeta && GeneralUtil.isNotEmpty(gsiTableMeta.indexMap)) {
             gsiTableMeta.indexMap.entrySet()
                 .stream()
-                .filter(e -> e.getValue().indexStatus.belongsTo(statuses))
+                .filter(e -> {
+                    if (!e.getValue().indexStatus.belongsTo(statuses)) {
+                        return false;
+                    }
+                    if (!includingColumnar && e.getValue().columnarIndex) {
+                        return false;
+                    }
+                    return true;
+                })
                 .map(Map.Entry::getKey)
                 .forEach(indexTableName ->
                     result.add(sm.getTable(indexTableName))
@@ -109,6 +129,17 @@ public class GlobalIndexMeta {
     public static boolean hasPublishedIndex(String primaryTable, String schema, ExecutionContext ec) {
         final TableMeta table = ec.getSchemaManager(schema).getTable(primaryTable);
         return table.withPublishedGsi();
+    }
+
+    public static List<String> getColumnarIndexNames(String primaryTable, String schema, ExecutionContext ec) {
+        final List<String> result = new ArrayList<>();
+        final TableMeta table = ec.getSchemaManager(schema).getTable(primaryTable);
+        final Map<String, GsiIndexMetaBean> columnarIndexPublished = table.getColumnarIndexPublished();
+        if (null != columnarIndexPublished) {
+            result.addAll(columnarIndexPublished.keySet());
+        }
+
+        return result;
     }
 
     public static List<String> getPublishedIndexNames(String primaryTable, String schema, ExecutionContext ec) {
@@ -159,12 +190,20 @@ public class GlobalIndexMeta {
         return getGsiStatus(ec, indexTableMeta).isWritable();
     }
 
+    public static boolean isBackfillInProgress(ExecutionContext ec, TableMeta indexTableMeta) {
+        return getGsiStatus(ec, indexTableMeta).isBackfillInProgress();
+    }
+
     /**
      * Index state is 'public'. We must assure
      * that the state is always the same in one transaction.
      */
     public static boolean isPublished(ExecutionContext ec, TableMeta indexTableMeta) {
         return getGsiStatus(ec, indexTableMeta).isPublished();
+    }
+
+    public static boolean isBackFillStatus(ExecutionContext ec, TableMeta indexTableMeta) {
+        return getGsiStatus(ec, indexTableMeta).isBackfillStatus();
     }
 
     public static boolean isPublishedPrimaryAndIndex(String primaryTable, String indexTable, String schema,
@@ -189,7 +228,6 @@ public class GlobalIndexMeta {
      * Including primary key
      *
      * @param primary Primary table meta
-     * @param includingPrimary
      * @param gsiFilter Filter conditions for gsi
      * @return Index column names
      */
@@ -314,6 +352,26 @@ public class GlobalIndexMeta {
             .collect(Collectors.toList());
     }
 
+    /**
+     * @return primary-keys and corresponding column position
+     */
+    public static Pair<List<String>, List<Integer>> getPrimaryKeysNotOrdered(TableMeta baseTableMeta) {
+        if (!baseTableMeta.isHasPrimaryKey()) {
+            return Pair.of(Collections.emptyList(), Collections.emptyList());
+        }
+        List<String> primaryKeys =
+            baseTableMeta.getPrimaryIndex().getKeyColumns().stream()
+                .map(columnMeta -> columnMeta.getName().toUpperCase())
+                .collect(Collectors.toList());
+
+        List<Integer> appearedKeysId = new ArrayList<>();
+        for (int i = 0; i < primaryKeys.size(); ++i) {
+            appearedKeysId.add(i);
+        }
+
+        return Pair.of(primaryKeys, appearedKeysId);
+    }
+
     public static List<String> getPrimaryAndShardingKeys(TableMeta baseTableMeta, List<TableMeta> indexTableMetas,
                                                          String schemaName) {
         return new ArrayList<>(getPkAndPartitionKey(baseTableMeta, indexTableMetas, schemaName));
@@ -340,6 +398,12 @@ public class GlobalIndexMeta {
                                    BiFunction<ExecutionContext, TableMeta, Boolean> gsiChecker) {
         final List<TableMeta> indexes = getIndex(primary, ec);
         return indexes.stream().allMatch(gsiMeta -> gsiChecker.apply(ec, gsiMeta));
+    }
+
+    public static boolean isAnyGsi(RelOptTable primary, ExecutionContext ec,
+                                   BiFunction<ExecutionContext, TableMeta, Boolean> gsiChecker) {
+        final List<TableMeta> indexes = getIndex(primary, ec);
+        return indexes.stream().anyMatch(gsiMeta -> gsiChecker.apply(ec, gsiMeta));
     }
 
     public static boolean isAllGsiPublished(RelOptTable primary, ExecutionContext ec) {
@@ -376,8 +440,59 @@ public class GlobalIndexMeta {
             .findFirst().orElse(null);
     }
 
+    public static String getColumnarWrappedName(String primaryTable, String index, String schema, ExecutionContext ec) {
+        if (!DbInfoManager.getInstance().isNewPartitionDb(schema)) {
+            return null;
+        }
+        final TableMeta table = ec.getSchemaManager(schema).getTable(primaryTable);
+        if (null == table) {
+            return null;
+        }
+        if (table.getColumnarIndexPublished() == null) {
+            return null;
+        }
+        if (ec.isCheckingCci()) {
+            String cciName = table.getColumnarIndexChecking().keySet().stream()
+                .filter(idx ->
+                    TddlSqlToRelConverter.unwrapGsiName(idx).equalsIgnoreCase(index) || idx.equalsIgnoreCase(index))
+                .findFirst().orElse(null);
+            if (null != cciName) {
+                return cciName;
+            }
+        }
+
+        return table.getColumnarIndexPublished().keySet().stream()
+            .filter(idx -> TddlSqlToRelConverter.unwrapGsiName(idx).equalsIgnoreCase(index))
+            .findFirst().orElse(null);
+    }
+
+    public static IndexType getColumnarIndexType(String primaryTable, String index, String schema,
+                                                 ExecutionContext ec) {
+        final TableMeta table = ec.getSchemaManager(schema).getTable(primaryTable);
+
+        if (null == table) {
+            return IndexType.NONE;
+        }
+        if (null == table.getColumnarIndexPublished()) {
+            return IndexType.NONE;
+        }
+        if (ec.isCheckingCci()) {
+            String cci = table.getColumnarIndexChecking().keySet().stream()
+                .filter(idx -> idx.equalsIgnoreCase(index))
+                .findFirst().orElse(null);
+            if (null != cci) {
+                // When checking cci, treat checking status as published.
+                return IndexType.PUBLISHED_COLUMNAR;
+            }
+        }
+        return table.getColumnarIndexPublished().keySet().stream()
+            .filter(idx -> idx.equalsIgnoreCase(index))
+            .map(idx -> IndexType.PUBLISHED_COLUMNAR)
+            .findFirst().orElse(IndexType.NONE);
+    }
+
     public enum IndexType {
-        NONE, LOCAL, PUBLISHED_GSI, UNPUBLISHED_GSI
+        NONE, LOCAL, PUBLISHED_GSI, UNPUBLISHED_GSI, PUBLISHED_COLUMNAR
     }
 
     public static IndexType getIndexType(String primaryTable, String index, String schema, ExecutionContext ec) {
@@ -595,5 +710,13 @@ public class GlobalIndexMeta {
         indexTableMetas.forEach(tm -> result.put(tm.getTableName(), getLocalIndexColumnListMap(tm)));
 
         return result;
+    }
+
+    public static boolean hasExplicitPrimaryKey(TableMeta tableMeta) {
+        return tableMeta.isHasPrimaryKey()
+            && tableMeta
+            .getPrimaryKey()
+            .stream()
+            .noneMatch(cm -> SqlValidatorImpl.isImplicitKey(cm.getName()));
     }
 }

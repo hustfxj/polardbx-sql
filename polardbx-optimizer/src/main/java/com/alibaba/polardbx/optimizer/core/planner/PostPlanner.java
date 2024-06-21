@@ -40,6 +40,7 @@ import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.config.table.ComplexTaskPlanUtils;
+import com.alibaba.polardbx.optimizer.config.table.GeneratedColumnUtil;
 import com.alibaba.polardbx.optimizer.config.table.GlobalIndexMeta;
 import com.alibaba.polardbx.optimizer.config.table.ScaleOutPlanUtil;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
@@ -48,14 +49,14 @@ import com.alibaba.polardbx.optimizer.core.dialect.DbType;
 import com.alibaba.polardbx.optimizer.core.rel.BaseTableOperation;
 import com.alibaba.polardbx.optimizer.core.rel.BroadcastTableModify;
 import com.alibaba.polardbx.optimizer.core.rel.DirectTableOperation;
+import com.alibaba.polardbx.optimizer.core.rel.HashWindow;
+import com.alibaba.polardbx.optimizer.core.rel.LogicalInsert;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalModify;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalModifyView;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalRelocate;
-import com.alibaba.polardbx.optimizer.core.rel.LogicalView;
 import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
 import com.alibaba.polardbx.optimizer.core.rel.PhyTableModifyViewBuilder;
 import com.alibaba.polardbx.optimizer.core.rel.PhyTableScanBuilder;
-import com.alibaba.polardbx.optimizer.core.rel.PhysicalFilter;
 import com.alibaba.polardbx.optimizer.core.rel.ReplaceTableNameWithQuestionMarkVisitor;
 import com.alibaba.polardbx.optimizer.core.rel.SortWindow;
 import com.alibaba.polardbx.optimizer.core.rel.TableFinder;
@@ -75,7 +76,6 @@ import com.alibaba.polardbx.optimizer.utils.ITransaction;
 import com.alibaba.polardbx.optimizer.utils.OptimizerUtils;
 import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
-import com.alibaba.polardbx.optimizer.utils.RexUtils;
 import com.alibaba.polardbx.rule.TableRule;
 import com.alibaba.polardbx.rule.model.TargetDB;
 import com.alibaba.polardbx.rule.utils.CalcParamsAttribute;
@@ -85,17 +85,23 @@ import org.apache.calcite.rel.RelShuttleImpl;
 import org.apache.calcite.rel.RelVisitor;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.core.RecursiveCTE;
 import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.logical.LogicalExpand;
+import org.apache.calcite.rel.logical.LogicalOutFile;
 import org.apache.calcite.rel.logical.LogicalRecyclebin;
+import org.apache.calcite.rex.RexUtil;
+import org.apache.calcite.sql.SqlDelete;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.SqlUpdate;
 import org.apache.calcite.util.Util;
 
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -119,7 +125,8 @@ public class PostPlanner {
         return INSTANCE;
     }
 
-    public void setSkipPostOptFlag(PlannerContext plannerContext, RelNode optimizedNode, boolean direct,
+    public void setSkipPostOptFlag(PlannerContext plannerContext, RelNode optimizedNode,
+                                   boolean direct,
                                    boolean shouldSkipPostPlanner) {
         class SkipPostPlanVisitor extends RelShuttleImpl {
 
@@ -131,6 +138,12 @@ public class PostPlanner {
                     this.skipPostPlan = true;
                     return other;
                 } else if (other instanceof SortWindow) {
+                    this.skipPostPlan = true;
+                    return other;
+                } else if (other instanceof HashWindow) {
+                    this.skipPostPlan = true;
+                    return other;
+                } else if (other instanceof RecursiveCTE) {
                     this.skipPostPlan = true;
                     return other;
                 } else {
@@ -154,7 +167,8 @@ public class PostPlanner {
     public ExecutionPlan optimize(ExecutionPlan executionPlan, ExecutionContext executionContext) {
         boolean enableTaskCpuProfileStat =
             MetricLevel.isSQLMetricEnabled(executionContext.getParamManager().getInt(
-                ConnectionParams.MPP_METRIC_LEVEL)) && executionContext.getRuntimeStatistics() != null;
+                ConnectionParams.MPP_METRIC_LEVEL))
+                && executionContext.getRuntimeStatistics() != null;
 
         if (executionPlan == null) {
             throw new OptimizerException("ExecutionPlan is null.");
@@ -189,15 +203,18 @@ public class PostPlanner {
             if (isOnlyBroadcast(executionPlan, executionContext)) {
                 DirectTableOperation dto = (DirectTableOperation) plan;
                 String dbIndex = getBroadcastTableGroup(executionContext, dto.getSchemaName());
-                DirectTableOperation newDto = (DirectTableOperation) dto.copy(dto.getTraitSet(), dto.getInputs());
+                DirectTableOperation newDto =
+                    (DirectTableOperation) dto.copy(dto.getTraitSet(), dto.getInputs());
                 newDto.setDbIndex(dbIndex);
                 return executionPlan.copy(newDto);
             }
 
-            if (ast == null || !ast.getKind().belongsTo(EnumSet.of(SqlKind.SELECT, SqlKind.DELETE, SqlKind.UPDATE))) {
+            if (ast == null || !ast.getKind()
+                .belongsTo(EnumSet.of(SqlKind.SELECT, SqlKind.DELETE, SqlKind.UPDATE))) {
                 return executionPlan;
             }
-            final boolean withIndexHint = executionPlan.checkProperty(ExecutionPlanProperties.WITH_INDEX_HINT);
+            final boolean withIndexHint =
+                executionPlan.checkProperty(ExecutionPlanProperties.WITH_INDEX_HINT);
             if (withIndexHint) {
                 final List<String> originTableNames = executionPlan.getOriginTableNames();
                 final List<String> resultTableNames = new ArrayList<>();
@@ -216,7 +233,8 @@ public class PostPlanner {
             }
 
             final ReplaceTableNameWithQuestionMarkVisitor visitor =
-                new ReplaceTableNameWithQuestionMarkVisitor(executionContext.getSchemaName(), withIndexHint,
+                new ReplaceTableNameWithQuestionMarkVisitor(executionContext.getSchemaName(),
+                    withIndexHint,
                     executionContext);
             final SqlNode sqlTemplate = ast.accept(visitor);
 
@@ -235,7 +253,8 @@ public class PostPlanner {
                 false);
 
             boolean canPushdown = (schemaNamesOfPlan.size() == 1);
-            if (ScaleOutPlanUtil.isEnabledScaleOut(executionContext.getParamManager()) && ast.getKind()
+            if (ScaleOutPlanUtil.isEnabledScaleOut(executionContext.getParamManager())
+                && ast.getKind()
                 .belongsTo(EnumSet.of(SqlKind.INSERT, SqlKind.DELETE, SqlKind.UPDATE))
                 && executionPlan.getTableSet() != null) {
                 Set<Pair<String, String>> tableSet = executionPlan.getTableSet();
@@ -244,12 +263,14 @@ public class PostPlanner {
                     TableMeta tableMeta = executionContext.getSchemaManager(tableInfo.getKey())
                         .getTable(tableInfo.getValue());
                     tableMetas.add(tableMeta);
-                    boolean isNewPart = DbInfoManager.getInstance().isNewPartitionDb(tableMeta.getSchemaName());
+                    boolean isNewPart =
+                        DbInfoManager.getInstance().isNewPartitionDb(tableMeta.getSchemaName());
                     if (isNewPart) {
                         canPushdown &= (!tableMeta.getPartitionInfo().isBroadcastTable());
                     } else {
                         TableRule tableRule =
-                            executionContext.getSchemaManager(tableMeta.getSchemaName()).getTddlRuleManager()
+                            executionContext.getSchemaManager(tableMeta.getSchemaName())
+                                .getTddlRuleManager()
                                 .getTableRule(tableMeta.getTableName());
                         canPushdown &= (!tableRule.isBroadcast());
                     }
@@ -274,18 +295,26 @@ public class PostPlanner {
                 boolean isNewPart = DbInfoManager.getInstance().isNewPartitionDb(schemaNamesOfAst);
                 String groupName = targetTables.keySet().iterator().next();
                 boolean needOnlineColumnModify = false;
+                boolean hasGeneratedColumn = false;
                 for (String tableName : logTableNames) {
-                    withGsi &= GlobalIndexMeta.hasIndex(tableName, schemaNamesOfAst, executionContext);
+                    withGsi &=
+                        GlobalIndexMeta.hasIndex(tableName, schemaNamesOfAst, executionContext);
                     needOnlineColumnModify |=
                         TableColumnUtils.isModifying(schemaNamesOfAst, tableName, executionContext);
-                    TableMeta tableMeta = executionContext.getSchemaManager(schemaNamesOfAst).getTable(tableName);
+                    hasGeneratedColumn |=
+                        GeneratedColumnUtil.containLogicalGeneratedColumn(schemaNamesOfAst,
+                            tableName,
+                            executionContext);
+                    TableMeta tableMeta =
+                        executionContext.getSchemaManager(schemaNamesOfAst).getTable(tableName);
                     if (!isNewPart) {
                         needRelicateWrite &= ComplexTaskPlanUtils
                             .canWrite(tableMeta, groupName);
                     } else {
                         for (List<String> phyTable : targetTables.get(groupName)) {
                             String partName = ComplexTaskPlanUtils
-                                .getPartNameFromGroupAndTable(tableMeta, groupName, phyTable.get(0));
+                                .getPartNameFromGroupAndTable(tableMeta, groupName,
+                                    phyTable.get(0));
                             needRelicateWrite &= ComplexTaskPlanUtils
                                 .canWrite(tableMeta, partName);
                             if (needRelicateWrite) {
@@ -294,7 +323,8 @@ public class PostPlanner {
                         }
 
                     }
-                    canPushdown &= !withGsi & !needRelicateWrite & !needOnlineColumnModify;
+                    canPushdown &= !withGsi & !needRelicateWrite & !needOnlineColumnModify
+                        & !hasGeneratedColumn;
                 }
             }
             canPushdown &= !RelUtils.existUnPushableLastInsertId(plan);
@@ -312,10 +342,12 @@ public class PostPlanner {
                         executionContext,
                         plan,
                         DbType.MYSQL,
+                        plan.getRowType(),
                         schemaNamesOfAst,
-                        logTableNames);
+                        logTableNames,
+                        true,
+                        true);
                     builder.setUnionSize(0);
-                    builder.setBuildForPushDownOneShardOnly(true);
                     List<RelNode> phyTableScans = builder.build(executionContext);
                     RelNode ret = phyTableScans.get(0);
                     return executionPlan.copy(ret);
@@ -332,17 +364,23 @@ public class PostPlanner {
                         if (executionContext.getParamManager()
                             .getBoolean(ConnectionParams.ENABLE_COMPLEX_DML_CROSS_DB)) {
                             executionPlan = executionPlan.copy(executionPlan.getPlan());
-                            executionPlan.getPlanProperties().set(ExecutionPlanProperties.MODIFY_CROSS_DB);
+                            executionPlan.getPlanProperties()
+                                .set(ExecutionPlanProperties.MODIFY_CROSS_DB);
                             return executionPlan;
                         } else {
-                            throw new TddlNestableRuntimeException("multi delete not support broadcast");
+                            throw new TddlNestableRuntimeException(
+                                "multi delete not support broadcast");
                         }
                     }
 
-                    final PhyTableModifyViewBuilder modifyViewBuilder = new PhyTableModifyViewBuilder(sqlTemplate,
-                        targetTables, executionContext, plan, DbType.MYSQL, logTableNames, schemaNamesOfAst);
+                    final PhyTableModifyViewBuilder modifyViewBuilder =
+                        new PhyTableModifyViewBuilder(sqlTemplate,
+                            targetTables, executionContext.getParamMap(), plan, DbType.MYSQL,
+                            logTableNames,
+                            schemaNamesOfAst);
                     modifyViewBuilder.setBuildForPushDownOneShardOnly(true);
-                    final List<RelNode> phyTableModifies = modifyViewBuilder.build();
+                    final List<RelNode> phyTableModifies =
+                        modifyViewBuilder.build(executionContext);
                     return executionPlan.copy(phyTableModifies.get(0));
                 }
                 case UPDATE: {
@@ -358,22 +396,26 @@ public class PostPlanner {
                         if (executionContext.getParamManager()
                             .getBoolean(ConnectionParams.ENABLE_COMPLEX_DML_CROSS_DB)) {
                             executionPlan = executionPlan.copy(executionPlan.getPlan());
-                            executionPlan.getPlanProperties().set(ExecutionPlanProperties.MODIFY_CROSS_DB);
+                            executionPlan.getPlanProperties()
+                                .set(ExecutionPlanProperties.MODIFY_CROSS_DB);
                             return executionPlan;
                         } else {
-                            throw new TddlNestableRuntimeException("multi update not support broadcast");
+                            throw new TddlNestableRuntimeException(
+                                "multi update not support broadcast");
                         }
                     }
 
-                    final PhyTableModifyViewBuilder modifyViewBuilder = new PhyTableModifyViewBuilder(sqlTemplate,
-                        targetTables,
-                        executionContext,
-                        plan,
-                        DbType.MYSQL,
-                        logTableNames,
-                        schemaNamesOfAst);
+                    final PhyTableModifyViewBuilder modifyViewBuilder =
+                        new PhyTableModifyViewBuilder(sqlTemplate,
+                            targetTables,
+                            executionContext.getParamMap(),
+                            plan,
+                            DbType.MYSQL,
+                            logTableNames,
+                            schemaNamesOfAst);
                     modifyViewBuilder.setBuildForPushDownOneShardOnly(true);
-                    final List<RelNode> phyTableModifies = modifyViewBuilder.build();
+                    final List<RelNode> phyTableModifies =
+                        modifyViewBuilder.build(executionContext);
                     return executionPlan.copy(phyTableModifies.get(0));
                 }
                 default:
@@ -384,7 +426,8 @@ public class PostPlanner {
                  * Maybe some tables at one group
                  */
                 if (ast.getKind() == SqlKind.DELETE) {
-                    if (GeneralUtil.isNotEmpty(targetTables) && RelUtils.dmlWithDerivedSubquery(plan, ast)) {
+                    if (GeneralUtil.isNotEmpty(targetTables) && RelUtils.dmlWithDerivedSubquery(
+                        plan, ast)) {
                         // For Pushed DML with subquery, sqlTemplate in LogicalModifyView should be replaced by original ast
                         final LogicalModifyView lmv = (LogicalModifyView) plan;
                         lmv.setTargetTables(targetTables);
@@ -393,15 +436,18 @@ public class PostPlanner {
                     } else if (!executionContext.getParamManager()
                         .getBoolean(ConnectionParams.ENABLE_COMPLEX_DML_CROSS_DB)) {
                         throw new TddlNestableRuntimeException("not support cross db delete");
-                    } else if (plan instanceof LogicalModify && ((LogicalModify) plan).isWithoutPk()) {
+                    } else if (plan instanceof LogicalModify
+                        && ((LogicalModify) plan).isWithoutPk()) {
                         throw new TddlRuntimeException(ErrorCode.ERR_UPDATE_DELETE_NO_PRIMARY_KEY,
                             String.join(",", ((LogicalModify) plan).getTargetTableNames()));
                     } else {
                         executionPlan = executionPlan.copy(executionPlan.getPlan());
-                        executionPlan.getPlanProperties().set(ExecutionPlanProperties.MODIFY_CROSS_DB);
+                        executionPlan.getPlanProperties()
+                            .set(ExecutionPlanProperties.MODIFY_CROSS_DB);
                     }
                 } else if (ast.getKind() == SqlKind.UPDATE) {
-                    if (GeneralUtil.isNotEmpty(targetTables) && RelUtils.dmlWithDerivedSubquery(plan, ast)) {
+                    if (GeneralUtil.isNotEmpty(targetTables) && RelUtils.dmlWithDerivedSubquery(
+                        plan, ast)) {
                         // For Pushed DML with subquery, sqlTemplate in LogicalModifyView should be replaced by original ast
                         final LogicalModifyView lmv = (LogicalModifyView) plan;
                         lmv.setTargetTables(targetTables);
@@ -410,12 +456,14 @@ public class PostPlanner {
                     } else if (!executionContext.getParamManager()
                         .getBoolean(ConnectionParams.ENABLE_COMPLEX_DML_CROSS_DB)) {
                         throw new TddlNestableRuntimeException("not support cross db update");
-                    } else if (plan instanceof LogicalModify && ((LogicalModify) plan).isWithoutPk()) {
+                    } else if (plan instanceof LogicalModify
+                        && ((LogicalModify) plan).isWithoutPk()) {
                         throw new TddlRuntimeException(ErrorCode.ERR_UPDATE_DELETE_NO_PRIMARY_KEY,
                             String.join(",", ((LogicalModify) plan).getTargetTableNames()));
                     } else {
                         executionPlan = executionPlan.copy(executionPlan.getPlan());
-                        executionPlan.getPlanProperties().set(ExecutionPlanProperties.MODIFY_CROSS_DB);
+                        executionPlan.getPlanProperties()
+                            .set(ExecutionPlanProperties.MODIFY_CROSS_DB);
                     }
                 }
             }
@@ -432,13 +480,17 @@ public class PostPlanner {
     /**
      * Whether is direct broadcast table plan
      */
-    private static boolean isOnlyBroadcast(final ExecutionPlan executionPlan, final ExecutionContext executionContext) {
+    private static boolean isOnlyBroadcast(final ExecutionPlan executionPlan,
+                                           final ExecutionContext executionContext) {
         RelNode plan = executionPlan.getPlan();
         if (!PlannerContext.getPlannerContext(plan).getParamManager()
             .getBoolean(ConnectionParams.ENABLE_BROADCAST_RANDOM_READ)) {
             return false;
         }
         if (!(plan instanceof DirectTableOperation)) {
+            return false;
+        }
+        if (((DirectTableOperation) plan).getLockMode() == SqlSelect.LockMode.EXCLUSIVE_LOCK) {
             return false;
         }
         Set<Pair<String, String>> tables = executionPlan.getTableSet();
@@ -476,7 +528,8 @@ public class PostPlanner {
             candidateGroups = HintUtil.allGroupsWithBroadcastTable(schemaName);
         }
 
-        int allSingleCount = (int) candidateGroups.stream().filter(GroupInfoUtil::isSingleGroup).count();
+        int allSingleCount =
+            (int) candidateGroups.stream().filter(GroupInfoUtil::isSingleGroup).count();
         if (allSingleCount == candidateGroups.size()) {
             return candidateGroups.get(new Random().nextInt(allSingleCount));
         } else {
@@ -486,7 +539,8 @@ public class PostPlanner {
         }
     }
 
-    public static boolean skipPostPlanner(final ExecutionPlan executionPlan, final ExecutionContext executionContext) {
+    public static boolean skipPostPlanner(final ExecutionPlan executionPlan,
+                                          final ExecutionContext executionContext) {
         SqlNode ast = executionPlan.getAst();
         RelNode plan = executionPlan.getPlan();
         if (!PlannerContext.getPlannerContext(plan).getParamManager()
@@ -501,30 +555,29 @@ public class PostPlanner {
             return true;
         }
 
-        boolean pushedDql;
-//        if (PlannerContext.getPlannerContext(plan).isUseMppPlan()) {
-//            if (plan instanceof LogicalView) {
-//                //mpp plan
-//                return !(allTableSingle(((LogicalView) plan).getTableNames(), ((LogicalView) plan).getSchemaName()));
-//            } else {
-//                return false;
-//            }
-//        } else {
-//            pushedDql = !(plan instanceof LogicalModifyView) && plan instanceof LogicalView;
-//        }
-
-        pushedDql = !(plan instanceof LogicalModifyView)
-            && !(plan instanceof OSSTableScan)
-            && plan instanceof LogicalView;
-
-        if (pushedDql || plan instanceof LogicalRelocate || plan instanceof BaseTableOperation
-            || plan instanceof LogicalRecyclebin || plan instanceof BroadcastTableModify) {
+        if (plan instanceof LogicalRelocate || plan instanceof BaseTableOperation
+            || plan instanceof LogicalRecyclebin || plan instanceof BroadcastTableModify
+            || plan instanceof LogicalOutFile) {
             return true;
         }
 
         if (plan instanceof LogicalModifyView && ((LogicalModifyView) plan).getHintContext() != null
             && ((LogicalModifyView) plan).getHintContext().containsInventoryHint()) {
             return false;
+        }
+
+        // mysql 不支持 Update / Delete limit m,n; 不可下推
+        if (plan instanceof LogicalModify && ((LogicalModify) plan).getOriginalSqlNode() != null) {
+            SqlNode originNode = ((LogicalModify) plan).getOriginalSqlNode();
+            if ((originNode instanceof SqlDelete && ((SqlDelete) originNode).getOffset() != null) ||
+                (originNode instanceof SqlUpdate && ((SqlUpdate) originNode).getOffset() != null)) {
+                return true;
+            }
+        }
+
+        if (plan instanceof LogicalModify && ((LogicalModify) plan).isModifyForeignKey() ||
+            plan instanceof LogicalInsert && ((LogicalInsert) plan).isModifyForeignKey()) {
+            return true;
         }
 
         // For Pushed DML with subquery, sqlTemplate in LogicalModifyView should be replaced by original ast
@@ -556,11 +609,12 @@ public class PostPlanner {
                                                                       boolean allowMultiSchema) {
 
         Map<Integer, ParameterContext> params =
-            executionContext.getParams() == null ? null : executionContext.getParams().getCurrentParameter();
+            executionContext.getParams() == null ? null :
+                executionContext.getParams().getCurrentParameter();
 
         final RelNode plan = executionPlan.getPlan();
         Set<String> schemaNames = executionPlan.getSchemaNames();
-        String key = OptimizerUtils.buildInexprKey(executionContext);
+        String key = OptimizerUtils.buildInExprKey(executionContext);
         PlanShardInfo planShardInfo = executionPlan.getPlanShardInfo(key);
 
         ExtractionResult er = null;
@@ -579,7 +633,10 @@ public class PostPlanner {
             // if no found any schemas in logical plan, then use the default schema to do sharding and plan pushdown
             schemaNameOfPlan = OptimizerContext.getContext(
                 executionContext.getSchemaName()).getSchemaName();
+            // build new set to avoid concurrent modify error
+            schemaNames = new HashSet<>();
             schemaNames.add(schemaNameOfPlan);
+            executionPlan.setSchemaNames(schemaNames);
         } else if (!allowMultiSchema) {
             // if found more than 2 schemas in logical plan, then reject to do plan pushdown
             return new HashMap<>();
@@ -601,11 +658,13 @@ public class PostPlanner {
 
         final List<List<TargetDB>> targetDBs = new ArrayList<>();
         if (!allowMultiSchema) {
-            TddlRuleManager tddlRuleManager = executionContext.getSchemaManager(schemaNameOfPlan).getTddlRuleManager();
+            TddlRuleManager tddlRuleManager =
+                executionContext.getSchemaManager(schemaNameOfPlan).getTddlRuleManager();
             Map<String, List<List<String>>> result = new HashMap<>();
 
             // used by shardedTb
-            Map<String, Map<String, Comparative>> allComps = planShardInfo.getAllTableComparative(schemaNameOfPlan);
+            Map<String, Map<String, Comparative>> allComps =
+                planShardInfo.getAllTableComparative(schemaNameOfPlan);
             Map<String, Map<String, Comparative>> allFullComps =
                 planShardInfo.getAllTableFullComparative(schemaNameOfPlan);
 
@@ -618,11 +677,13 @@ public class PostPlanner {
                     Map<String, Object> calcParams = new HashMap<>();
                     calcParams.put(CalcParamsAttribute.SHARD_FOR_EXTRA_DB, false);
                     calcParams.put(CalcParamsAttribute.COM_DB_TB, allFullComps);
-                    calcParams.put(CalcParamsAttribute.CONN_TIME_ZONE, executionContext.getTimeZone());
+                    calcParams.put(CalcParamsAttribute.CONN_TIME_ZONE,
+                        executionContext.getTimeZone());
                     calcParams.put(CalcParamsAttribute.EXECUTION_CONTEXT, executionContext);
                     List<TargetDB> tdbs =
                         tddlRuleManager
-                            .shard(name, true, forceAllowFullTableScan, comps, params, calcParams, executionContext);
+                            .shard(name, true, forceAllowFullTableScan, comps, params, calcParams,
+                                executionContext);
                     targetDBs.add(tdbs);
                 } else {
                     // do routing for each partTable
@@ -631,7 +692,8 @@ public class PostPlanner {
                         PartitionPruner.doPruningByStepInfo(stepInfo, executionContext);
 
                     // covert to targetDbList
-                    targetDBs.add(PartitionPrunerUtils.buildTargetDbsByPartPrunedResults(prunedResult));
+                    targetDBs.add(
+                        PartitionPrunerUtils.buildTargetDbsByPartPrunedResults(prunedResult));
                 }
             }
             result.putAll(PlannerUtils.convertTargetDB(targetDBs, schemaNameOfPlan));
@@ -658,7 +720,8 @@ public class PostPlanner {
                     targetDBs.clear();
 
                     // routed by shardDbTb
-                    Map<String, Map<String, Comparative>> allComps = planShardInfo.getAllTableComparative(schemaName);
+                    Map<String, Map<String, Comparative>> allComps =
+                        planShardInfo.getAllTableComparative(schemaName);
                     Map<String, Map<String, Comparative>> allFullComps =
                         planShardInfo.getAllTableFullComparative(schemaName);
 
@@ -669,10 +732,12 @@ public class PostPlanner {
                             Map<String, Object> calcParams = new HashMap<>();
                             calcParams.put(CalcParamsAttribute.SHARD_FOR_EXTRA_DB, false);
                             calcParams.put(CalcParamsAttribute.COM_DB_TB, allFullComps);
-                            calcParams.put(CalcParamsAttribute.CONN_TIME_ZONE, executionContext.getTimeZone());
+                            calcParams.put(CalcParamsAttribute.CONN_TIME_ZONE,
+                                executionContext.getTimeZone());
                             calcParams.put(CalcParamsAttribute.EXECUTION_CONTEXT, executionContext);
                             List<TargetDB> tdbs =
-                                tddlRuleManager.shard(name, true, forceAllowFullTableScan, comps, params, calcParams,
+                                tddlRuleManager.shard(name, true, forceAllowFullTableScan, comps,
+                                    params, calcParams,
                                     executionContext);
                             targetDBs.add(tdbs);
                         } else {
@@ -682,7 +747,8 @@ public class PostPlanner {
                             PartPrunedResult prunedResult =
                                 PartitionPruner.doPruningByStepInfo(stepInfo, executionContext);
                             // covert to targetDbList
-                            targetDBs.add(PartitionPrunerUtils.buildTargetDbsByPartPrunedResults(prunedResult));
+                            targetDBs.add(PartitionPrunerUtils.buildTargetDbsByPartPrunedResults(
+                                prunedResult));
                         }
 
                     }
@@ -760,13 +826,15 @@ public class PostPlanner {
             @Override
             public void visit(RelNode relNode, int ordinal, RelNode parent) {
                 if (relNode instanceof OSSTableScan) {
+                    // don't optimize oss table scan in post planner
                     exists = true;
                 } else {
                     if (relNode instanceof Project) {
                         exists = PushProjectRule.doNotPush((Project) relNode) ? true : exists;
                     } else if (relNode instanceof Filter) {
                         exists =
-                            RexUtils.containsUnPushableFunction(((Filter) relNode).getCondition(), true) ? true :
+                            RexUtil.containsUnPushableFunction(((Filter) relNode).getCondition(),
+                                true) ? true :
                                 exists;
                     }
                 }

@@ -55,4 +55,16 @@ public interface ITransactionManager extends Lifecycle, ITransactionManagerUtil 
     void register(ITransaction transaction);
 
     void unregister(long txid);
+
+    default boolean supportAsyncCommit() {
+        return false;
+    }
+
+    long getMinSnapshotSeq();
+
+    long getColumnarMinSnapshotSeq();
+
+    default boolean support2pcOpt() {
+        return false;
+    }
 }

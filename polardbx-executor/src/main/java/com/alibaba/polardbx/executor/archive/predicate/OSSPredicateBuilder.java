@@ -30,8 +30,10 @@ import com.alibaba.polardbx.common.utils.time.core.TimeStorage;
 import com.alibaba.polardbx.common.utils.time.parser.TimeParseStatus;
 import com.alibaba.polardbx.common.utils.time.parser.TimeParserFlags;
 import com.alibaba.polardbx.executor.archive.pruning.OssOrcFilePruner;
+import com.alibaba.polardbx.executor.archive.reader.OSSColumnTransformer;
+import com.alibaba.polardbx.executor.archive.reader.TypeComparison;
 import com.alibaba.polardbx.executor.operator.util.minmaxfilter.MinMaxFilter;
-import com.alibaba.polardbx.optimizer.config.table.ColumnMeta;
+import com.alibaba.polardbx.optimizer.config.table.OSSOrcFileMeta;
 import com.alibaba.polardbx.optimizer.config.table.OrcMetaUtils;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
@@ -49,6 +51,7 @@ import org.apache.calcite.rex.RexVisitorImpl;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.fun.SqlRuntimeFilterFunction;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.orc.impl.TypeUtils;
 import org.apache.orc.sarg.PredicateLeaf;
 import org.apache.orc.sarg.SearchArgument;
 import org.apache.orc.sarg.SearchArgumentFactory;
@@ -56,7 +59,6 @@ import org.jetbrains.annotations.NotNull;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.Types;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -71,13 +73,20 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
     Map<Integer, BloomFilterInfo> bloomFilterInfoMap;
     List<RelDataTypeField> runtimeFilterFields;
     TableMeta tableMeta;
-    Map<String, ColumnMeta> columnsWithSortKey;
     SessionProperties sessionProperties;
+
+    OSSColumnTransformer ossColumnTransformer;
+
+    boolean enableAggPruner;
+
+    OSSOrcFileMeta fileMeta;
 
     public OSSPredicateBuilder(Parameters parameters, List<RelDataTypeField> filterFields,
                                Map<Integer, BloomFilterInfo> bloomFilterInfoMap,
                                List<RelDataTypeField> runtimeFilterFields, TableMeta tableMeta,
-                               SessionProperties sessionProperties) {
+                               SessionProperties sessionProperties,
+                               OSSColumnTransformer ossColumnTransformer,
+                               OSSOrcFileMeta fileMeta) {
         super(false);
         this.builder = SearchArgumentFactory.newBuilder();
         this.parameters = parameters;
@@ -88,12 +97,31 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
         this.tableMeta = tableMeta;
         this.sessionProperties = sessionProperties;
 
-        // get varchar key columns for sort key column info
-        this.columnsWithSortKey = tableMeta.getIndexes().stream()
-            .map(indexMeta -> indexMeta.getKeyColumns())
-            .flatMap(List::stream)
-            .filter(columnMeta -> columnMeta.getDataType() instanceof SliceType)
-            .collect(Collectors.toMap(columnMeta -> columnMeta.getOriginColumnName(), columnMeta -> columnMeta));
+        this.ossColumnTransformer = ossColumnTransformer;
+        this.enableAggPruner = true;
+        this.fileMeta = fileMeta;
+    }
+
+    String getFieldId(String targetColumn) {
+        TypeComparison result = ossColumnTransformer.compare(targetColumn);
+
+        if (result == TypeComparison.IS_EQUAL_YES) {
+            return tableMeta.getColumnFieldId(targetColumn);
+        }
+
+        // Todo: support filter for different type!
+        if (result == TypeComparison.IS_EQUAL_NO) {
+            this.enableAggPruner = false;
+            return null;
+        }
+
+        // new column after orc file
+        if (TypeComparison.isMissing(result)) {
+            this.enableAggPruner = false;
+            return null;
+        }
+
+        return null;
     }
 
     public String[] columns() {
@@ -170,17 +198,25 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
 
         String columnName = filterFields.get(field.getIndex()).getName();
         SqlTypeName typeName = field.getType().getSqlTypeName();
+        DataType dataType = tableMeta.getColumn(columnName).getDataType();
+        columnName = getFieldId(columnName);
+        if (columnName == null) {
+            builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+            return true;
+        }
+
         columns.add(columnName);
 
         // should we prune the sort key column instead of original col
         String redundantColumn = null;
         // precise data type info from table meta
         DataType preciseDataType = null;
-        if (columnsWithSortKey.containsKey(columnName)) {
+        if (fileMeta.getColumnNameToIdx(OrcMetaUtils.redundantColumnOf(columnName)) != null) {
             redundantColumn = OrcMetaUtils.redundantColumnOf(columnName);
             columns.add(redundantColumn);
 
-            preciseDataType = columnsWithSortKey.get(columnName).getDataType();
+            Integer rank = ossColumnTransformer.getTargetColumnRank(filterFields.get(field.getIndex()).getName());
+            preciseDataType = ossColumnTransformer.getSourceColumnMeta(rank).getDataType();
             if (!(preciseDataType instanceof SliceType)) {
                 // sort key unsupported
                 return false;
@@ -230,15 +266,21 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             }
             return true;
         case DECIMAL:
-            if (value instanceof Number) {
-                DataType dataType = tableMeta.getColumn(columnName).getDataType();
-                byte[] bytes = OssOrcFilePruner.decimalToBin(Decimal.fromString(value.toString()).getDecimalStructure(),
-                    dataType.getPrecision(), dataType.getScale());
-                applier.apply(columnName, PredicateLeaf.Type.STRING,
-                    new Object[] {new String(bytes, StandardCharsets.UTF_8)});
-            } else {
+            if (!(value instanceof Number)) {
                 builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+                return true;
             }
+            Decimal decimal = Decimal.fromString(value.toString());
+            if (fileMeta.isEnableDecimal64() && TypeUtils.isDecimal64Precision(dataType.getPrecision())) {
+                // passing an approximate value for pruning
+                long longVal = decimal.unscaleInternal(dataType.getScale());
+                applier.apply(columnName, PredicateLeaf.Type.LONG, new Object[] {longVal});
+                return true;
+            }
+            byte[] bytes = OssOrcFilePruner.decimalToBin(decimal.getDecimalStructure(),
+                dataType.getPrecision(), dataType.getScale());
+            applier.apply(columnName, PredicateLeaf.Type.STRING,
+                new Object[] {new String(bytes, StandardCharsets.UTF_8)});
             return true;
         case TIMESTAMP:
             MysqlDateTime mysqlDateTime = DataTypeUtil.toMySQLDatetimeByFlags(
@@ -307,17 +349,24 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
 
         String columnName = filterFields.get(field.getIndex()).getName();
         SqlTypeName typeName = field.getType().getSqlTypeName();
+        DataType dataType = tableMeta.getColumn(columnName).getDataType();
+        columnName = getFieldId(columnName);
+        if (columnName == null) {
+            builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+            return true;
+        }
         columns.add(columnName);
 
         // should we prune the sort key column instead of original col
         String redundantColumn = null;
         // precise data type info from table meta
         DataType preciseDataType = null;
-        if (columnsWithSortKey.containsKey(columnName)) {
+        if (fileMeta.getColumnNameToIdx(OrcMetaUtils.redundantColumnOf(columnName)) != null) {
             redundantColumn = OrcMetaUtils.redundantColumnOf(columnName);
             columns.add(redundantColumn);
 
-            preciseDataType = columnsWithSortKey.get(columnName).getDataType();
+            Integer rank = ossColumnTransformer.getTargetColumnRank(filterFields.get(field.getIndex()).getName());
+            preciseDataType = ossColumnTransformer.getSourceColumnMeta(rank).getDataType();
             if (!(preciseDataType instanceof SliceType)) {
                 // sort key unsupported
                 return false;
@@ -373,20 +422,28 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             }
             return true;
         case DECIMAL:
-            if (value1 instanceof Number && value2 instanceof Number) {
-                DataType dataType = tableMeta.getColumn(columnName).getDataType();
-                byte[] bytes1 =
-                    OssOrcFilePruner.decimalToBin(Decimal.fromString(value1.toString()).getDecimalStructure(),
-                        dataType.getPrecision(), dataType.getScale());
-                byte[] bytes2 =
-                    OssOrcFilePruner.decimalToBin(Decimal.fromString(value2.toString()).getDecimalStructure(),
-                        dataType.getPrecision(), dataType.getScale());
-
-                builder.between(columnName, PredicateLeaf.Type.STRING, new String(bytes1, StandardCharsets.UTF_8),
-                    new String(bytes2, StandardCharsets.UTF_8));
-            } else {
+            if (!(value1 instanceof Number && value2 instanceof Number)) {
                 builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+                return true;
             }
+            Decimal decimal1 = Decimal.fromString(value1.toString());
+            Decimal decimal2 = Decimal.fromString(value2.toString());
+            if (fileMeta.isEnableDecimal64() && TypeUtils.isDecimal64Precision(dataType.getPrecision())) {
+                // passing approximate values with wider range for pruning
+                long longVal1 = decimal1.unscaleInternal(dataType.getScale());
+                long longVal2 = decimal2.unscaleInternal(dataType.getScale());
+                builder.between(columnName, PredicateLeaf.Type.LONG, longVal1, longVal2);
+                return true;
+            }
+            byte[] bytes1 =
+                OssOrcFilePruner.decimalToBin(decimal1.getDecimalStructure(),
+                    dataType.getPrecision(), dataType.getScale());
+            byte[] bytes2 =
+                OssOrcFilePruner.decimalToBin(decimal2.getDecimalStructure(),
+                    dataType.getPrecision(), dataType.getScale());
+
+            builder.between(columnName, PredicateLeaf.Type.STRING, new String(bytes1, StandardCharsets.UTF_8),
+                new String(bytes2, StandardCharsets.UTF_8));
             return true;
         case TIMESTAMP:
             MysqlDateTime mysqlDateTime1 = DataTypeUtil.toMySQLDatetimeByFlags(
@@ -513,18 +570,25 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
         }
 
         String columnName = filterFields.get(field.getIndex()).getName();
+        DataType dataType = tableMeta.getColumn(columnName).getDataType();
         SqlTypeName typeName = field.getType().getSqlTypeName();
+        columnName = getFieldId(columnName);
+        if (columnName == null) {
+            builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+            return true;
+        }
         columns.add(columnName);
 
         // should we prune the sort key column instead of original col
         String redundantColumn = null;
         // precise data type info from table meta
         DataType preciseDataType = null;
-        if (columnsWithSortKey.containsKey(columnName)) {
+        if (fileMeta.getColumnNameToIdx(OrcMetaUtils.redundantColumnOf(columnName)) != null) {
             redundantColumn = OrcMetaUtils.redundantColumnOf(columnName);
             columns.add(redundantColumn);
 
-            preciseDataType = columnsWithSortKey.get(columnName).getDataType();
+            Integer rank = ossColumnTransformer.getTargetColumnRank(filterFields.get(field.getIndex()).getName());
+            preciseDataType = ossColumnTransformer.getSourceColumnMeta(rank).getDataType();
             if (!(preciseDataType instanceof SliceType)) {
                 // sort key unsupported
                 return false;
@@ -541,7 +605,7 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
         case INTEGER_UNSIGNED:
         case BIGINT:
             if (checkInClass(paramList, Number.class)) {
-                List<Object> newPara = Lists.newArrayList();
+                List<Object> newPara = Lists.newArrayListWithCapacity(paramList.size());
                 for (Object obj : paramList) {
                     newPara.add(((Number) obj).longValue());
                 }
@@ -552,7 +616,7 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             return true;
         case BIGINT_UNSIGNED:
             if (checkInClass(paramList, Number.class)) {
-                List<Object> newPara = Lists.newArrayList();
+                List<Object> newPara = Lists.newArrayListWithCapacity(paramList.size());
                 for (Object obj : paramList) {
                     newPara.add(((Number) obj).longValue() ^ UInt64Utils.FLIP_MASK);
                 }
@@ -564,7 +628,7 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
         case DOUBLE:
         case FLOAT:
             if (checkInClass(paramList, Number.class)) {
-                List<Object> newPara = Lists.newArrayList();
+                List<Object> newPara = Lists.newArrayListWithCapacity(paramList.size());
                 for (Object obj : paramList) {
                     newPara.add(((Number) obj).doubleValue());
                 }
@@ -576,7 +640,7 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
         case VARCHAR:
         case CHAR:
             if (redundantColumn != null && preciseDataType != null && checkInClass(paramList, String.class)) {
-                List<Object> newPara = Lists.newArrayList();
+                List<Object> newPara = Lists.newArrayListWithCapacity(paramList.size());
                 final SliceType sliceType = (SliceType) preciseDataType;
                 for (Object obj : paramList) {
                     newPara.add(makeSortKeyString(obj, sliceType));
@@ -587,22 +651,31 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             }
             return true;
         case DECIMAL:
-            if (checkInClass(paramList, Number.class)) {
-                List<Object> newPara = Lists.newArrayList();
-                DataType dataType = tableMeta.getColumn(columnName).getDataType();
-                for (Object obj : paramList) {
-                    byte[] bytes =
-                        OssOrcFilePruner.decimalToBin(Decimal.fromString(obj.toString()).getDecimalStructure(),
-                            dataType.getPrecision(), dataType.getScale());
-                    newPara.add(new String(bytes, StandardCharsets.UTF_8));
-                }
-                buildIn(columnName, PredicateLeaf.Type.STRING, newPara);
-            } else {
+            if (!checkInClass(paramList, Number.class)) {
                 builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+                return true;
             }
+            List<Object> newPara = Lists.newArrayListWithCapacity(paramList.size());
+            if (fileMeta.isEnableDecimal64() && TypeUtils.isDecimal64Precision(dataType.getPrecision())) {
+                for (Object obj : paramList) {
+                    Decimal decimal = Decimal.fromString(obj.toString());
+                    long longVal1 = decimal.unscaleInternal(dataType.getScale());
+                    newPara.add(longVal1);
+                }
+                buildIn(columnName, PredicateLeaf.Type.LONG, newPara);
+                return true;
+            }
+
+            for (Object obj : paramList) {
+                byte[] bytes =
+                    OssOrcFilePruner.decimalToBin(Decimal.fromString(obj.toString()).getDecimalStructure(),
+                        dataType.getPrecision(), dataType.getScale());
+                newPara.add(new String(bytes, StandardCharsets.UTF_8));
+            }
+            buildIn(columnName, PredicateLeaf.Type.STRING, newPara);
             return true;
         case TIMESTAMP:
-            List<Object> timestampLongValueParams = new ArrayList<>();
+            List<Object> timestampLongValueParams = Lists.newArrayListWithCapacity(paramList.size());
             for (Object obj : paramList) {
                 MysqlDateTime mysqlDateTime = DataTypeUtil.toMySQLDatetimeByFlags(
                     obj,
@@ -625,7 +698,7 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             return true;
         case DATE:
         case DATETIME:
-            List<Object> packedParams = new ArrayList<>();
+            List<Object> packedParams = Lists.newArrayListWithCapacity(paramList.size());
             for (Object obj : paramList) {
                 MysqlDateTime mysqlDateTime = DataTypeUtil.toMySQLDatetimeByFlags(
                     obj,
@@ -640,7 +713,7 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             buildIn(columnName, PredicateLeaf.Type.LONG, packedParams);
             return true;
         case TIME:
-            List<Object> packedTimeParams = new ArrayList<>();
+            List<Object> packedTimeParams = Lists.newArrayListWithCapacity(paramList.size());
             for (Object obj : paramList) {
                 MysqlDateTime mysqlDateTime = DataTypeUtil.toMySQLDatetimeByFlags(
                     obj,
@@ -761,6 +834,11 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
 
         String columnName = filterFields.get(rexInputRef.getIndex()).getName();
 
+        columnName = getFieldId(columnName);
+        if (columnName == null) {
+            builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+            return true;
+        }
         builder.isNull(columnName, PredicateLeaf.Type.BOOLEAN);
 
         return true;
@@ -783,18 +861,25 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             RexInputRef field = (RexInputRef) call.getOperands().get(i);
 
             String columnName = runtimeFilterFields.get(field.getIndex()).getName();
+            DataType dataType = tableMeta.getColumn(columnName).getDataType();
             SqlTypeName typeName = field.getType().getSqlTypeName();
+            columnName = getFieldId(columnName);
+            if (columnName == null) {
+                builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+                return true;
+            }
             columns.add(columnName);
 
             // should we prune the sort key column instead of original col
             String redundantColumn = null;
             // precise data type info from table meta
             DataType preciseDataType = null;
-            if (columnsWithSortKey.containsKey(columnName)) {
+            if (fileMeta.getColumnNameToIdx(OrcMetaUtils.redundantColumnOf(columnName)) != null) {
                 redundantColumn = OrcMetaUtils.redundantColumnOf(columnName);
                 columns.add(redundantColumn);
 
-                preciseDataType = columnsWithSortKey.get(columnName).getDataType();
+                Integer rank = ossColumnTransformer.getTargetColumnRank(filterFields.get(field.getIndex()).getName());
+                preciseDataType = ossColumnTransformer.getSourceColumnMeta(rank).getDataType();
                 if (!(preciseDataType instanceof SliceType)) {
                     // sort key unsupported
                     return false;
@@ -891,23 +976,37 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
             case DECIMAL:
                 String minDecimalString = minMaxFilter.getMinString();
                 String maxDecimalString = minMaxFilter.getMaxString();
-                if (minDecimalString != null && maxDecimalString != null) {
-                    DataType dataType = tableMeta.getColumn(columnName).getDataType();
-                    byte[] bytes1 =
-                        OssOrcFilePruner.decimalToBin(Decimal.fromString(minDecimalString).getDecimalStructure(),
-                            dataType.getPrecision(), dataType.getScale());
-                    byte[] bytes2 =
-                        OssOrcFilePruner.decimalToBin(Decimal.fromString(minDecimalString).getDecimalStructure(),
-                            dataType.getPrecision(), dataType.getScale());
-                    if (minDecimalString.equals(maxDecimalString)) {
-                        builder.equals(columnName, PredicateLeaf.Type.STRING,
-                            new String(bytes1, StandardCharsets.UTF_8));
-                    } else {
-                        builder.between(columnName, PredicateLeaf.Type.STRING,
-                            new String(bytes1, StandardCharsets.UTF_8), new String(bytes2, StandardCharsets.UTF_8));
-                    }
-                } else {
+                if (minDecimalString == null || maxDecimalString == null) {
                     builder.literal(SearchArgument.TruthValue.YES_NO_NULL);
+                    return true;
+                }
+                Decimal minDecimal = Decimal.fromString(minDecimalString);
+                Decimal maxDecimal = Decimal.fromString(maxDecimalString);
+                if (fileMeta.isEnableDecimal64() && TypeUtils.isDecimal64Precision(dataType.getPrecision())) {
+                    // passing approximate values with wider range for pruning
+                    long minLongVal = minDecimal.unscaleInternal(dataType.getScale());
+                    long maxLongVal = maxDecimal.unscaleInternal(dataType.getScale());
+                    if (minLongVal == maxLongVal) {
+                        builder.equals(columnName, PredicateLeaf.Type.LONG, minLongVal);
+                    } else {
+                        builder.between(columnName, PredicateLeaf.Type.LONG, minLongVal,
+                            maxLongVal);
+                    }
+                    return true;
+                }
+
+                byte[] bytes1 =
+                    OssOrcFilePruner.decimalToBin(minDecimal.getDecimalStructure(),
+                        dataType.getPrecision(), dataType.getScale());
+                byte[] bytes2 =
+                    OssOrcFilePruner.decimalToBin(maxDecimal.getDecimalStructure(),
+                        dataType.getPrecision(), dataType.getScale());
+                if (minDecimalString.equals(maxDecimalString)) {
+                    builder.equals(columnName, PredicateLeaf.Type.STRING,
+                        new String(bytes1, StandardCharsets.UTF_8));
+                } else {
+                    builder.between(columnName, PredicateLeaf.Type.STRING,
+                        new String(bytes1, StandardCharsets.UTF_8), new String(bytes2, StandardCharsets.UTF_8));
                 }
                 return true;
             default:
@@ -922,6 +1021,10 @@ public class OSSPredicateBuilder extends RexVisitorImpl<Boolean> {
         SortKey sortKey = preciseDataType.makeSortKey(value, preciseDataType.length());
         byte[] utf8Bytes = (byte[]) MySQLUnicodeUtils.latin1ToUtf8(sortKey.keys).getBase();
         return new String(utf8Bytes);
+    }
+
+    public boolean isEnableAggPruner() {
+        return enableAggPruner;
     }
 
     public interface TriFunction<T, U, V, R> {

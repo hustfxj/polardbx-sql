@@ -37,17 +37,14 @@ public class SQLRecorderLogger {
     // sql#parameterizedSqlId#sqlCount#appName
     public final static MessageFormat parameterizedSqlLogFormat = new MessageFormat("{0}#{1}#{2}#{3}");
 
-    // 逻辑慢SQL日志
-    public final static Logger slowLogger = LoggerFactory.getLogger("slow");
-
     //逻辑慢SQL日志详细，和SQL日志一样的指标
-    public final static Logger slowDetailLogger = LoggerFactory.getLogger("slow_detail");
+    public final static Logger slowDetailLogger = LoggerFactory.getLogger("slow_detail", true);
 
     // 物理慢SQL
     public final static Logger physicalSlowLogger = LoggerFactory.getLogger("physical_slow");
 
     // DRDS普通 SQL日志
-    public final static Logger sqlLogger = LoggerFactory.getLogger("sql");
+    public final static Logger sqlLogger = LoggerFactory.getLogger("sql", true);
 
     // DDL日志
     public final static Logger ddlLogger = LoggerFactory.getLogger("ddl");
@@ -70,5 +67,26 @@ public class SQLRecorderLogger {
 
     // SCALE OUT 任务日志
     public final static Logger scaleOutTaskLogger = LoggerFactory.getLogger("scale_out_task");
+
+    // Slow trans log
+    public final static Logger slowTransLogger = LoggerFactory.getLogger("slow_trans");
+
+    // Inner sql executed by InnerConnection
+    public final static Logger innerSqlLogger = LoggerFactory.getLogger("inner_sql", true);
+    /**
+     * 0:sql#<br>
+     * 1:success(0 for success, 1 for fail)#<br>
+     * 2:time_cost
+     */
+    public final static MessageFormat innerSqlFormat = new MessageFormat("{0}#{1}#{2}");
+
+    public final static Logger cdcLogger = LoggerFactory.getLogger("cdc_log");
+
+    // format_version#trace_id#trx_type#start_time#finish_time#duration_time#status#active_time#idle_time
+    // #write_time#read_time#write_affect_rows#read_return_rows#mdl_wait_time#get_tso_time#prepare_time
+    // #trx_log_time#commit_time#rollback_time#sql_count#rw_sql_count#trx_template_id#trx_log_type#
+    public final static MessageFormat slowTransFormat =
+        new MessageFormat(
+            "{0}#{1}#{2}#{3}#{4}#{5}#{6}#{7}#{8}#{9}#{10}#{11}#{12}#{13}#{14}#{15}#{16}#{17}#{18}#{19}#{20}#{21}#{22}#");
 
 }

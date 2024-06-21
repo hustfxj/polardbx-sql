@@ -34,6 +34,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 public class StripeColumnMeta {
+
     private static Map<Engine, Cache<String, OrcBloomFilter>> ORC_BLOOM_FILTER_CACHE = new ConcurrentHashMap<>();
 
     private Engine engine;
@@ -43,9 +44,11 @@ public class StripeColumnMeta {
     private ColumnMetasRecord record;
 
     private ColumnStatistics columnStatistics;
+
     private StripeInfo stripeInfo;
 
-    public StripeColumnMeta () {}
+    public StripeColumnMeta() {
+    }
 
     public long getStripeIndex() {
         return stripeInfo.getStripeIndex();
@@ -106,10 +109,10 @@ public class StripeColumnMeta {
     private static Cache<String, OrcBloomFilter> buildCache(long maxSize) {
         int planCacheExpireTime = DynamicConfig.getInstance().planCacheExpireTime();
         return CacheBuilder.newBuilder()
-                .maximumSize(maxSize)
-                .expireAfterWrite(planCacheExpireTime, TimeUnit.MILLISECONDS)
-                .softValues()
-                .build();
+            .maximumSize(maxSize)
+            .expireAfterWrite(planCacheExpireTime, TimeUnit.MILLISECONDS)
+            .softValues()
+            .build();
     }
 
     private OrcBloomFilter getBloomFilterImpl(Engine engine, String path) {
@@ -119,7 +122,7 @@ public class StripeColumnMeta {
 
         try {
             // Parse the bloom filter from part of oss files and cache in local.
-            return cache.get(path, () -> parseBloomFilter());
+            return cache.get(path + record.stripeIndex + record.columnName, () -> parseBloomFilter());
         } catch (ExecutionException executionException) {
             return null;
         }
@@ -143,7 +146,8 @@ public class StripeColumnMeta {
         int offset = (int) record.bloomFilterOffset;
         int length = (int) record.bloomFilterLength;
         byte[] buffer = new byte[length];
-        FileSystemUtils.readFile(record.bloomFilterPath, offset, length, buffer, engine);
+        // TODO(siyun): this should be checked: columnar with old table scan
+        FileSystemUtils.readFile(record.bloomFilterPath, offset, length, buffer, engine, false);
 
         // parse bloom filter from oss file.
         try {
@@ -156,7 +160,7 @@ public class StripeColumnMeta {
     private static OrcBloomFilter doParseUnmerged(ColumnMetasRecord record) {
         // parse bloom filter from oss file.
         ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
-        FileSystemUtils.readFile(record.bloomFilterPath, byteArrayOutputStream, Engine.valueOf(record.engine));
+        FileSystemUtils.readFile(record.bloomFilterPath, byteArrayOutputStream, Engine.valueOf(record.engine), false);
         byte[] bytes = byteArrayOutputStream.toByteArray();
         try {
             return OrcBloomFilter.deserialize(new ByteArrayInputStream(bytes, 0, bytes.length));

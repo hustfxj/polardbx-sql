@@ -23,35 +23,31 @@ import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.time.MySQLTimeConverter;
 import com.alibaba.polardbx.common.utils.time.MySQLTimeTypeUtil;
 import com.alibaba.polardbx.common.utils.time.calculator.MySQLTimeCalculator;
-import com.alibaba.polardbx.common.utils.time.core.MySQLTimeVal;
 import com.alibaba.polardbx.common.utils.time.core.MysqlDateTime;
 import com.alibaba.polardbx.common.utils.time.core.OriginalTemporalValue;
+import com.alibaba.polardbx.common.utils.time.core.OriginalTimestamp;
 import com.alibaba.polardbx.common.utils.time.core.TimeStorage;
 import com.alibaba.polardbx.common.utils.time.parser.NumericTimeParser;
 import com.alibaba.polardbx.common.utils.time.parser.StringTimeParser;
 import com.alibaba.polardbx.common.utils.time.parser.TimeParseStatus;
 import com.alibaba.polardbx.common.utils.time.parser.TimeParserFlags;
-import com.alibaba.polardbx.common.charset.CollationHandlers;
-import com.alibaba.polardbx.common.collation.CollationHandler;
+import com.alibaba.polardbx.optimizer.config.table.charset.CollationHandlers;
+import com.alibaba.polardbx.optimizer.config.table.collation.CollationHandler;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
-import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
 import com.alibaba.polardbx.rpc.result.XResult;
 import com.alibaba.polardbx.rpc.result.XResultUtil;
 import com.google.protobuf.ByteString;
 import com.mysql.cj.polarx.protobuf.PolarxResultset;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
+import io.airlift.slice.XxHash64;
 
+import java.nio.charset.StandardCharsets;
 import java.sql.Date;
 import java.sql.ResultSet;
-import java.sql.Time;
 import java.sql.Timestamp;
 import java.sql.Types;
-import java.time.Instant;
-import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.util.Arrays;
 
 /**
  * datetime(N) type
@@ -264,6 +260,17 @@ public class DatetimeField extends AbstractTemporalField {
             CollationHandler collationHandler = getCollationHandler();
             collationHandler.hashcode(packedBinary, length, numbers);
         }
+    }
+
+    @Override
+    public long xxHashCode() {
+        if (isNull()) {
+            return NULL_HASH_CODE;
+        }
+        MysqlDateTime dateTime = TimeStorage.readTimestamp(packedLong);
+        OriginalTimestamp originalTimestamp = new OriginalTimestamp(dateTime);
+        byte[] rawBytes = originalTimestamp.toString().getBytes(StandardCharsets.UTF_8);
+        return XxHash64.hash(rawBytes, 0, rawBytes.length);
     }
 
     @Override

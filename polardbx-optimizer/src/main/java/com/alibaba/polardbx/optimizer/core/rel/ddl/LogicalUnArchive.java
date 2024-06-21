@@ -86,6 +86,7 @@ public class LogicalUnArchive extends BaseDdlOperation {
                 Preconditions.checkArgument(((SqlIdentifier) sqlUnArchive.getNode()).isSimple(),
                     "Unknown tablegroup: " + sqlUnArchive.getNode().toString());
                 String tableGroup = ((SqlIdentifier) sqlUnArchive.getNode()).getLastName();
+
                 final TableGroupInfoManager tableGroupInfoManager =
                     OptimizerContext.getContext(getSchemaName()).getTableGroupInfoManager();
                 TableGroupConfig tableGroupConfig = tableGroupInfoManager.getTableGroupConfigByName(tableGroup);
@@ -93,8 +94,7 @@ public class LogicalUnArchive extends BaseDdlOperation {
                     throw new TddlRuntimeException(ErrorCode.ERR_TABLE_GROUP_NOT_EXISTS,
                         "Tablegroup: " + tableGroup + " doesn't exists");
                 }
-                for (TablePartRecordInfoContext table : tableGroupConfig.getAllTables()) {
-                    String targetTable = table.getLogTbRec().getTableName();
+                for (String targetTable : tableGroupConfig.getAllTables()) {
                     tables.put(targetTable, sm.getTable(targetTable).getVersion());
                 }
                 Preconditions.checkArgument(tables.size() > 0,
@@ -105,6 +105,7 @@ public class LogicalUnArchive extends BaseDdlOperation {
             case DATABASE: {
                 Preconditions.checkArgument(TableInfoManager.getSchemaDefaultDbIndex(getSchemaName()) != null,
                     "Database: " + getSchemaName() + " doesn't exists");
+
                 ResultSet rs = conn.prepareStatement(
                         String.format("select table_name from %s where table_schema=\"%s\"",
                             GmsSystemTables.TABLES, getSchemaName()))
@@ -121,6 +122,7 @@ public class LogicalUnArchive extends BaseDdlOperation {
             default:
                 preparedData = new UnArchivePreparedData(getSchemaName(), tables, null);
             }
+
         } catch (SQLException e) {
             e.printStackTrace();
             throw GeneralUtil.nestedException(e);
@@ -176,6 +178,16 @@ public class LogicalUnArchive extends BaseDdlOperation {
                 "Database: " + schemaName + " doesn't exists");
         }
         return schemaName;
+    }
+
+    @Override
+    public boolean isSupportedByFileStorage() {
+        return false;
+    }
+
+    @Override
+    public boolean isSupportedByBindFileStorage() {
+        return true;
     }
 
     public static LogicalUnArchive create(DDL input) {

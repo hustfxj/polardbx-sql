@@ -17,16 +17,20 @@
 package com.alibaba.polardbx.matrix.config;
 
 import com.alibaba.polardbx.common.TddlConstants;
+import com.alibaba.polardbx.common.ddl.Job;
 import com.alibaba.polardbx.common.ddl.newengine.DdlConstants;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
-import com.alibaba.polardbx.common.lock.LockingFunctionManager;
 import com.alibaba.polardbx.common.logger.LoggerInit;
+import com.alibaba.polardbx.common.logical.ITPrepareStatement;
 import com.alibaba.polardbx.common.logical.ITStatement;
+import com.alibaba.polardbx.common.model.App;
 import com.alibaba.polardbx.common.model.Group;
 import com.alibaba.polardbx.common.model.Matrix;
 import com.alibaba.polardbx.common.model.RepoInst;
+import com.alibaba.polardbx.common.model.lifecycle.AbstractLifecycle;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.properties.ConnectionProperties;
 import com.alibaba.polardbx.common.properties.ParamManager;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
@@ -36,8 +40,6 @@ import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.common.utils.timezone.InternalTimeZone;
 import com.alibaba.polardbx.common.utils.timezone.TimeZoneUtils;
 import com.alibaba.polardbx.config.ConfigDataMode;
-import com.alibaba.polardbx.config.impl.holder.AbstractConfigDataHolder;
-import com.alibaba.polardbx.config.impl.holder.ConfigHolderFactory;
 import com.alibaba.polardbx.executor.common.AbstractSequenceManager;
 import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.executor.common.SequenceLoadFromDBManager;
@@ -51,6 +53,8 @@ import com.alibaba.polardbx.executor.ddl.newengine.DdlEngineRemoteTaskExecutor;
 import com.alibaba.polardbx.executor.ddl.newengine.DdlEngineScheduler;
 import com.alibaba.polardbx.executor.ddl.newengine.DdlPlanScheduler;
 import com.alibaba.polardbx.executor.ddl.newengine.cross.AsyncPhyObjectRecorder;
+import com.alibaba.polardbx.executor.ddl.sync.JobRequest;
+import com.alibaba.polardbx.executor.gms.ColumnarManager;
 import com.alibaba.polardbx.executor.gms.GmsTableMetaManager;
 import com.alibaba.polardbx.executor.gms.TableListListener;
 import com.alibaba.polardbx.executor.gsi.GsiManager;
@@ -77,18 +81,18 @@ import com.alibaba.polardbx.optimizer.config.server.IServerConfigManager;
 import com.alibaba.polardbx.optimizer.config.table.RepoSchemaManager;
 import com.alibaba.polardbx.optimizer.config.table.SchemaManager;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
-import com.alibaba.polardbx.optimizer.config.table.statistic.StatisticManager;
+import com.alibaba.polardbx.optimizer.context.AsyncDDLContext;
 import com.alibaba.polardbx.optimizer.context.DdlContext;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
+import com.alibaba.polardbx.optimizer.context.ExecutionContext.ErrorMessage;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
-import com.alibaba.polardbx.optimizer.partition.TableMetaFetcher;
-import com.alibaba.polardbx.optimizer.planmanager.PlanManager;
+import com.alibaba.polardbx.optimizer.partition.util.TableMetaFetcher;
 import com.alibaba.polardbx.optimizer.rule.MockSchemaManager;
 import com.alibaba.polardbx.optimizer.rule.Partitioner;
 import com.alibaba.polardbx.optimizer.rule.RuleSchemaManager;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
+import com.alibaba.polardbx.optimizer.statis.SQLRecord;
 import com.alibaba.polardbx.optimizer.tablegroup.TableGroupInfoManager;
-import com.alibaba.polardbx.optimizer.utils.IScalarSubqueryExecHelper;
 import com.alibaba.polardbx.optimizer.utils.ITransaction;
 import com.alibaba.polardbx.optimizer.utils.SubQueryDynamicParamUtils;
 import com.alibaba.polardbx.optimizer.variable.VariableManager;
@@ -97,29 +101,29 @@ import com.alibaba.polardbx.optimizer.view.SystemTableView;
 import com.alibaba.polardbx.optimizer.view.ViewManager;
 import com.alibaba.polardbx.repo.mysql.spi.MyDataSourceGetter;
 import com.alibaba.polardbx.rule.TddlRule;
+import com.alibaba.polardbx.server.conn.InnerConnectionManager;
 import com.alibaba.polardbx.statistics.SQLRecorderLogger;
 import com.alibaba.polardbx.stats.MatrixStatistics;
-import com.alibaba.polardbx.transaction.AutoCommitTransaction;
 import com.alibaba.polardbx.transaction.TransactionExecutor;
 import com.alibaba.polardbx.transaction.TransactionManager;
+import com.alibaba.polardbx.transaction.trx.AutoCommitTransaction;
 import org.apache.commons.lang.StringUtils;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-
 
 /**
  * 依赖的组件
  *
  * @since 5.0.0
  */
-public class MatrixConfigHolder extends AbstractConfigDataHolder {
+public class MatrixConfigHolder extends AbstractLifecycle {
 
     private final static Logger logger = LoggerFactory.getLogger(MatrixConfigHolder.class);
 
@@ -139,22 +143,17 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
     private OptimizerContext optimizerContext;
     private ExecutorContext executorContext;
     private Matrix matrix;
-    private String env;
+    private List<App> subApps;
     private TddlRule tddlRule;
     private MatrixStatistics statistics;
     private IServerConfigManager serverConfigManager;
-    private IScalarSubqueryExecHelper subqueryExecHelper;
     private StorageInfoManager storageInfoManager;
-    private StatisticManager statisticManager;
     private GsiManager gsiManager;
-    private PlanManager planManager;
     private ViewManager viewManager;
     private VariableManager variableManager;
     private InternalTimeZone shardRouterDefaultTimeZone;
     private DdlEngineScheduler ddlEngineScheduler;
-    private DdlPlanScheduler ddlPlanScheduler;
     private TableGroupInfoManager tableGroupInfoManager;
-    private ScheduledJobsManager scheduledJobsManager;
 
     @Override
     public void doInit() {
@@ -168,44 +167,37 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
         OptimizerContext oc = new OptimizerContext(schemaName);
         this.optimizerContext = oc;
         // 将自己做为config holder
-        try {
+        topologyInit();
 
-            topologyInit();
+        initGroups();
 
-            ConfigHolderFactory.addConfigDataHolder(appName, this);
-            initGroups();
+        this.storageInfoManager = new StorageInfoManager(topologyHandler);
+        this.storageInfoManager.init();
 
-            this.storageInfoManager = new StorageInfoManager(topologyHandler);
-            this.storageInfoManager.init();
+        ruleInit();
+        schemaInit();
 
-            ruleInit();
-            schemaInit();
+        executorContext.setTopologyHandler(topologyHandler);
+        executorContext.setTopologyExecutor(topologyExecutor);
 
-            executorContext.setTopologyHandler(topologyHandler);
-            executorContext.setTopologyExecutor(topologyExecutor);
+        Objects.requireNonNull(partitioner);
+        Objects.requireNonNull(tddlRuleManager);
+        Objects.requireNonNull(partitionInfoManager);
+        Objects.requireNonNull(tableGroupInfoManager);
 
-            Objects.requireNonNull(partitioner);
-            Objects.requireNonNull(tddlRuleManager);
-            Objects.requireNonNull(partitionInfoManager);
-            Objects.requireNonNull(tableGroupInfoManager);
+        oc.setMatrix(topologyHandler.getMatrix());
+        oc.setRuleManager(tddlRuleManager);
+        oc.setPartitioner(partitioner);
+        oc.setStatistics(this.statistics);
+        oc.setPartitionInfoManager(partitionInfoManager);
+        oc.setTableGroupInfoManager(tableGroupInfoManager);
 
-            oc.setMatrix(topologyHandler.getMatrix());
-            oc.setRuleManager(tddlRuleManager);
-            oc.setPartitioner(partitioner);
-            oc.setStatistics(this.statistics);
-            oc.setPartitionInfoManager(partitionInfoManager);
-            oc.setTableGroupInfoManager(tableGroupInfoManager);
+        SubQueryDynamicParamUtils.initScalarSubQueryExecHelper(ScalarSubqueryExecHelper.getInstance());
 
-            SubQueryDynamicParamUtils.initScalarSubQueryExecHelper(ScalarSubqueryExecHelper.getInstance());
+        //由于load app存在并发加载的问题, 所以这里需要最终确认加载初始化成功的app上下文
+        loadContext();
 
-            //由于load app存在并发加载的问题, 所以这里需要最终确认加载初始化成功的app上下文
-            loadContext();
-
-            sequenceInit();
-            executorContext.setSeqeunceManager(sequenceManager);
-        } finally {
-            ConfigHolderFactory.removeConfigHoder(appName);
-        }
+        sequenceInit();
 
         matrix.setMasterRepoInstMap(topologyHandler.getRepoInstMaps(RepoInst.REPO_INST_TYPE_MASTER));
 
@@ -265,17 +257,23 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
         oc.setParamManager(new ParamManager(dataSource.getConnectionProperties()));
 
-        // init table for locking function
-        distributedLockManagerInit();
-        PurgeOssFileScheduleTask.getInstance().init(new ParamManager(dataSource.getConnectionProperties()));
-
         // Start XA recover task. In case of leader of CN without requests(in other AZ)
         // and that makes all pending trx unfinished forever.
         if (storageInfoManager.supportXA() || storageInfoManager.supportTso()) {
             TransactionManager.getInstance(schemaName).enableXaRecoverScan();
             TransactionManager.getInstance(schemaName).enableKillTimeoutTransaction();
             TransactionManager.getInstance(schemaName).enableLogCleanTask();
+            TransactionManager.getInstance(schemaName).scheduleTransactionStatisticsTask();
         }
+        if (ConfigDataMode.isPolarDbX()) {
+            PurgeOssFileScheduleTask.getInstance().init(new ParamManager(dataSource.getConnectionProperties()));
+        }
+
+        if (ConfigDataMode.isPolarDbX() && !ConfigDataMode.isFastMock()) {
+            executorContext.setReloadColumnarManager(ColumnarManager::reload);
+        }
+
+        executorContext.setInnerConnectionManager(InnerConnectionManager.getInstance());
     }
 
     private void loadContext() {
@@ -294,9 +292,10 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
         this.sequenceManager = new SequenceManager(manager);
 
-        if (ConfigDataMode.getConfigServerMode() == ConfigDataMode.Mode.MOCK) {
+        if (ConfigDataMode.getMode() == ConfigDataMode.Mode.MOCK) {
             this.sequenceManager.init();
         }
+        executorContext.setSeqeunceManager(sequenceManager);
     }
 
     private void gsiInit() {
@@ -305,18 +304,6 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
         this.gsiManager = manager;
         this.executorContext.setGsiManager(this.gsiManager);
-    }
-
-    private void distributedLockManagerInit() {
-        // 不支持PolarDB-X模式 / 不支持只读实例 / 不支持mock模式d
-        if (false
-            && ConfigDataMode.isMasterMode()
-            && !ConfigDataMode.isFastMock()) {
-            // TGroupDataSource of Group 0.
-            DataSource distributedLockMgrDs = buildDataSource(tddlRuleManager.getTddlRule().getDefaultDbIndex());
-            // create locking function table
-            LockingFunctionManager.getInstance().init(distributedLockMgrDs);
-        }
     }
 
     @Override
@@ -331,7 +318,6 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
         try {
             if (tddlRuleManager != null) {
-                TddlRule rule = tddlRuleManager.getTddlRule();
                 tddlRuleManager.destroy();
             }
         } catch (Exception ex) {
@@ -385,22 +371,6 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
             }
         } catch (Exception ex) {
             logger.warn("storageInfoManager destroy error", ex);
-        }
-
-        try {
-            if (statisticManager != null) {
-                statisticManager.destroy();
-            }
-        } catch (Exception ex) {
-            logger.warn("statisticManager destroy error", ex);
-        }
-
-        try {
-            if (planManager != null) {
-                planManager.destroy();
-            }
-        } catch (Exception ex) {
-            logger.warn("planManager destroy error", ex);
         }
 
         try {
@@ -459,9 +429,6 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
         topologyExecutor.init();
 
         matrix = topologyHandler.getMatrix();
-
-        // 初始化一下配置参数
-        propertiesInit();
     }
 
     public void ruleInit() {
@@ -548,9 +515,9 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
         // Initialize table list listener that initializes all table listeners.
         tableListListener = new TableListListener(schemaName);
         tableListListener.init();
-
         // Bind a table list listener.
         MetaDbConfigManager.getInstance().bindListener(tableListDataId, tableListListener);
+
     }
 
     public void tableMetaDestroy() {
@@ -591,7 +558,7 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
         AsyncPhyObjectRecorder.register(schemaName.toLowerCase());
 
-        ddlPlanScheduler = DdlPlanScheduler.getINSTANCE();
+        DdlPlanScheduler.getINSTANCE();
     }
 
     public void ddlEngineDestroy() {
@@ -610,6 +577,74 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
     public void prepareExecutionContext(ExecutionContext context, String sql, String schema) {
         context.setTraceId("balancer");
         context.setSchemaName(schema);
+    }
+
+    public void prepareExecutionContext(ExecutionContext context, Map<String, Object> dataPassed) {
+        Object connId = dataPassed.get(SQLRecord.CONN_ID);
+        if (connId != null) {
+            context.setConnId((Long) connId);
+            context.getAsyncDDLContext().setConnId((Long) connId);
+        }
+
+        Object testMode = dataPassed.get(JobRequest.TEST_MODE);
+        if (testMode != null) {
+            context.setTestMode((Boolean) testMode);
+            context.getAsyncDDLContext().setTestMode((Boolean) testMode);
+        }
+
+        Object clientIP = dataPassed.get(SQLRecord.CLIENT_IP);
+        if (clientIP != null) {
+            context.setClientIp((String) clientIP);
+            context.getAsyncDDLContext().setClientIp((String) clientIP);
+        }
+
+        Object traceId = dataPassed.get(SQLRecord.TRACE_ID);
+        if (traceId != null) {
+            context.setTraceId((String) traceId);
+            context.getAsyncDDLContext().setTraceId((String) traceId);
+        }
+
+        Object txId = dataPassed.get(SQLRecord.TX_ID);
+        if (txId != null) {
+            context.setTxId((Long) txId);
+            context.getAsyncDDLContext().setTxId((Long) txId);
+        }
+
+        if (schemaName != null) {
+            context.setSchemaName(schemaName);
+        }
+    }
+
+    public List<ErrorMessage> performAsyncDDLJob(Job job, String schemaName, JobRequest jobRequest) {
+        try (TConnection conn = (TConnection) dataSource.getConnection()) {
+
+            prepareExecutionContext(conn.getExecutionContext(), jobRequest.getDataPassed());
+
+            if (AsyncDDLContext.isSeparateJob(job) || AsyncDDLContext.isParentJob(job)) {
+                try (ITPrepareStatement ps = conn.prepareStatement(job.getDdlStmt())) {
+                    ExecutionContext ec = conn.getExecutionContext();
+                    AsyncDDLContext asyncDDLContext = conn.getExecutionContext().getAsyncDDLContext();
+                    // Perform a job newly created or recovered.
+                    asyncDDLContext.setJob(job);
+                    ec.getExtraCmds().put(ConnectionParams.FORCE_DDL_ON_LEGACY_ENGINE.getName(), "true");
+                    ps.execute();
+                    // Return warnings if exist.
+                    if (asyncDDLContext.getExtraData() != null) {
+                        return (List<ErrorMessage>) asyncDDLContext.getExtraData().get(ExecutionContext.FAILED_MESSAGE);
+                    }
+                    return new ArrayList<>();
+                } catch (SQLException e) {
+                    throw new TddlRuntimeException(ErrorCode.ERR_DDL_JOB_ERROR, e, e.getMessage());
+                }
+            } else {
+                throw new TddlRuntimeException(ErrorCode.ERR_DDL_JOB_UNSUPPORTED, "cannot perform a sub-job '"
+                    + job.getId() + "' (parent job '"
+                    + job.getParentId()
+                    + "') separately in " + schemaName);
+            }
+        } catch (SQLException e) {
+            throw new TddlRuntimeException(ErrorCode.ERR_DDL_JOB_ERROR, e, e.getMessage());
+        }
     }
 
     public DdlContext restoreDDL(String schemaName, Long jobId) {
@@ -799,13 +834,9 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
     }
 
     public void schedulerInit() {
-        if (!ConfigDataMode.isFastMock()) {
-            scheduledJobsManager = ScheduledJobsManager.getINSTANCE();
+        if (ConfigDataMode.isPolarDbX() && !ConfigDataMode.isFastMock()) {
+            ScheduledJobsManager.getInstance();
         }
-    }
-
-    public void propertiesInit() {
-        this.dataSource.parseConnectionProperties("", TDataSource.globalConnectionProperties);
     }
 
     protected void initGroups() {
@@ -848,11 +879,6 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
     public void setAppName(String appName) {
         this.appName = appName;
-        // 为了特殊兼容TC的sql限流匹配问题,特殊识别几个appName,恶心的逻辑
-        if ("TCREAD_SLAVE2_APP".equals(appName) || "TRADE_MYSQL_RDB_MATRIX".equals(appName)
-            || "TCMISC_MYSQL".equals(appName) || "TCBUYER_APP".equals(appName) || "TC_READONLY_APP".equals(appName)) {
-            ConfigDataMode.setQuotaEscape(false);
-        }
     }
 
     public String getUnitName() {
@@ -875,6 +901,10 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
         this.sharding = sharding;
     }
 
+    public void setSubApps(List<App> subApps) {
+        this.subApps = subApps;
+    }
+
     public Matrix getMatrix() {
         return matrix;
     }
@@ -885,14 +915,6 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
     public void setTddlRule(TddlRule tddlRule) {
         this.tddlRule = tddlRule;
-    }
-
-    public String getEnv() {
-        return env;
-    }
-
-    public void setEnv(String env) {
-        this.env = env;
     }
 
     public String getSchemaName() {
@@ -915,20 +937,12 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
         return this.dataSource;
     }
 
-    public StatisticManager getStatisticManager() {
-        return statisticManager;
-    }
-
     public IServerConfigManager getServerConfigManager() {
         return serverConfigManager;
     }
 
     public void setServerConfigManager(IServerConfigManager serverConfigManager) {
         this.serverConfigManager = serverConfigManager;
-    }
-
-    public PlanManager getPlanManager() {
-        return planManager;
     }
 
     public void setShardRouterDefaultTimeZone(InternalTimeZone shardRouterDefaultTimeZone) {
@@ -948,13 +962,5 @@ public class MatrixConfigHolder extends AbstractConfigDataHolder {
 
     public StorageInfoManager getStorageInfoManager() {
         return storageInfoManager;
-    }
-
-    public IScalarSubqueryExecHelper getSubqueryExecHelper() {
-        return subqueryExecHelper;
-    }
-
-    public void setSubqueryExecHelper(IScalarSubqueryExecHelper subqueryExecHelper) {
-        this.subqueryExecHelper = subqueryExecHelper;
     }
 }

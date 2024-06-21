@@ -22,8 +22,10 @@ import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.executor.cursor.impl.ArrayResultCursor;
 import com.alibaba.polardbx.gms.metadb.table.ColumnsRecord;
 import com.alibaba.polardbx.gms.metadb.table.TableInfoManager;
+import com.alibaba.polardbx.gms.metadb.table.TablesRecord;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.alibaba.polardbx.optimizer.config.table.TableColumnUtils;
+import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 
 import java.sql.Connection;
@@ -33,13 +35,23 @@ import java.util.List;
 
 public class ResultSetHelper {
 
-    public static List<Object[]> filterOutHiddenColumns(String schemaName, String tableName, List<Object[]> rows,
-                                                        ExecutionContext ec) {
+    public static List<Object[]> processColumnInfos(String schemaName, String tableName, List<Object[]> rows,
+                                                    ExecutionContext ec) {
         List<Object[]> result = new ArrayList<>();
-        for (Object[] row: rows) {
-            if (!TableColumnUtils.isHiddenColumn(ec, schemaName, tableName, String.valueOf(row[0]))) {
-                result.add(row);
+        TableMeta tableMeta = ec.getSchemaManager(schemaName).getTable(tableName);
+        for (Object[] row : rows) {
+            String columnName = String.valueOf(row[0]);
+            // Filter out hidden columns
+            if (TableColumnUtils.isHiddenColumn(ec, schemaName, tableName, columnName)) {
+                continue;
             }
+
+            // Add extra info for logical generated column
+            if (tableMeta.getColumn(columnName).isLogicalGeneratedColumn()) {
+                row[row.length == 6 ? 5 : 6] = "LOGICAL GENERATED";
+            }
+
+            result.add(row);
         }
         return result;
     }
@@ -69,6 +81,24 @@ public class ResultSetHelper {
         try (Connection metaDbConn = MetaDbUtil.getConnection()) {
             tableInfoManager.setConnection(metaDbConn);
             return tableInfoManager.queryColumns(schemaName, tableName);
+        } catch (SQLException e) {
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_GET_CONNECTION, e, e.getMessage());
+        } finally {
+            tableInfoManager.setConnection(null);
+        }
+    }
+
+    public static TablesRecord fetchLogicalTableRecord(String schemaName, String tableName) {
+        TableInfoManager tableInfoManager = new TableInfoManager();
+
+        try (Connection metaDbConn = MetaDbUtil.getConnection()) {
+            tableInfoManager.setConnection(metaDbConn);
+            TablesRecord tableRecord = tableInfoManager.queryTable(schemaName, tableName, false);
+            if (tableRecord == null) {
+                // Check if there is an ongoing RENAME TABLE operation, so search with new table name.
+                tableRecord = tableInfoManager.queryTable(schemaName, tableName, true);
+            }
+            return tableRecord;
         } catch (SQLException e) {
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_GET_CONNECTION, e, e.getMessage());
         } finally {

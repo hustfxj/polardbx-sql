@@ -17,6 +17,9 @@
 package com.alibaba.polardbx.server.response;
 
 import com.alibaba.polardbx.Fields;
+import com.alibaba.polardbx.executor.columnar.pruning.ColumnarPruneManager;
+import com.alibaba.polardbx.executor.operator.scan.BlockCacheManager;
+import com.alibaba.polardbx.executor.operator.scan.impl.DefaultScanPreProcessor;
 import com.alibaba.polardbx.gms.engine.FileStoreStatistics;
 import com.alibaba.polardbx.net.buffer.ByteBufferHolder;
 import com.alibaba.polardbx.net.compress.IPacketOutputProxy;
@@ -28,13 +31,15 @@ import com.alibaba.polardbx.net.packet.RowDataPacket;
 import com.alibaba.polardbx.server.ServerConnection;
 import com.alibaba.polardbx.server.util.PacketUtil;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class ShowCacheStats {
+    private static final int FIELD_COUNT = FileStoreStatistics.CACHE_STATS_FIELD_COUNT;
     private static final ResultSetHeaderPacket header =
         PacketUtil.getHeader(FileStoreStatistics.CACHE_STATS_FIELD_COUNT);
     private static final FieldPacket[] fields = new FieldPacket[FileStoreStatistics.CACHE_STATS_FIELD_COUNT];
-    private static final EOFPacket eof = new EOFPacket();
+    private static final byte packetId = FIELD_COUNT + 1;
 
     static {
         int i = 0;
@@ -56,10 +61,16 @@ public class ShowCacheStats {
         fields[i] = PacketUtil.getField("HIT", Fields.FIELD_TYPE_VAR_STRING);
         fields[i++].packetId = ++packetId;
 
+        fields[i] = PacketUtil.getField("HOTHIT", Fields.FIELD_TYPE_VAR_STRING);
+        fields[i++].packetId = ++packetId;
+
         fields[i] = PacketUtil.getField("MISS", Fields.FIELD_TYPE_VAR_STRING);
         fields[i++].packetId = ++packetId;
 
         fields[i] = PacketUtil.getField("QUOTA_EXCEED", Fields.FIELD_TYPE_VAR_STRING);
+        fields[i++].packetId = ++packetId;
+
+        fields[i] = PacketUtil.getField("UNAVAILABLE_NUM", Fields.FIELD_TYPE_VAR_STRING);
         fields[i++].packetId = ++packetId;
 
         fields[i] = PacketUtil.getField("CACHE_DICTIONARY", Fields.FIELD_TYPE_VAR_STRING);
@@ -71,10 +82,11 @@ public class ShowCacheStats {
         fields[i] = PacketUtil.getField("MAX_CACHE_ENTRIES", Fields.FIELD_TYPE_VAR_STRING);
         fields[i++].packetId = ++packetId;
 
-        eof.packetId = ++packetId;
+        fields[i] = PacketUtil.getField("MAX_CACHE_SIZE", Fields.FIELD_TYPE_VAR_STRING);
+        fields[i++].packetId = ++packetId;
     }
 
-    public static void execute(ServerConnection c) {
+    public static boolean execute(ServerConnection c) {
         ByteBufferHolder buffer = c.allocate();
         IPacketOutputProxy proxy = PacketOutputProxyFactory.getInstance().createProxy(c, buffer);
         proxy.packetBegin();
@@ -87,30 +99,44 @@ public class ShowCacheStats {
             proxy = field.write(proxy);
         }
 
+        byte tmpPacketId = packetId;
         // write eof
-        proxy = eof.write(proxy);
+        if (!c.isEofDeprecated()) {
+            EOFPacket eof = new EOFPacket();
+            eof.packetId = ++tmpPacketId;
+            proxy = eof.write(proxy);
+        }
 
         // write rows
-        byte packetId = eof.packetId;
+        List<byte[][]> resultList = new ArrayList<>();
+        List<byte[][]> fileCacheStats = FileStoreStatistics.generateCacheStatsPacket();
+        byte[][] blockCacheStats = BlockCacheManager.getInstance().generateCacheStatsPacket();
+        byte[][] stripeFootCache = DefaultScanPreProcessor.getCacheStat();
+        byte[][] pruneCache = ColumnarPruneManager.getCacheStat();
+        resultList.addAll(fileCacheStats);
+        resultList.add(blockCacheStats);
+        resultList.add(pruneCache);
+        resultList.add(stripeFootCache);
 
-        List<byte[][]> resultList = FileStoreStatistics.generateCacheStatsPacket();
         if (resultList != null) {
             for (byte[][] results : resultList) {
                 RowDataPacket row = new RowDataPacket(FileStoreStatistics.CACHE_STATS_FIELD_COUNT);
                 for (byte[] result : results) {
                     row.add(result);
                 }
-                row.packetId = ++packetId;
+                row.packetId = ++tmpPacketId;
                 proxy = row.write(proxy);
             }
+
         }
 
         // write last eof
         EOFPacket lastEof = new EOFPacket();
-        lastEof.packetId = ++packetId;
+        lastEof.packetId = ++tmpPacketId;
         proxy = lastEof.write(proxy);
 
         // write buffer
         proxy.packetEnd();
+        return true;
     }
 }

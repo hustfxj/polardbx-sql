@@ -17,7 +17,7 @@
 package com.alibaba.polardbx.qatest.ddl.auto.omc;
 
 import com.alibaba.fastjson.JSONObject;
-import com.alibaba.polardbx.cdc.entity.DDLExtInfo;
+import com.alibaba.polardbx.common.cdc.entity.DDLExtInfo;
 import com.alibaba.polardbx.druid.DbType;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLCreateTableStatement;
 import com.alibaba.polardbx.druid.sql.parser.SQLStatementParser;
@@ -34,6 +34,7 @@ import net.jcip.annotations.NotThreadSafe;
 import org.apache.commons.lang.StringUtils;
 import org.junit.Assert;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runners.Parameterized;
 
@@ -44,7 +45,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
-import static com.alibaba.polardbx.cdc.SysTableUtil.CDC_DDL_RECORD_TABLE;
+import static com.alibaba.polardbx.cdc.CdcTableUtil.CDC_DDL_RECORD_TABLE;
 import static com.alibaba.polardbx.druid.sql.SQLUtils.normalize;
 import static com.alibaba.polardbx.druid.sql.parser.SQLParserUtils.createSQLStatementParser;
 import static com.alibaba.polardbx.qatest.validator.DataOperator.executeOnMysqlAndTddl;
@@ -72,19 +73,18 @@ public class ColumnOrdinalTest extends DDLBaseNewDBTestCase {
         "alter table %s change column d dd bigint after e",
         "alter table %s change column e `3` bigint after dd",
         "alter table %s change column `3` `\"f\"` int first",
-        "alter table %s change column `dd` `UNIQUE` int unique after `\"f\"`",
+        "alter table %s change column `dd` `UNIQUE` int after `\"f\"`",
     };
 
     private static final String MODIFY_COLUMNS = "a,b,c,d,e";
 
     private static final String CHANGE_COLUMNS = "a,bb,cc,`UNIQUE`,`\"f\"`";
 
-    private static final String[] MODIFY_GSI_COLUMNS = {"a", "e", "b", "c", "d"};
+    private static final String[] MODIFY_GSI_COLUMNS = {"c", "a", "b", "e", "d"};
 
-    private static final String[] CHANGE_GSI_COLUMNS = {"a", "bb", "cc", "\"f\"", "UNIQUE"};
+    private static final String[] CHANGE_GSI_COLUMNS = {"\"f\"", "UNIQUE", "cc", "a", "bb"};
 
     private static final String USE_OMC_ALGORITHM = " ALGORITHM=OMC ";
-    private static final String OMC_ALTER_TABLE_WITH_GSI = "OMC_ALTER_TABLE_WITH_GSI=TRUE";
 
     private static String buildCmdExtra(String... params) {
         if (0 == params.length) {
@@ -109,9 +109,13 @@ public class ColumnOrdinalTest extends DDLBaseNewDBTestCase {
         return true;
     }
 
+    @Before
+    public void init() {
+        setGlobalSupportInstantAddColumn(useInstantAddColumn);
+    }
+
     @Test
     public void testModifyColumnOrdinal() throws SQLException {
-        setGlobalSupportInstantAddColumn(useInstantAddColumn);
         String tableName = "omc_modify_column_ordinal_test_tbl";
         testColumnOrdinalInternal(tableName, MODIFY_PARAMS, MODIFY_COLUMNS, MODIFY_GSI_COLUMNS, true);
         testColumnOrdinalInternal(tableName, MODIFY_PARAMS, MODIFY_COLUMNS, MODIFY_GSI_COLUMNS, false);
@@ -119,7 +123,6 @@ public class ColumnOrdinalTest extends DDLBaseNewDBTestCase {
 
     @Test
     public void testChangeColumnOrdinal() throws SQLException {
-        setGlobalSupportInstantAddColumn(useInstantAddColumn);
         String tableName = "omc_change_column_ordinal_test_tbl";
         testColumnOrdinalInternal(tableName, CHANGE_PARAMS, CHANGE_COLUMNS, CHANGE_GSI_COLUMNS, true);
         testColumnOrdinalInternal(tableName, CHANGE_PARAMS, CHANGE_COLUMNS, CHANGE_GSI_COLUMNS, false);
@@ -159,7 +162,7 @@ public class ColumnOrdinalTest extends DDLBaseNewDBTestCase {
         String insert = String.format("insert into %s values (1,2,3,4,5),(6,7,8,9,10)", tableName);
         executeOnMysqlAndTddl(mysqlConnection, tddlConnection, insert, insert, null, false);
 
-        String hint = buildCmdExtra(OMC_ALTER_TABLE_WITH_GSI);
+        String hint = "";
         for (int i = 0; i < params.length; i++) {
             String alterSql = hint + String.format(params[i], tableName);
             execDdlWithRetry(tddlDatabase1, tableName, alterSql + USE_OMC_ALGORITHM, tddlConnection);
@@ -251,5 +254,40 @@ public class ColumnOrdinalTest extends DDLBaseNewDBTestCase {
             }
         }
         return new DDLExtInfo();
+    }
+
+    @Test
+    @Ignore
+    public void generatedColumnTest() {
+        String tableName = "dn_gen_col_alter_tbl";
+        dropTableIfExists(tableName);
+        String createTable =
+            String.format("create table %s (a int primary key, b int, c int as (a), d int, e int)", tableName);
+        String partDef = " partition by hash(a)";
+        JdbcUtil.executeUpdateSuccess(tddlConnection, createTable + partDef);
+
+        String alter = String.format("alter table %s modify column b bigint first, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
+
+        alter = String.format("alter table %s modify column b bigint after e, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
+
+        alter = String.format("alter table %s modify column d bigint first, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
+
+        alter = String.format("alter table %s modify column d bigint after e, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
+
+        alter = String.format("alter table %s change column b f bigint first, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
+
+        alter = String.format("alter table %s change column b f bigint after e, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
+
+        alter = String.format("alter table %s change column d f bigint first, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
+
+        alter = String.format("alter table %s change column d f bigint after e, algorithm=omc", tableName);
+        JdbcUtil.executeUpdateFailed(tddlConnection, alter, "");
     }
 }

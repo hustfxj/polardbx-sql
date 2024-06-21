@@ -22,9 +22,10 @@ import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.jdbc.RawString;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.druid.util.StringUtils;
+import com.alibaba.polardbx.optimizer.config.table.ColumnMeta;
 import com.alibaba.polardbx.optimizer.config.table.ColumnMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
-import com.alibaba.polardbx.optimizer.core.TddlOperatorTable;
 import com.alibaba.polardbx.optimizer.core.TddlRelDataTypeSystemImpl;
 import com.alibaba.polardbx.optimizer.core.TddlTypeFactoryImpl;
 import com.alibaba.polardbx.optimizer.core.datatype.BinaryType;
@@ -35,14 +36,16 @@ import com.alibaba.polardbx.optimizer.core.expression.calc.IExpression;
 import com.alibaba.polardbx.optimizer.core.field.FieldCheckLevel;
 import com.alibaba.polardbx.optimizer.core.field.SessionProperties;
 import com.alibaba.polardbx.optimizer.core.field.TypeConversionStatus;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundSpec;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundVal;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundValueKind;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundSpec;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundVal;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundValueKind;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
-import com.alibaba.polardbx.optimizer.partition.SubPartitionSpec;
+import com.alibaba.polardbx.optimizer.partition.common.PartKeyLevel;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionStrategy;
 import com.alibaba.polardbx.optimizer.partition.datatype.PartitionField;
 import com.alibaba.polardbx.optimizer.partition.datatype.PartitionFieldBuilder;
+import com.alibaba.polardbx.optimizer.partition.datatype.function.PartitionFunctionBuilder;
 import com.alibaba.polardbx.optimizer.partition.datatype.function.PartitionIntFunction;
 import com.alibaba.polardbx.optimizer.partition.exception.InvalidTypeConversionException;
 import com.alibaba.polardbx.optimizer.partition.util.StepExplainItem;
@@ -77,18 +80,6 @@ public class PartitionPrunerUtils {
         new TddlTypeFactoryImpl(TddlRelDataTypeSystemImpl.getInstance());
     protected static final RexBuilder rexBuilder = new RexBuilder(typeFactory);
 
-    protected static Map<String, PartitionIntFunction> partFuncInfo = new HashMap<>();
-
-    static {
-        partFuncInfo.put(TddlOperatorTable.YEAR.getName(), PartitionIntFunction.create(TddlOperatorTable.YEAR));
-        partFuncInfo.put(TddlOperatorTable.TO_DAYS.getName(), PartitionIntFunction.create(TddlOperatorTable.TO_DAYS));
-        partFuncInfo
-            .put(TddlOperatorTable.TO_SECONDS.getName(), PartitionIntFunction.create(TddlOperatorTable.TO_SECONDS));
-        partFuncInfo.put(TddlOperatorTable.UNIX_TIMESTAMP.getName(),
-            PartitionIntFunction.create(TddlOperatorTable.UNIX_TIMESTAMP));
-        partFuncInfo.put(TddlOperatorTable.MONTH.getName(), PartitionIntFunction.create(TddlOperatorTable.MONTH));
-    }
-
     //=========== Some tool methods for TargetDB ============
     /**
      * Full topology of one tbl : PartitionInfo.getPhysicalPartitionTopology() & PartitionInfo.getTopology()
@@ -102,7 +93,7 @@ public class PartitionPrunerUtils {
         List<TargetDB> targetDbList = new ArrayList<>();
         Map<String, Map<String, Field>> targetDbInfo = new HashMap<>();
 
-        List<PhysicalPartitionInfo> prunedParts = result.getPrunedPartitions();
+        List<PhysicalPartitionInfo> prunedParts = result.getPrunedParttions();
         for (int j = 0; j < prunedParts.size(); j++) {
             PhysicalPartitionInfo prunedPart = prunedParts.get(j);
 
@@ -151,7 +142,7 @@ public class PartitionPrunerUtils {
 
         for (int i = 0; i < results.size(); i++) {
             PartPrunedResult result = results.get(i);
-            if (result.getPrunedPartitions().isEmpty()) {
+            if (result.getPrunedParttions().isEmpty()) {
                 return phyGrpInfoMap;
             }
         }
@@ -162,7 +153,7 @@ public class PartitionPrunerUtils {
                 broadcastTopologyList.add(result.getPartInfo().getTopology());
                 continue;
             }
-            List<PhysicalPartitionInfo> prunedParts = result.getPrunedPartitions();
+            List<PhysicalPartitionInfo> prunedParts = result.getPrunedParttions();
             for (int j = 0; j < prunedParts.size(); j++) {
                 PhysicalPartitionInfo prunedPart = prunedParts.get(j);
                 String grpKey = prunedPart.getGroupKey();
@@ -225,6 +216,20 @@ public class PartitionPrunerUtils {
         return phyGrpInfoMap;
     }
 
+//    /*======= Methods for get PartitionIntFunction ========*/
+//    public static PartitionIntFunction getPartitionIntFunction(SqlOperator sqlOperator,
+//                                                               PartKeyLevel partLevel,
+//                                                               PartitionInfo partInfo) {
+//        PartitionByDefinition targetPartBy = partInfo.getPartitionBy();
+//        if (partLevel == PartKeyLevel.SUBPARTITION_KEY
+//            && partInfo.getPartitionBy().getSubPartitionBy() != null) {
+//            targetPartBy = partInfo.getPartitionBy().getSubPartitionBy();
+//        }
+//        return targetPartBy.getPartIntFunc();
+//    }
+
+    /*======== Methods for covert to TargetDB from PartPrunedResult ========*/
+
     /**
      * Convert the list of topologyInfo to TargetDB， used by cdc only
      */
@@ -258,51 +263,38 @@ public class PartitionPrunerUtils {
         return targetDbList;
     }
 
-    /*======= Methods for get PartitionIntFunction ========*/
-    public static PartitionIntFunction getPartitionIntFunction(String funcName) {
-        return partFuncInfo.get(funcName);
-    }
-
-    public static Set<String> getAllSupportedPartitionIntFunctions() {
-        return partFuncInfo.keySet();
-    }
-
     /*======== Methods for building partition bitset ========*/
 
-    public static BitSet buildPartitionsBitSetByPartPostSet(PartitionInfo partInfo, Set<Integer> postSet) {
-        BitSet partBitSet = buildEmptyPartitionsBitSet(partInfo);
-        int partCnt = partInfo.getPartitionBy().getPartitions().size();
-        setPartBitSetForPartList(partBitSet, postSet, PartKeyLevel.PARTITION_KEY, partCnt, -1, true);
+    public static BitSet buildPhyPartsBitSetByPhyPartPostSet(PartitionInfo partInfo, Set<Integer> postSet) {
+        BitSet partBitSet = buildEmptyPhysicalPartitionsBitSet(partInfo);
+        setPartBitSetForPartList(partBitSet, postSet, true);
         return partBitSet;
     }
 
-    public static BitSet buildEmptyPartitionsBitSet(PartitionInfo partInfo) {
+    public static BitSet buildEmptyPartitionsBitSetByPartRouter(PartitionRouter router) {
+        int allPartCount = router.getPartitionCount();
+        BitSet allPartBitSet = new BitSet(allPartCount);
+        return allPartBitSet;
+    }
 
-        boolean hasSubpartition = partInfo.getSubPartitionBy() != null;
-        BitSet partBitSet;
-        if (!hasSubpartition) {
-            int allPartCount = partInfo.getPartitionBy().getPartitions().size();
-            partBitSet = new BitSet(allPartCount);
-        } else {
-            throw new TddlRuntimeException(ErrorCode.ERR_PARTITION_MANAGEMENT,
-                String.format("Not support subpartition, table name is %s", partInfo.getTableName()));
-        }
+    public static BitSet buildFullScanPartitionsBitSetByPartRouter(PartitionRouter router) {
+        int allPartCount = router.getPartitionCount();
+        BitSet allPartBitSet = new BitSet(allPartCount);
+        allPartBitSet.set(0, allPartCount, true);
+        return allPartBitSet;
+    }
+
+    public static BitSet buildEmptyPhysicalPartitionsBitSet(PartitionInfo partInfo) {
+        int allPartCount = partInfo.getPartitionBy().getPhysicalPartitions().size();
+        BitSet partBitSet = new BitSet(allPartCount);
         return partBitSet;
     }
 
-    public static BitSet buildFullScanPartitionsBitSet(PartitionInfo partInfo) {
-
-        boolean hasSubpartition = partInfo.getSubPartitionBy() != null;
-        BitSet partBitSet = null;
-        if (!hasSubpartition) {
-            int allPartCount = partInfo.getPartitionBy().getPartitions().size();
-            partBitSet = new BitSet(allPartCount);
-            partBitSet.set(0, allPartCount, true);
-            return partBitSet;
-        } else {
-            throw new TddlRuntimeException(ErrorCode.ERR_PARTITION_MANAGEMENT,
-                String.format("Not support subpartition, table name is %s", partInfo.getTableName()));
-        }
+    public static BitSet buildFullPhysicalPartitionsBitSet(PartitionInfo partInfo) {
+        int allPartCount = partInfo.getPartitionBy().getPhysicalPartitions().size();
+        BitSet allPhyPartBitSet = new BitSet(allPartCount);
+        allPhyPartBitSet.set(0, allPartCount, true);
+        return allPhyPartBitSet;
     }
 
     /**
@@ -383,6 +375,23 @@ public class PartitionPrunerUtils {
         return partBitSet;
     }
 
+    public static BitSet setPartBitSetByStartEnd(BitSet partBitSet,
+                                                 Integer startPartPosi,
+                                                 Integer endPartPosi,
+                                                 boolean bitSetVal) {
+
+        int bitSetStart = 0;
+        int bitSetEnd = 0;
+        if (startPartPosi.equals(PartitionRouter.RouterResult.NO_FOUND_PARTITION_IDX) || endPartPosi
+            .equals(PartitionRouter.RouterResult.NO_FOUND_PARTITION_IDX)) {
+            return partBitSet;
+        }
+        bitSetStart = startPartPosi - 1;
+        bitSetEnd = endPartPosi - 1;
+        partBitSet.set(bitSetStart, bitSetEnd + 1, bitSetVal);
+        return partBitSet;
+    }
+
     /**
      * //--------------
      * <pre>
@@ -447,6 +456,15 @@ public class PartitionPrunerUtils {
         return partBitSet;
     }
 
+    public static BitSet setPartBitSetForPartList(BitSet partBitSet,
+                                                  Set<Integer> partPostSet,
+                                                  boolean bitSetVal) {
+        for (Integer posi : partPostSet) {
+            partBitSet.set(posi - 1, bitSetVal);
+        }
+        return partBitSet;
+    }
+
     public static Map<String, List<String>> getPartNameInfosFromBitSet(PartitionInfo partInfo, BitSet partBitSet) {
 
         Map<String, List<String>> partNameInfo = new HashMap<>();
@@ -462,7 +480,7 @@ public class PartitionPrunerUtils {
             }
         } else {
             PartitionSpec part0 = partitions.get(0);
-            List<SubPartitionSpec> subpartitions = part0.getSubPartitions();
+            List<PartitionSpec> subpartitions = part0.getSubPartitions();
             int subPartCnt = subpartitions.size();
             for (int i = 0; i < partCnt; i++) {
                 PartitionSpec ps = partitions.get(i);
@@ -470,7 +488,7 @@ public class PartitionPrunerUtils {
                 for (int j = 0; j < subPartCnt; j++) {
                     int bsIndex = i * subPartCnt + j;
                     if (partBitSet.get(bsIndex)) {
-                        SubPartitionSpec spec = subpartitions.get(j);
+                        PartitionSpec spec = subpartitions.get(j);
                         subPartNames.add(spec.getName());
                     }
                 }
@@ -580,17 +598,19 @@ public class PartitionPrunerUtils {
             evalValObj = calcExpr.eval(null, executionContext);
         }
 
-//        // list meaning this value come from IN expr.
-//        if(evalValObj instanceof List){
-//            evalValObj = ((List<?>) evalValObj).get(0);
-//        }
-
         /**
          * Try to fetch the data type from evalValObj
          */
         DataType exprDataType = exprReturnType;
         if (needGetTypeFromDynamicExpr && evalValObj != null) {
             exprDataType = DataTypeUtil.getTypeOfObject(evalValObj);
+            Object[] newV = new Object[1];
+            DataType[] newDt = new DataType[1];
+            boolean fixedValue = DataTypeUtil.fixDynamicParamObjectIfNeed(evalValObj, exprDataType, newV, newDt);
+            if (fixedValue) {
+                evalValObj = newV[0];
+                exprDataType = newDt[0];
+            }
         }
 
         /**
@@ -621,21 +641,52 @@ public class PartitionPrunerUtils {
      */
     protected static PartitionField evalPartFuncVal(PartitionField partField,
                                                     PartitionIntFunction partFunc,
+                                                    PartitionStrategy partStrategy,
                                                     ExecutionContext context,
                                                     boolean[] endpoints,
                                                     PartFieldAccessType scenario) {
 
-        Object evalObj;
+        Object evalObj = null;
         // get a session properties from context
         SessionProperties sessionProperties = SessionProperties.fromExecutionContext(context);
-        if (endpoints != null) {
-            evalObj = partFunc.evalIntEndpoint(partField, sessionProperties, endpoints);
+        DataType dataType = partFunc.getReturnType();
+        PartitionField newPartField = null;
+        boolean isBuildInFunc = PartitionFunctionBuilder.isBuildInPartFunc(partFunc);
+        if (dataType == DataTypes.LongType && isBuildInFunc) {
+            if (endpoints != null) {
+                evalObj = partFunc.evalIntEndpoint(partField, sessionProperties, endpoints);
+            } else {
+                evalObj = partFunc.evalInt(partField, sessionProperties);
+            }
+            // evalObj must be Long because it is from partFunc.evalIntEndpoint or partFunc.evalInt
+            newPartField = PartitionPrunerUtils.buildPartField(evalObj,
+                DataTypes.LongType, partFunc.getReturnType(), endpoints, context, scenario);
+
         } else {
-            evalObj = partFunc.evalInt(partField, sessionProperties);
+            List<PartitionField> fullPartColFlds = new ArrayList<>();
+            fullPartColFlds.add(partField);
+            List<PartitionField> fullParams = partFunc.getFullParamsByPartColFields(fullPartColFlds);
+            evalObj = partFunc.evalEndpoint(fullParams, sessionProperties, endpoints);
+            PartitionField partFunEvalField = PartitionPrunerUtils.buildPartField(evalObj,
+                partFunc.getReturnType(), partFunc.getReturnType(), endpoints, context, scenario);
+
+            /**
+             * <pre>
+             * For the partition definition as the following ( int_col1 and int_col2 are partition columns):
+             *    CO_HASH( right(int_col1, 4), int_col2 ) or CO_HASH( right(int_col1, 4), right(int_col1, 4) )
+             * , some substring of the eval result of right(int_col1) /left(int_col1) /substr(int_col1)
+             *  maybe a number with zero-symbol-beginning, such as
+             *      right(12000001) == "0001"
+             *  , bue the original value of int_col2 is just 1,
+             *  then the routing result of "0001" and "1" will be different if they are treated as varchar datatype objects.
+             *  so we must convert these substring of the eval result into the dateype of partColMeta for number datatype,
+             *  including tinyint/smallint/mediumint/int/bigint/decimal with scale=0
+             * </pre>
+             */
+            newPartField =
+                PartitionPrunerUtils.convertPartFuncEvalValueToPartColDataTypeIfNeed(partFunEvalField, partField,
+                    partFunc, partStrategy, context, endpoints, scenario);
         }
-        // evalObj must be Long because it is from partFunc.evalIntEndpoint or partFunc.evalInt
-        PartitionField newPartField = PartitionPrunerUtils.buildPartField(evalObj,
-            DataTypes.LongType, partFunc.getReturnType(), endpoints, context, scenario);
 
         return newPartField;
     }
@@ -746,13 +797,29 @@ public class PartitionPrunerUtils {
             newCmpKind = PartFuncMonotonicityUtil.buildComparisonKind(epInfo);
         } else {
             int invalidTypeCastPartColInddex = -1;
+            ComparisonKind exprInfoCmpKind = exprInfo.getCmpKind();
             for (int j = 0; j < partColNum; j++) {
                 searchValArr[j] =
                     PartitionPrunerUtils.evalExecAndBuildBoundValue(context, pruningCtx, predExprExecArr[j], epInfo);
                 if (searchValArr[j].isNormalValue() && !searchValArr[j].isNullValue()) {
-                    if (searchValArr[j].getValue().lastStatus() != TypeConversionStatus.TYPE_OK) {
-                        invalidTypeCastPartColInddex = j;
-                        break;
+                    TypeConversionStatus typeConvertStatus = searchValArr[j].getValue().lastStatus();
+                    if (typeConvertStatus != TypeConversionStatus.TYPE_OK) {
+                        /**
+                         * typeConvertStatus must be a type-truncated-status
+                         */
+                        if (exprInfoCmpKind == ComparisonKind.EQUAL) {
+                            /**
+                             * <pre>
+                             * For full-part-col equality predicate,
+                             * just use the truncated partFld to finish routing
+                             * </pre>
+                             *
+                             */
+                            continue;
+                        } else {
+                            invalidTypeCastPartColInddex = j;
+                            break;
+                        }
                     }
                 }
             }
@@ -763,7 +830,6 @@ public class PartitionPrunerUtils {
              * max/min value to enlarge the range..
              */
             if (invalidTypeCastPartColInddex > -1) {
-                ComparisonKind exprInfoCmpKind = exprInfo.getCmpKind();
                 PartitionBoundVal autoFillVal = null;
                 if (exprInfoCmpKind == ComparisonKind.GREATER_THAN_OR_EQUAL
                     || exprInfoCmpKind == ComparisonKind.GREATER_THAN) {
@@ -781,6 +847,10 @@ public class PartitionPrunerUtils {
                     for (int i = invalidTypeCastPartColInddex; i < partColNum; i++) {
                         searchValArr[i] = autoFillVal;
                     }
+                } else {
+                    /**
+                     * Impossible come here
+                     */
                 }
             } else {
                 newCmpKind = PartFuncMonotonicityUtil.buildComparisonKind(epInfo);
@@ -888,18 +958,8 @@ public class PartitionPrunerUtils {
                 }
             }
         }
-
-        PartPruneStepType stepType = step.getStepType();
-        if (stepType == PartPruneStepType.PARTPRUNE_OP_MATCHED_PART_KEY) {
-            PartitionPruneStepOp stepOp = (PartitionPruneStepOp) step;
-            if (stepOp.isDynamicSubQueryInStep()) {
-                return false;
-            }
-            if (stepOp.getComparisonKind() == ComparisonKind.EQUAL) {
-                return true;
-            }
-        }
-        return false;
+        boolean onlyContainEqCond = PartitionPruneStepUtil.onlyContainEqualConditionInner(false, step);
+        return onlyContainEqCond;
     }
 
     public static void logStepExplainInfo(ExecutionContext context,
@@ -916,13 +976,13 @@ public class PartitionPrunerUtils {
             explainBuilder.append("\nTraceId=").append(traceId);
             explainBuilder.append(",").append("Table=").append(dbName).append(".").append(tblName);
             if (!pruningContext.isPruningByTuple()) {
-                logStepExplainInfoInner(pruningContext.getRootStep(), 2, pruningContext.getStepExplainInfo(),
+                logStepExplainInfoInner(null, pruningContext.getRootStep(), 2, pruningContext.getStepExplainInfo(),
                     explainBuilder);
             } else {
                 PartitionTupleRouteInfo tupleRouteInfo = pruningContext.getRootTuple();
                 List<PartTupleDispatchInfo> dispatchInfos = tupleRouteInfo.getTupleDispatchFuncInfos();
                 for (int i = 0; i < dispatchInfos.size(); i++) {
-                    logStepExplainInfoInner(dispatchInfos.get(i), 2, pruningContext.getStepExplainInfo(),
+                    logStepExplainInfoInner(null, dispatchInfos.get(i), 2, pruningContext.getStepExplainInfo(),
                         explainBuilder);
                 }
             }
@@ -935,12 +995,14 @@ public class PartitionPrunerUtils {
         }
     }
 
-    private static void logStepExplainInfoInner(PartitionPruneBase current,
+    private static void logStepExplainInfoInner(Integer parentSpecPosi,
+                                                PartitionPruneBase current,
                                                 int currentLevel,
                                                 Map<Object, StepExplainItem> stepExplainInfo,
                                                 StringBuilder explainBuilder) {
 
         boolean isTuple = current instanceof PartTupleDispatchInfo;
+
         StepExplainItem item = stepExplainInfo.get(current);
         if (item == null) {
             return;
@@ -949,15 +1011,48 @@ public class PartitionPrunerUtils {
         for (int i = 0; i < currentLevel; i++) {
             explainBuilder.append(" ");
         }
+
+        if (parentSpecPosi == null) {
+            parentSpecPosi = -1;
+        }
+
+        PartPrunedResult result = item.partSpecPosiToPruneResultMap.get(parentSpecPosi);
+
         explainBuilder.append(isTuple ? "Tuple=" : "Step=");
         explainBuilder.append(item.stepDesc);
         explainBuilder.append(",");
-        explainBuilder.append("PartSet={").append(item.prunedResult.toString()).append("}");
-        if (current instanceof PartitionPruneStepCombine) {
+        if (item.useSubPartByTemp) {
+            explainBuilder.append("useSubPartTemp=true").append(",");
+        }
+        explainBuilder.append("PartSet={").append(result.toAllPhyPartBitString()).append("}");
+
+        if (current instanceof PartitionPruneSubPartStepAnd) {
+            List<PartitionPruneStep> steps = item.targetSubSteps;
+            for (int i = 0; i < steps.size(); i++) {
+                logStepExplainInfoInner(null, steps.get(i), currentLevel + 1, stepExplainInfo,
+                    explainBuilder);
+            }
+        } else if (current instanceof PartitionPruneSubPartStepOr) {
+            List<PartitionPruneStep> steps = item.targetSubSteps;
+            PartitionPruneStep subPartStep = steps.get(0);
+            List<Integer> posiList = item.prunePartSpecPosiList;
+
+            if (!item.useSubPartByTemp) {
+                for (int i = 0; i < posiList.size(); i++) {
+                    logStepExplainInfoInner(posiList.get(i), subPartStep, currentLevel + 1, stepExplainInfo,
+                        explainBuilder);
+                }
+            } else {
+                logStepExplainInfoInner(posiList.get(0), subPartStep, currentLevel + 1, stepExplainInfo,
+                    explainBuilder);
+            }
+
+        } else if (current instanceof PartitionPruneStepCombine) {
             PartitionPruneStepCombine stepCombine = (PartitionPruneStepCombine) current;
             List<PartitionPruneStep> steps = stepCombine.getSubSteps();
             for (int i = 0; i < steps.size(); i++) {
-                logStepExplainInfoInner(steps.get(i), currentLevel + 1, stepExplainInfo, explainBuilder);
+                logStepExplainInfoInner(parentSpecPosi, steps.get(i), currentLevel + 1, stepExplainInfo,
+                    explainBuilder);
             }
         }
     }
@@ -975,18 +1070,19 @@ public class PartitionPrunerUtils {
             item.stepDesc = tupleDispatchInfo.buildStepDigest(context);
             Map<Object, StepExplainItem> explainInfo = pruningContext.getStepExplainInfo();
             explainInfo.put(tupleDispatchInfo, item);
+
         } catch (Throwable ex) {
             // ignore all exception
             PRUNER_LOG.error(ex);
         }
     }
 
-    public static void collateStepExplainInfo(PartitionPruneStep step,
-                                              ExecutionContext context,
-                                              PartPrunedResult result,
-                                              PartPruneStepPruningContext pruningContext) {
+    public static StepExplainItem collateStepExplainInfo(PartitionPruneStep step,
+                                                         ExecutionContext context,
+                                                         PartPrunedResult result,
+                                                         PartPruneStepPruningContext pruningContext) {
         if (!pruningContext.isEnableLogPruning()) {
-            return;
+            return null;
         }
         try {
             StepExplainItem item = new StepExplainItem();
@@ -994,13 +1090,97 @@ public class PartitionPrunerUtils {
             if (step instanceof PartitionPruneStepOp) {
                 item.stepDesc = ((PartitionPruneStepOp) step).buildStepDigest(context);
             } else {
-                item.stepDesc = step.getStepType().getSymbol();
+                item.stepDesc = ((PartitionPruneStepCombine) step).getCombineSymbol();
             }
+            Integer parentSpecPosi = result.getParentSpecPosi();
+            if (parentSpecPosi == null) {
+                parentSpecPosi = -1;
+            }
+            item.partLevel = step.getPartLevel();
+            item.parentSpecPosiList.add(parentSpecPosi);
+            item.partSpecPosiToPruneResultMap.put(parentSpecPosi, result);
+
             Map<Object, StepExplainItem> explainInfo = pruningContext.getStepExplainInfo();
-            explainInfo.put(step, item);
+            StepExplainItem explainItem = explainInfo.get(step);
+            if (explainItem == null) {
+                explainInfo.put(step, item);
+                return item;
+            } else {
+                if (!explainItem.partSpecPosiToPruneResultMap.containsKey(parentSpecPosi)) {
+                    explainItem.parentSpecPosiList.add(parentSpecPosi);
+                    explainItem.partSpecPosiToPruneResultMap.put(parentSpecPosi, result);
+                }
+                return explainItem;
+            }
         } catch (Throwable ex) {
             // ignore all exception
             PRUNER_LOG.error(ex);
+            return null;
         }
+    }
+
+    /**
+     * <pre>
+     *
+     * Convert the computed result PartField of part function of substr/right/left to the PartFiled of PartCol
+     * which datatype is int and decimal
+     *
+     * </pre>
+     */
+    private static PartitionField convertPartFuncEvalValueToPartColDataTypeIfNeed(PartitionField partFuncEvalValFld,
+                                                                                  PartitionField partColInputFld,
+                                                                                  PartitionIntFunction partFun,
+                                                                                  PartitionStrategy partStrategy,
+                                                                                  ExecutionContext context,
+                                                                                  boolean[] endpoints,
+                                                                                  PartFieldAccessType scenario) {
+        /**
+         * <pre>
+         * For the partition definition as the following ( int_col1 and int_col2 are partition columns):
+         *    CO_HASH( right(int_col1, 4), int_col2 ) or CO_HASH( right(int_col1, 4), right(int_col1, 4) )
+         * , some substring of the eval result of right(int_col1) /left(int_col1) /substr(int_col1)
+         *  maybe a number with zero-symbol-beginning, such as
+         *      right(12000001) == "0001"
+         *  , bue the original value of int_col2 is just 1,
+         *  then the routing result of "0001" and "1" will be different if they are treated as varchar datatype objects.
+         *  so we must convert these substring of the eval result into the dateype of partColMeta for number datatype,
+         *  including tinyint/smallint/mediumint/int/bigint/decimal with scale=0
+         * </pre>
+         */
+
+        if (partStrategy != PartitionStrategy.CO_HASH) {
+            return partFuncEvalValFld;
+        }
+
+        if (!PartitionFunctionBuilder.isStringFamilyPartitionFunction(partFun.getSqlOperator().getName())) {
+            return partFuncEvalValFld;
+        }
+
+        /**
+         * The dataTYpe of partColMeta
+         */
+        DataType partColDataType = partColInputFld.dataType();
+        if (!(DataTypeUtil.isUnderBigintUnsignedType(partColDataType) || DataTypeUtil.isDecimalType(partColDataType))) {
+            return partFuncEvalValFld;
+        }
+
+        PartitionField newPartColFldReturn = PartitionFieldBuilder.createField(partColDataType);
+        if (partFuncEvalValFld.isNull()) {
+            newPartColFldReturn.setNull(true);
+            return newPartColFldReturn;
+        }
+        String strVal = partFuncEvalValFld.stringValue().toStringUtf8();
+        if (StringUtils.isEmpty(strVal)) {
+            return newPartColFldReturn;
+        }
+
+        /**
+         * The dataTYpe of partition Function return
+         */
+        DataType partFuncReturnDataType = partFuncEvalValFld.dataType();
+
+        newPartColFldReturn.store(strVal, partFuncReturnDataType);
+        processTypeConversionStatus(scenario, partFuncReturnDataType, newPartColFldReturn, endpoints);
+        return newPartColFldReturn;
     }
 }

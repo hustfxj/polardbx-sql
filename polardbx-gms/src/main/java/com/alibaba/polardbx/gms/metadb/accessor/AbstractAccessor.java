@@ -76,8 +76,15 @@ public abstract class AbstractAccessor extends AbstractLifecycle {
         if (GeneralUtil.isEmpty(names)) {
             return null;
         }
+        return concatParams(names.size());
+    }
+
+    protected String concatParams(int size) {
+        if (size == 0) {
+            return null;
+        }
         StringBuilder buf = new StringBuilder();
-        for (int i = 0; i < names.size(); i++) {
+        for (int i = 0; i < size; i++) {
             buf.append(COMMA).append(QUESTION_MARK);
         }
         return buf.deleteCharAt(0).toString();
@@ -94,6 +101,18 @@ public abstract class AbstractAccessor extends AbstractLifecycle {
         return MetaDbUtil.buildStringParameters(paramValues.toArray(new String[0]));
     }
 
+    protected Map<Integer, ParameterContext> buildParams(String tableSchema, String tableName, String indexName,
+                                                         List<String> objectNames) {
+        List<String> paramValues = new ArrayList<>();
+        paramValues.add(tableSchema);
+        paramValues.add(tableName);
+        paramValues.add(indexName);
+        if (GeneralUtil.isNotEmpty(objectNames)) {
+            paramValues.addAll(objectNames);
+        }
+        return MetaDbUtil.buildStringParameters(paramValues.toArray(new String[0]));
+    }
+
     protected Map<Integer, ParameterContext> buildParams(String tableSchema, String tableName,
                                                          List<String> objectNames, int newStatus) {
         List<String> paramValues = new ArrayList<>();
@@ -103,6 +122,18 @@ public abstract class AbstractAccessor extends AbstractLifecycle {
         if (GeneralUtil.isNotEmpty(objectNames)) {
             paramValues.addAll(objectNames);
         }
+        return MetaDbUtil.buildStringParameters(paramValues.toArray(new String[0]));
+    }
+
+    protected Map<Integer, ParameterContext> buildParams(String tableSchema, String tableName,
+                                                         List<String> objectNames, String columns) {
+        List<String> paramValues = new ArrayList<>();
+        paramValues.add(tableSchema);
+        paramValues.add(tableName);
+        if (GeneralUtil.isNotEmpty(objectNames)) {
+            paramValues.addAll(objectNames);
+        }
+        paramValues.add(columns);
         return MetaDbUtil.buildStringParameters(paramValues.toArray(new String[0]));
     }
 
@@ -150,6 +181,12 @@ public abstract class AbstractAccessor extends AbstractLifecycle {
     }
 
     protected <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
+                                                          String schemaName, String objectName, String objectName2,
+                                                          String objectName3) {
+        return query(selectSql, systemTable, clazz, schemaName, objectName, objectName2, objectName3, connection);
+    }
+
+    protected <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
                                                           String schemaName, String objectName, DataSource dataSource) {
         return query(selectSql, systemTable, clazz, schemaName, objectName, null, dataSource);
     }
@@ -167,19 +204,8 @@ public abstract class AbstractAccessor extends AbstractLifecycle {
         }
     }
 
-    protected <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
-                                                          String schemaName, String objectName, String objectName2,
-                                                          Connection connection) {
-        Map<Integer, ParameterContext> params;
-        if (TStringUtil.isNotBlank(objectName2)) {
-            params = MetaDbUtil.buildStringParameters(new String[] {schemaName, objectName, objectName2});
-        } else if (TStringUtil.isNotBlank(objectName)) {
-            params = MetaDbUtil.buildStringParameters(new String[] {schemaName, objectName});
-        } else if (TStringUtil.isNotBlank(schemaName)) {
-            params = MetaDbUtil.buildStringParameters(new String[] {schemaName});
-        } else {
-            params = null;
-        }
+    protected <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz) {
+        Map<Integer, ParameterContext> params = Maps.newHashMap();
         return query(selectSql, systemTable, clazz, params, connection);
     }
 
@@ -187,6 +213,21 @@ public abstract class AbstractAccessor extends AbstractLifecycle {
                                                           long objectId) {
         Map<Integer, ParameterContext> params = Maps.newHashMap();
         MetaDbUtil.setParameter(1, params, ParameterMethod.setLong, objectId);
+        return query(selectSql, systemTable, clazz, params, connection);
+    }
+
+    protected <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
+                                                          long objectId1, long objectId2) {
+        Map<Integer, ParameterContext> params = Maps.newHashMap();
+        MetaDbUtil.setParameter(1, params, ParameterMethod.setLong, objectId1);
+        MetaDbUtil.setParameter(2, params, ParameterMethod.setLong, objectId2);
+        return query(selectSql, systemTable, clazz, params, connection);
+    }
+
+    protected <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
+                                                          List<Long> paramList) {
+        Map<Integer, ParameterContext> params = Maps.newHashMap();
+        MetaDbUtil.setParameters(params, ParameterMethod.setLong, paramList);
         return query(selectSql, systemTable, clazz, params, connection);
     }
 
@@ -212,6 +253,46 @@ public abstract class AbstractAccessor extends AbstractLifecycle {
                                                                  Map<Integer, ParameterContext> params,
                                                                  Connection connection) {
         try {
+            return MetaDbUtil.query(selectSql, params, clazz, connection);
+        } catch (Exception e) {
+            LOGGER.error("Failed to query the system table " + systemTable, e);
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e, "query",
+                systemTable,
+                e.getMessage());
+        }
+    }
+
+    protected static <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
+                                                                 String schemaName, String objectName,
+                                                                 Connection connection) {
+        return query(selectSql, systemTable, clazz, schemaName, objectName, null, null, connection);
+    }
+
+    protected static <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
+                                                                 String schemaName, String objectName,
+                                                                 String objectName2,
+                                                                 Connection connection) {
+        return query(selectSql, systemTable, clazz, schemaName, objectName, objectName2, null, connection);
+    }
+
+    protected static <T extends SystemTableRecord> List<T> query(String selectSql, String systemTable, Class clazz,
+                                                                 String schemaName, String objectName,
+                                                                 String objectName2, String objectName3,
+                                                                 Connection connection) {
+        try {
+            Map<Integer, ParameterContext> params;
+            if (TStringUtil.isNotBlank(objectName3)) {
+                params =
+                    MetaDbUtil.buildStringParameters(new String[] {schemaName, objectName, objectName2, objectName3});
+            } else if (TStringUtil.isNotBlank(objectName2)) {
+                params = MetaDbUtil.buildStringParameters(new String[] {schemaName, objectName, objectName2});
+            } else if (TStringUtil.isNotBlank(objectName)) {
+                params = MetaDbUtil.buildStringParameters(new String[] {schemaName, objectName});
+            } else if (TStringUtil.isNotBlank(schemaName)) {
+                params = MetaDbUtil.buildStringParameters(new String[] {schemaName});
+            } else {
+                params = null;
+            }
             return MetaDbUtil.query(selectSql, params, clazz, connection);
         } catch (Exception e) {
             LOGGER.error("Failed to query the system table " + systemTable, e);

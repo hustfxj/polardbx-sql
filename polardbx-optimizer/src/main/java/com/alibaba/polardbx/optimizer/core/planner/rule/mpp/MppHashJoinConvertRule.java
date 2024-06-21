@@ -45,7 +45,6 @@ import java.util.List;
 /**
  * @author dylan
  */
-
 public class MppHashJoinConvertRule extends RelOptRule {
 
     public static final MppHashJoinConvertRule INSTANCE = new MppHashJoinConvertRule();
@@ -78,8 +77,10 @@ public class MppHashJoinConvertRule extends RelOptRule {
         }
 
         RelTraitSet emptyTraitSet = hashJoin.getCluster().getPlanner().emptyTraitSet();
-        left = convert(hashJoin.getLeft(), emptyTraitSet.replace(leftCollation).replace(MppConvention.INSTANCE));
-        right = convert(hashJoin.getRight(), emptyTraitSet.replace(rightCollation).replace(MppConvention.INSTANCE));
+        left = convert(hashJoin.getLeft(),
+            emptyTraitSet.replace(leftCollation).replace(MppConvention.INSTANCE));
+        right = convert(hashJoin.getRight(),
+            emptyTraitSet.replace(rightCollation).replace(MppConvention.INSTANCE));
 
         List<Pair<RelDistribution, Pair<RelNode, RelNode>>> implementationList = new ArrayList<>();
 
@@ -96,15 +97,17 @@ public class MppHashJoinConvertRule extends RelOptRule {
             }
         }
 
+        int leftFieldCount = left.getRowType().getFieldCount();
+        int rightFiledCount = right.getRowType().getFieldCount();
+        Mappings.TargetMapping mapping =
+            Mappings.createShiftMapping(rightFiledCount, leftFieldCount, 0, rightFiledCount);
+
         for (Pair<List<Integer>, List<Integer>> keyPair : keyPairList) {
             RelDataType keyDataType = CalciteUtils.getJoinKeyDataType(
                 hashJoin.getCluster().getTypeFactory(), hashJoin, keyPair.left, keyPair.right);
             RelNode hashLeft = RuleUtils.ensureKeyDataTypeDistribution(left, keyDataType, keyPair.left);
             RelNode hashRight = RuleUtils.ensureKeyDataTypeDistribution(right, keyDataType, keyPair.right);
-            int leftFieldCount = left.getRowType().getFieldCount();
-            int rightFiledCount = right.getRowType().getFieldCount();
-            Mappings.TargetMapping mapping =
-                Mappings.createShiftMapping(rightFiledCount, leftFieldCount, 0, rightFiledCount);
+
             implementationList.add(Pair.of(hashLeft.getTraitSet().getDistribution(), Pair.of(hashLeft, hashRight)));
             implementationList
                 .add(Pair.of(hashRight.getTraitSet().getDistribution().apply(mapping), Pair.of(hashLeft, hashRight)));
@@ -114,23 +117,27 @@ public class MppHashJoinConvertRule extends RelOptRule {
             .getBoolean(ConnectionParams.ENABLE_BROADCAST_JOIN)) {
             // Broadcast Shuffle
             switch (hashJoin.getJoinType()) {
-                case LEFT: {
-                    RelNode broadcastRight = convert(right, right.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
-                    implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(left, broadcastRight)));
-                    break;
-                }
-                case RIGHT:{
-                    RelNode broadcastLeft = convert(left, left.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
-                    implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(broadcastLeft, right)));
-                    break;
-                }
-                case INNER: {
-                    RelNode broadcastLeft = convert(left, left.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
-                    implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(broadcastLeft, right)));
-                    RelNode broadcastRight = convert(right, right.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
-                    implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(left, broadcastRight)));
-                    break;
-                }
+            case LEFT: {
+                RelNode broadcastRight =
+                    convert(right, right.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
+                implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(left, broadcastRight)));
+                break;
+            }
+            case RIGHT: {
+                RelNode broadcastLeft =
+                    convert(left, left.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
+                implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(broadcastLeft, right)));
+                break;
+            }
+            case INNER: {
+                RelNode broadcastLeft =
+                    convert(left, left.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
+                implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(broadcastLeft, right)));
+                RelNode broadcastRight =
+                    convert(right, right.getTraitSet().replace(RelDistributions.BROADCAST_DISTRIBUTED));
+                implementationList.add(Pair.of(RelDistributions.ANY, Pair.of(left, broadcastRight)));
+                break;
+            }
             }
         }
 

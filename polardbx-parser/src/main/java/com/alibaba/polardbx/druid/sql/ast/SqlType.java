@@ -27,11 +27,28 @@ public enum SqlType {
     SHOW(11),
     EXPLAIN(16),
     DESC(18),
+    SHOW_CONVERT_TABLE_MODE(19),
 
+    /**
+     * insert select
+     */
     INSERT_INTO_SELECT(45),
 
     COMMIT(55),
-    ROLLBACK(56);
+    ROLLBACK(56),
+
+    /**
+     * ddl
+     */
+
+    CREATE(80),
+    DROP(81),
+    TRUNCATE(82),
+    PURGE(83),
+    ALTER(84),
+    GENERIC_DDL(85),
+    UNARCHIVE(86),
+    ARCHIVE(86);
 
     private int i;
 
@@ -59,6 +76,17 @@ public enum SqlType {
             || sqlType.equals(DELETE)
             || sqlType.equals(REPLACE)
             || sqlType.equals(INSERT_INTO_SELECT));
+    }
+
+    public static boolean isDDL(SqlType sqlType) {
+        return sqlType != null
+            && (sqlType.equals(DROP)
+            || sqlType.equals(CREATE)
+            || sqlType.equals(TRUNCATE)
+            || sqlType.equals(PURGE)
+            || sqlType.equals(ALTER)
+            || sqlType.equals(GENERIC_DDL)
+            || sqlType.equals(UNARCHIVE));
     }
 
 }

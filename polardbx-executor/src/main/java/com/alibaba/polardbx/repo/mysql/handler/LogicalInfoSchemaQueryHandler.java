@@ -65,7 +65,6 @@ import com.alibaba.polardbx.optimizer.core.row.Row;
 import com.alibaba.polardbx.optimizer.metadata.InfoSchemaCommon;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
-import com.alibaba.polardbx.optimizer.view.ViewManager;
 import com.alibaba.polardbx.repo.mysql.spi.MyPhyQueryCursor;
 import com.alibaba.polardbx.rule.TableRule;
 import org.apache.calcite.rel.RelNode;
@@ -86,6 +85,7 @@ import org.apache.calcite.sql.fun.SqlCountAggFunction;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.commons.lang.StringUtils;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
@@ -380,11 +380,13 @@ public abstract class LogicalInfoSchemaQueryHandler extends HandlerCommon {
                 infoSchemaContext.getExecutionContext());
 
             boolean needRemoveGsi = false;
+            boolean needRemoveColumnar = false;
             boolean needRemoveNonPublic = false;
 
                 try {
                     TableMeta tableMeta = schemaManager.getTable(tableName);
                     needRemoveGsi = tableMeta.isGsi();
+                    needRemoveColumnar = tableMeta.isColumnar();
                     needRemoveNonPublic = tableMeta.getStatus() != TableStatus.PUBLIC;
                     tablesAutoPartInfo.put(tableName, tableMeta.isAutoPartition());
                 } catch (Throwable t) {
@@ -393,7 +395,7 @@ public abstract class LogicalInfoSchemaQueryHandler extends HandlerCommon {
             }
 
             if (isRecycleBinTable || isTableWithoutPrivileges || needRemoveGsi || needRemoveNonPublic
-                || isTruncateTmpTable) {
+                || isTruncateTmpTable || needRemoveColumnar) {
                 iter.remove();
             }
         }
@@ -408,6 +410,9 @@ public abstract class LogicalInfoSchemaQueryHandler extends HandlerCommon {
                 likeExpr = likeExpr.substring(1, likeExpr.length() - 1);
             }
         }
+
+        boolean enableLowerCase =
+            executionContext.getParamManager().getBoolean(ConnectionParams.ENABLE_LOWER_CASE_TABLE_NAMES);
 
         List<Object[]> result = new ArrayList<>();
         for (String table : tableNames) {
@@ -428,9 +433,9 @@ public abstract class LogicalInfoSchemaQueryHandler extends HandlerCommon {
                 if (tablesAutoPartInfo.get(table) != null) {
                     autoPart = tablesAutoPartInfo.get(table) ? "YES" : "NO";
                 }
-                result.add(new Object[] {table, type, autoPart});
+                result.add(new Object[] {enableLowerCase ? StringUtils.lowerCase(table) : table, type, autoPart});
             } else {
-                result.add(new Object[] {table});
+                result.add(new Object[] {enableLowerCase ? StringUtils.lowerCase(table) : table});
             }
         }
 
@@ -1052,8 +1057,6 @@ public abstract class LogicalInfoSchemaQueryHandler extends HandlerCommon {
     }
 
     private TGroupDataSource getGroupDataSource(String groupName, LogicalInfoSchemaContext infoSchemaContext) {
-        TGroupDataSource defaultGroupDataSource = null;
-
         OptimizerContext optimizerContext = infoSchemaContext.getOptimizerContext();
 
         if (TStringUtil.isEmpty(groupName)) {
@@ -1061,9 +1064,7 @@ public abstract class LogicalInfoSchemaQueryHandler extends HandlerCommon {
         }
 
         DataSource dataSource = infoSchemaContext.getRealRepo().getDataSource(groupName);
-
-        defaultGroupDataSource = (TGroupDataSource) dataSource;
-        return defaultGroupDataSource;
+        return (TGroupDataSource) dataSource;
     }
 
     private TAtomDsConfDO getAtomRuntimeConfig(TGroupDataSource groupDataSource) {

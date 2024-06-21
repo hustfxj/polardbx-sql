@@ -81,8 +81,7 @@ public class HybridHashJoinExecutorFactory extends ExecutorFactory {
                 IExpression otherCondition = convertExpression(otherCond, context);
 
                 List<EquiJoinKey> joinKeys = EquiJoinUtils
-                    .buildEquiJoinKeys(join, join.getOuter(), join.getInner(), (RexCall) equalCond, join.getJoinType(),
-                        true);
+                    .buildEquiJoinKeys(join, join.getOuter(), join.getInner(), (RexCall) equalCond, join.getJoinType());
                 List<IExpression> antiJoinOperands = null;
                 if (operands != null && join.getJoinType() == JoinRelType.ANTI && !operands.isEmpty()) {
                     antiJoinOperands =
@@ -92,10 +91,7 @@ public class HybridHashJoinExecutorFactory extends ExecutorFactory {
                     new HybridHashJoinExec(outerInput, inner, join.getJoinType(), maxOneRow,
                         joinKeys, otherCondition, antiJoinOperands, context, parallelism, i, bucketNum,
                         spillerFactory);
-                exec.setId(join.getRelatedId());
-                if (context.getRuntimeStatistics() != null) {
-                    RuntimeStatHelper.registerStatForExec(join, exec, context);
-                }
+                registerRuntimeStat(exec, join, context);
                 executors.add(exec);
             }
         }

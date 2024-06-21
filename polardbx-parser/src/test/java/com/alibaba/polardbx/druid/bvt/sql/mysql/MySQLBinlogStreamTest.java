@@ -7,6 +7,9 @@ import org.apache.commons.lang3.StringUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
+/**
+ *
+ */
 public class MySQLBinlogStreamTest extends MysqlTest {
     @Test
     public void test_0() {
@@ -38,14 +41,6 @@ public class MySQLBinlogStreamTest extends MysqlTest {
         SQLStatement stmt = parse(sql);
         String output = SQLUtils.toMySqlString(stmt);
         Assert.assertEquals("SHOW MASTER LOGS WITH 'stream1'", output);
-    }
-
-    @Test
-    public void test_4() {
-        String sql = "show binlog events with 'stream1'";
-        SQLStatement stmt = parse(sql);
-        String output = SQLUtils.toMySqlString(stmt);
-        Assert.assertEquals("SHOW BINLOG EVENTS WITH 'stream1'", output);
     }
 
     @Test
@@ -90,10 +85,10 @@ public class MySQLBinlogStreamTest extends MysqlTest {
 
     @Test
     public void test_10() {
-        String sql = "show binlog events with 'stream1' in 'binlog.000001' from 128 limit 10,20";
+        String sql = "show binlog events in 'group1_stream_0_binlog.000001' from 128 limit 10,20";
         SQLStatement stmt = parse(sql);
         String output = SQLUtils.toMySqlString(stmt);
-        Assert.assertEquals("SHOW BINLOG EVENTS WITH 'stream1' IN 'binlog.000001' FROM 128 LIMIT 10, 20", output);
+        Assert.assertEquals("SHOW BINLOG EVENTS IN 'group1_stream_0_binlog.000001' FROM 128 LIMIT 10, 20", output);
     }
 
 }

@@ -16,7 +16,10 @@
 
 package com.alibaba.polardbx.optimizer.view;
 
+import com.alibaba.polardbx.common.jdbc.ParameterContext;
+import com.alibaba.polardbx.common.jdbc.RawString;
 import com.alibaba.polardbx.optimizer.core.DrdsConvention;
+import com.alibaba.polardbx.optimizer.core.function.calc.scalar.filter.Like;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.AbstractRelNode;
@@ -29,11 +32,18 @@ import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.commons.collections.CollectionUtils;
+import org.jetbrains.annotations.NotNull;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 /**
@@ -48,6 +58,18 @@ public class VirtualView extends AbstractRelNode {
     private Map<Integer, List<Object>> index = new HashMap<>();
 
     private Map<Integer, Object> like = new HashMap<>();
+
+    public static class ColumnDef {
+        public final String name;
+        public final int index;
+        public final SqlTypeName type;
+
+        public ColumnDef(String name, int index, SqlTypeName type) {
+            this.name = name;
+            this.index = index;
+            this.type = type;
+        }
+    }
 
     protected VirtualView(RelOptCluster cluster, RelTraitSet traitSet, VirtualViewType virtualViewType) {
         super(cluster, traitSet);
@@ -99,6 +121,8 @@ public class VirtualView extends AbstractRelNode {
             return new InformationSchemaInformationSchemaColumns(cluster, traitSet);
         case STATISTICS:
             return new InformationSchemaStatistics(cluster, traitSet);
+        case STATISTICS_DATA:
+            return new InformationSchemaStatisticsData(cluster, traitSet);
         case SCHEMATA:
             return new InformationSchemaSchemata(cluster, traitSet);
         case TABLES:
@@ -129,6 +153,10 @@ public class VirtualView extends AbstractRelNode {
             return new InformationSchemaTriggers(cluster, traitSet);
         case ROUTINES:
             return new InformationSchemaRoutines(cluster, traitSet);
+        case CHECK_ROUTINES:
+            return new InformationSchemaCheckRoutines(cluster, traitSet);
+        case JAVA_FUNCTIONS:
+            return new InformationSchemaJavaFunctions(cluster, traitSet);
         case COLUMN_PRIVILEGES:
             return new InformationSchemaColumnPrivileges(cluster, traitSet);
         case FILES:
@@ -139,12 +167,18 @@ public class VirtualView extends AbstractRelNode {
             return new InformationSchemaGlobalVariables(cluster, traitSet);
         case KEY_COLUMN_USAGE:
             return new InformationSchemaKeyColumnUsage(cluster, traitSet);
+        case OPTIMIZER_ALERT:
+            return new InformationSchemaOptimizerAlert(cluster, traitSet);
         case OPTIMIZER_TRACE:
             return new InformationSchemaOptimizerTrace(cluster, traitSet);
+        case TRACE:
+            return new InformationSchemaTrace(cluster, traitSet);
         case PARAMETERS:
             return new InformationSchemaParameters(cluster, traitSet);
         case PARTITIONS:
             return new InformationSchemaPartitions(cluster, traitSet);
+        case PARTITIONS_META:
+            return new InformationSchemaPartitionsMeta(cluster, traitSet);
         case LOCAL_PARTITIONS:
             return new InformationSchemaLocalPartitions(cluster, traitSet);
         case LOCAL_PARTITIONS_SCHEDULE:
@@ -241,11 +275,17 @@ public class VirtualView extends AbstractRelNode {
             return new InformationSchemaQueryInfo(cluster, traitSet);
         case GLOBAL_INDEXES:
             return new InformationSchemaGlobalIndexes(cluster, traitSet);
+        case COLUMNAR_INDEX_STATUS:
+            return new InformationSchemaColumnarIndexStatus(cluster, traitSet);
+        case COLUMNAR_STATUS:
+            return new InformationSchemaColumnarStatus(cluster, traitSet);
         case METADATA_LOCK:
             return new InformationSchemaMetadataLock(cluster, traitSet);
 
         case STORAGE:
             return new InformationSchemaStorage(cluster, traitSet);
+        case STORAGE_STATUS:
+            return new InformationSchemaStorageStatus(cluster, traitSet);
         case STORAGE_REPLICAS:
             return new InformationSchemaStorageReplicas(cluster, traitSet);
         case FULL_STORAGE:
@@ -260,6 +300,8 @@ public class VirtualView extends AbstractRelNode {
             return new InformationSchemaTableDetail(cluster, traitSet);
         case LOCALITY_INFO:
             return new InformationSchemaLocalityInfo(cluster, traitSet);
+        case STORAGE_POOL_INFO:
+            return new InformationSchemaStoragePoolInfo(cluster, traitSet);
         case MOVE_DATABASE:
             return new InformationSchemaMoveDatabase(cluster, traitSet);
         case PHYSICAL_PROCESSLIST:
@@ -292,6 +334,12 @@ public class VirtualView extends AbstractRelNode {
             return new InformationSchemaDdlPlan(cluster, traitSet);
         case REBALANCE_BACKFILL:
             return new InformationSchemaRebalanceBackFill(cluster, traitSet);
+        case REBALANCE_PROGRESS:
+            return new InformationSchemaRebalanceProgress(cluster, traitSet);
+        case CREATE_DATABASE_AS_BACKFILL:
+            return new InformationSchemaCreateDatabaseAsBackfill(cluster, traitSet);
+        case CREATE_DATABASE:
+            return new InformationSchemaCreateDatabase(cluster, traitSet);
         case STATEMENTS_SUMMARY:
             return new InformationSchemaStatementSummary(cluster, traitSet);
         case STATEMENTS_SUMMARY_HISTORY:
@@ -312,6 +360,20 @@ public class VirtualView extends AbstractRelNode {
             return new InformationSchemaFunctionCacheCapacity(cluster, traitSet);
         case PUSHED_FUNCTION:
             return new InformationSchemaPushedFunction(cluster, traitSet);
+        case TABLE_ACCESS:
+            return new InformationSchemaTableAccess(cluster, traitSet);
+        case TABLE_JOIN_CLOSURE:
+            return new InformationSchemaTableJoinClosure(cluster, traitSet);
+        case POLARDBX_TRX:
+            return new InformationSchemaPolardbxTrx(cluster, traitSet);
+        case STORAGE_PROPERTIES:
+            return new InformationSchemaStorageProperties(cluster, traitSet);
+        case PREPARED_TRX_BRANCH:
+            return new InformationSchemaPreparedTrxBranch(cluster, traitSet);
+        case REPLICA_STAT:
+            return new InformationSchemaReplicaStat(cluster, traitSet);
+        case SHOW_HELP:
+            return new InformationSchemaShowHelp(cluster, traitSet);
         default:
             throw new AssertionError();
         }
@@ -324,6 +386,17 @@ public class VirtualView extends AbstractRelNode {
         newVirtualView.like = new HashMap<>();
         newVirtualView.like.putAll(this.like);
         return newVirtualView;
+    }
+
+    public void copyFilters(VirtualView virtualView) {
+        final List<Integer> indexList = this.indexableColumnList();
+        final List<Integer> rhsIndexList = virtualView.indexableColumnList();
+        assert indexList.size() == rhsIndexList.size();
+
+        for (int i = 0; i < indexList.size(); i++) {
+            index.put(indexList.get(i), virtualView.index.get(rhsIndexList.get(i)));
+            like.put(indexList.get(i), virtualView.like.get(rhsIndexList.get(i)));
+        }
     }
 
     public VirtualViewType getVirtualViewType() {
@@ -405,6 +478,10 @@ public class VirtualView extends AbstractRelNode {
 
     boolean indexableColumn(int i) {
         return false;
+    }
+
+    List<Integer> indexableColumnList() {
+        return Collections.emptyList();
     }
 
     private void addIndexItem(int i, Object o) {
@@ -497,6 +574,7 @@ public class VirtualView extends AbstractRelNode {
                 for (RexNode rex : currentCondition.getOperands()) {
                     pushFilter(rex);
                 }
+                break;
             }
             default: {
                 return;
@@ -504,5 +582,84 @@ public class VirtualView extends AbstractRelNode {
             }
         }
 
+    }
+
+    /**
+     * Apply filters for index column with universal set provided.
+     * Assuming the type of column is String now.
+     */
+    public Set<String> applyFilters(int index, Map<Integer, ParameterContext> params,
+                                    @NotNull Set<String> universalSet) {
+        Set<String> filterValues = getEqualsFilterValues(index, params);
+        String likeClause = getLikeString(index, params);
+
+        if (!filterValues.isEmpty()) {
+            universalSet = universalSet.stream()
+                .filter(schemaName -> filterValues.contains(schemaName.toLowerCase()))
+                .collect(Collectors.toCollection(
+                    () -> new TreeSet<>(String::compareToIgnoreCase)
+                ));
+        }
+
+        if (likeClause != null) {
+            universalSet = universalSet.stream()
+                .filter(schemaName -> new Like().like(schemaName, likeClause))
+                .collect(Collectors.toCollection(
+                    () -> new TreeSet<>(String::compareToIgnoreCase)
+                ));
+        }
+
+        return universalSet;
+    }
+
+    /**
+     * For string params equals or IN filter clause, return the set of filtered param values
+     *
+     * @param index column index of this view
+     * @param params ParamsMap
+     * @return the set of filtered param value. return empty set if there are no filters in this column
+     */
+    @NotNull
+    public Set<String> getEqualsFilterValues(int index, Map<Integer, ParameterContext> params) {
+        List<Object> indexList = this.getIndex().get(index);
+
+        Set<String> filterValues = new HashSet<>();
+        if (CollectionUtils.isNotEmpty(indexList)) {
+            for (Object obj : indexList) {
+                if (obj instanceof RexDynamicParam) {
+                    Object value = params.get(((RexDynamicParam) obj).getIndex() + 1).getValue();
+                    if (value instanceof RawString) {
+                        for (Object o : ((RawString) value).getObjList()) {
+                            filterValues.add(String.valueOf(o).toLowerCase());
+                        }
+                    } else {
+                        String tableName = String.valueOf(value);
+                        filterValues.add(tableName.toLowerCase());
+                    }
+                } else if (obj instanceof RexLiteral) {
+                    String tableName = ((RexLiteral) obj).getValueAs(String.class);
+                    filterValues.add(tableName.toLowerCase());
+                } else if (obj instanceof RawString) {
+                    for (Object o : ((RawString) obj).getObjList()) {
+                        assert !(o instanceof List);
+                        filterValues.add(o.toString().toLowerCase());
+                    }
+                }
+            }
+        }
+
+        return filterValues;
+    }
+
+    public String getLikeString(int index, Map<Integer, ParameterContext> params) {
+        Object likeValue = this.getLike().get(index);
+        if (likeValue != null) {
+            if (likeValue instanceof RexDynamicParam) {
+                return String.valueOf(params.get(((RexDynamicParam) likeValue).getIndex() + 1).getValue());
+            } else if (likeValue instanceof RexLiteral) {
+                return ((RexLiteral) likeValue).getValueAs(String.class);
+            }
+        }
+        return null;
     }
 }

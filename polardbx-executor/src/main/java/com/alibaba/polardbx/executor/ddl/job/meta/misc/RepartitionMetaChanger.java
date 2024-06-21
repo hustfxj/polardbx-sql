@@ -16,14 +16,17 @@
 
 package com.alibaba.polardbx.executor.ddl.job.meta.misc;
 
+import com.alibaba.polardbx.common.ddl.foreignkey.ForeignKeyData;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
+import com.alibaba.polardbx.gms.metadb.table.ColumnsRecord;
 import com.alibaba.polardbx.gms.metadb.table.IndexesRecord;
 import com.alibaba.polardbx.gms.metadb.table.TableInfoManager;
 import com.alibaba.polardbx.gms.metadb.table.TablesExtRecord;
 import com.alibaba.polardbx.gms.partition.TablePartitionRecord;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager;
-import com.alibaba.polardbx.optimizer.partition.PartitionTableType;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionTableType;
+import com.google.common.collect.ImmutableList;
 import org.apache.commons.lang3.StringUtils;
 
 import java.sql.Connection;
@@ -150,7 +153,6 @@ public class RepartitionMetaChanger {
         final TableInfoManager tableInfoManager,
         final GsiMetaManager.TableType primaryTableType) {
 
-
         String random = UUID.randomUUID().toString();
 
         List<TablePartitionRecord> sourceTablePartition =
@@ -219,6 +221,16 @@ public class RepartitionMetaChanger {
         tableInfoManager.updateTablePartitionsVersion(schemaName, tableName, tablePartition.get(0).metaVersion + 1);
     }
 
+    public static void changeTableMeta4ForeignKey(Connection metaDbConn,
+                                                  List<ForeignKeyData> fks) {
+        TableInfoManager tableInfoManager = new TableInfoManager();
+        tableInfoManager.setConnection(metaDbConn);
+
+        for (ForeignKeyData fk : fks) {
+            tableInfoManager.dropForeignKeys(fk.schema, fk.tableName, ImmutableList.of(fk.indexName));
+        }
+    }
+
     /**
      * for alter table partitions count
      */
@@ -236,7 +248,36 @@ public class RepartitionMetaChanger {
                 cutOverIndexes(metaDbConn, schemaName, logicalTableName, tableName, newTableName);
             } else {
                 // primary table
-                cutOver(metaDbConn, schemaName, tableName, newTableName, false, false, true,false);
+                cutOver(metaDbConn, schemaName, tableName, newTableName, false, false, true, false);
+            }
+        });
+    }
+
+    /**
+     * for alter table modify sharding key or add drop primary key
+     */
+    public static void alterTaleModifyColumnCutOver(Connection metaDbConn,
+                                                    final String schemaName,
+                                                    final String logicalTableName,
+                                                    Map<String, String> tableNameMap,
+                                                    boolean autoPartition,
+                                                    boolean single,
+                                                    boolean broadcast) {
+        // 1. cut over table_partitions meta and local indexes meta
+        // 2. cut over global indexes meta
+        // 3. cut over columns meta
+        // 4. recover primary table auto_partition flag
+        tableNameMap.forEach((tableName, newTableName) -> {
+            if (!StringUtils.equalsIgnoreCase(tableName, logicalTableName)) {
+                // index table
+                cutOver(metaDbConn, schemaName, tableName, newTableName, false, false, false, true);
+                cutOverIndexes(metaDbConn, schemaName, logicalTableName, tableName, newTableName);
+                cutOverColumns(metaDbConn, schemaName, tableName, newTableName);
+            } else {
+                // primary table
+                cutOver(metaDbConn, schemaName, tableName, newTableName, single, broadcast, autoPartition,
+                    false);
+                cutOverColumns(metaDbConn, schemaName, tableName, newTableName);
             }
         });
     }
@@ -269,6 +310,14 @@ public class RepartitionMetaChanger {
                 throw new TddlNestableRuntimeException(msgContent);
             }
 
+            // update index status   public --- write only
+            tableInfoManager.updateIndexesStatus(schemaName, sourceIndexName, targetTableIndex.get(0).indexStatus);
+            tableInfoManager.updateIndexesStatus(schemaName, targetIndexName, sourceTableIndex.get(0).indexStatus);
+
+            // update flag
+            tableInfoManager.updateIndexesFlag(schemaName, sourceIndexName, targetTableIndex.get(0).flag);
+            tableInfoManager.updateIndexesFlag(schemaName, targetIndexName, sourceTableIndex.get(0).flag);
+
             // cut over
             tableInfoManager.alterPartitionCountCutOver(schemaName, sourceIndexName, random);
             tableInfoManager.alterPartitionCountCutOver(schemaName, targetIndexName, sourceIndexName);
@@ -280,6 +329,50 @@ public class RepartitionMetaChanger {
 
             tableInfoManager.updateIndexesVersion(schemaName, sourceIndexName, newVersion);
             tableInfoManager.updateIndexesVersion(schemaName, targetIndexName, newVersion);
+
+        } finally {
+            tableInfoManager.setConnection(null);
+        }
+    }
+
+    public static void cutOverColumns(Connection metaDbConn,
+                                      final String schemaName,
+                                      final String sourceTableName,
+                                      final String targetTableName) {
+        TableInfoManager tableInfoManager = new TableInfoManager();
+        tableInfoManager.setConnection(metaDbConn);
+
+        try {
+            String random = UUID.randomUUID().toString();
+
+            // validate
+            List<ColumnsRecord> sourceTableColumns = tableInfoManager.queryColumns(schemaName, sourceTableName);
+            if (sourceTableColumns == null || sourceTableColumns.isEmpty()) {
+                String msgContent = String.format("Table'%s.%s' doesn't exist", schemaName, sourceTableName);
+                throw new TddlNestableRuntimeException(msgContent);
+            }
+
+            List<ColumnsRecord> targetTableColumns = tableInfoManager.queryColumns(schemaName, targetTableName);
+            if (targetTableColumns == null || targetTableColumns.isEmpty()) {
+                String msgContent = String.format("Table'%s.%s' doesn't exist", schemaName, targetTableName);
+                throw new TddlNestableRuntimeException(msgContent);
+            }
+
+            for (ColumnsRecord columnsRecord : targetTableColumns) {
+                if (columnsRecord.columnMappingName != null) {
+                    tableInfoManager.updateColumnMappingName(schemaName, targetTableName, columnsRecord.columnName,
+                        null);
+                    if (!columnsRecord.columnMappingName.isEmpty()) {
+                        tableInfoManager.updateColumnMappingName(schemaName, sourceTableName,
+                            columnsRecord.columnMappingName, columnsRecord.columnName);
+                    }
+                }
+            }
+
+            // cut over
+            tableInfoManager.alterModifyColumnCutOver(schemaName, sourceTableName, random);
+            tableInfoManager.alterModifyColumnCutOver(schemaName, targetTableName, sourceTableName);
+            tableInfoManager.alterModifyColumnCutOver(schemaName, random, targetTableName);
 
         } finally {
             tableInfoManager.setConnection(null);

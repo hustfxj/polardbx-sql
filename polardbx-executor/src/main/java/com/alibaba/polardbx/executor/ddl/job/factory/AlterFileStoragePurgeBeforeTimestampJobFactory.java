@@ -18,8 +18,6 @@ package com.alibaba.polardbx.executor.ddl.job.factory;
 
 import com.alibaba.polardbx.common.Engine;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
-import com.alibaba.polardbx.common.exception.TddlRuntimeException;
-import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.logger.Logger;
@@ -36,6 +34,7 @@ import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
 import com.alibaba.polardbx.executor.handler.ddl.LogicalRenameTableHandler;
 import com.alibaba.polardbx.gms.engine.FileStorageFilesMetaRecord;
+import com.alibaba.polardbx.gms.engine.FileStorageMetaStore;
 import com.alibaba.polardbx.gms.metadb.GmsSystemTables;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
 import com.alibaba.polardbx.gms.metadb.table.FilesRecord;
@@ -56,6 +55,10 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TimeZone;
+import java.util.stream.Collectors;
+
+import static com.alibaba.polardbx.executor.common.RecycleBin.FILE_STORAGE_PREFIX;
 import java.util.stream.Collectors;
 
 import static com.alibaba.polardbx.executor.common.RecycleBin.FILE_STORAGE_PREFIX;
@@ -69,8 +72,8 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
     private AlterFileStoragePreparedData alterFileStoragePreparedData;
 
     public AlterFileStoragePurgeBeforeTimestampJobFactory(
-            AlterFileStoragePreparedData alterFileStoragePreparedData,
-            ExecutionContext executionContext) {
+        AlterFileStoragePreparedData alterFileStoragePreparedData,
+        ExecutionContext executionContext) {
         this.executionContext = executionContext;
         this.alterFileStoragePreparedData = alterFileStoragePreparedData;
     }
@@ -84,14 +87,21 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
     protected ExecutableDdlJob doCreate() {
         Engine engine = Engine.of(alterFileStoragePreparedData.getFileStorageName());
         Timestamp timestamp = Timestamp.valueOf(alterFileStoragePreparedData.getTimestamp());
-        long ts = timestamp.getTime() << BITS_LOGICAL_TIME;
-        if (ts < 0) {
-            throw new IllegalArgumentException("timestamp should greater than 1970-01-01 00:00:01");
+
+        TimeZone fromTimeZone;
+        if (executionContext.getTimeZone() != null) {
+            fromTimeZone = executionContext.getTimeZone().getTimeZone();
+        } else {
+            fromTimeZone = TimeZone.getDefault();
         }
+
+        long ts =
+            OSSTaskUtils.getTsFromTimestampWithTimeZone(alterFileStoragePreparedData.getTimestamp(), fromTimeZone);
 
         // ensure purge do not affect backup
         int backupOssPeriodInDay = executionContext.getParamManager().getInt(ConnectionParams.BACKUP_OSS_PERIOD);
-        final ITimestampOracle timestampOracle = executionContext.getTransaction().getTransactionManagerUtil().getTimestampOracle();
+        final ITimestampOracle timestampOracle =
+            executionContext.getTransaction().getTransactionManagerUtil().getTimestampOracle();
         if (null == timestampOracle) {
             throw new UnsupportedOperationException("Do not support timestamp oracle");
         }
@@ -152,10 +162,13 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
 
             for (int i = 0; i < toDeleteFileRecordList.size(); i++) {
                 FilesRecord filesRecord = toDeleteFileRecordList.get(i);
-                if (schemaName.equals(filesRecord.getLogicalSchemaName()) && logicalTableName.equals(filesRecord.getLogicalTableName())) {
+                if (schemaName.equals(filesRecord.getLogicalSchemaName()) && logicalTableName.equals(
+                    filesRecord.getLogicalTableName())) {
                     currentFilesRecordList.add(filesRecord);
                 } else {
-                    DropOssFilesTask dropOssFilesTask = new DropOssFilesTask(engine.name(), schemaName, logicalTableName, currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
+                    DropOssFilesTask dropOssFilesTask =
+                        new DropOssFilesTask(engine.name(), schemaName, logicalTableName,
+                            currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
                     taskList.add(dropOssFilesTask);
                     schemaName = filesRecord.getLogicalSchemaName();
                     logicalTableName = filesRecord.getLogicalTableName();
@@ -166,7 +179,8 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
             }
 
             if (!currentFilesRecordList.isEmpty()) {
-                DropOssFilesTask dropOssFilesTask = new DropOssFilesTask(engine.name(), schemaName, logicalTableName, currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
+                DropOssFilesTask dropOssFilesTask = new DropOssFilesTask(engine.name(), schemaName, logicalTableName,
+                    currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
                 taskList.add(dropOssFilesTask);
             }
         }
@@ -175,7 +189,8 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
         taskList.addAll(buildRecycleBinPurgeBeforeTimestamp(engine, timestamp, executionContext));
 
         if (!toDeleteFileMeta.isEmpty()) {
-            taskList.add(new DeleteOssFilesTask(engine.name(), DefaultDbSchema.NAME, toDeleteFileMeta.stream().map(x -> x.fileName).collect(Collectors.toSet())));
+            taskList.add(new DeleteOssFilesTask(engine.name(), DefaultDbSchema.NAME,
+                toDeleteFileMeta.stream().map(x -> x.fileName).collect(Collectors.toSet())));
         }
 
         for (Pair<String, String> pair : schemaTablePair) {
@@ -191,14 +206,17 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
         return executableDdlJob;
     }
 
-    public static List<DdlTask> buildRecycleBinPurgeBeforeTimestamp(Engine engine, Timestamp ts, ExecutionContext executionContext) {
+    public static List<DdlTask> buildRecycleBinPurgeBeforeTimestamp(Engine engine, Timestamp ts,
+                                                                    ExecutionContext executionContext) {
         try (Connection conn = MetaDbDataSource.getInstance().getConnection()) {
             List<DdlTask> ddlTasks = new ArrayList<>();
             TableInfoManager tableInfoManager = new TableInfoManager();
             tableInfoManager.setConnection(conn);
 
             Statement statement = conn.createStatement();
-            ResultSet resultSet = statement.executeQuery(String.format("select `schema_name`, `name`, `original_name`, `gmt_create` from %s where name like '%s%%'", GmsSystemTables.RECYCLE_BIN,
+            ResultSet resultSet = statement.executeQuery(String.format(
+                "select `schema_name`, `name`, `original_name`, `gmt_create` from %s where name like '%s%%'",
+                GmsSystemTables.RECYCLE_BIN,
                 FILE_STORAGE_PREFIX));
 
             while (resultSet.next()) {
@@ -212,7 +230,8 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
                         if (tablesRecord != null
                             && engine.name().equalsIgnoreCase(tablesRecord.engine)) {
                             // purge
-                            ddlTasks.addAll(buildPurgeOssRecycleBin(engine, schemaName, binName, executionContext.copy()));
+                            ddlTasks.addAll(
+                                buildPurgeOssRecycleBin(engine, schemaName, binName, executionContext.copy()));
                         }
                     }
                 }
@@ -223,7 +242,8 @@ public class AlterFileStoragePurgeBeforeTimestampJobFactory extends DdlJobFactor
         }
     }
 
-    private static List<DdlTask> buildPurgeOssRecycleBin(Engine engine, String schemaName, String binName, ExecutionContext executionContext) {
+    private static List<DdlTask> buildPurgeOssRecycleBin(Engine engine, String schemaName, String binName,
+                                                         ExecutionContext executionContext) {
         // TODO: improve makeTableVisible
         LogicalRenameTableHandler.makeTableVisible(schemaName, binName, executionContext);
         List<DdlTask> taskList = new ArrayList<>();

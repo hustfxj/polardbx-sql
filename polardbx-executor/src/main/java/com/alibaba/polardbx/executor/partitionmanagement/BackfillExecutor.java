@@ -17,7 +17,6 @@
 package com.alibaba.polardbx.executor.partitionmanagement;
 
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
-import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
@@ -30,8 +29,8 @@ import com.alibaba.polardbx.executor.backfill.Loader;
 import com.alibaba.polardbx.executor.cursor.Cursor;
 import com.alibaba.polardbx.executor.partitionmanagement.backfill.AlterTableGroupExtractor;
 import com.alibaba.polardbx.executor.partitionmanagement.backfill.AlterTableGroupLoader;
+import com.alibaba.polardbx.executor.scaleout.backfill.ChangeSetExecutor;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
-import com.google.common.collect.Sets;
 import org.apache.calcite.rel.RelNode;
 
 import java.util.HashMap;
@@ -60,11 +59,13 @@ public class BackfillExecutor {
                         ExecutionContext baseEc,
                         Map<String, Set<String>> sourcePhyTables,
                         Map<String, Set<String>> targetPhyTables,
-                        boolean movePartitions) {
+                        boolean movePartitions,
+                        boolean useChangeSet) {
         final long batchSize = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_BATCH_SIZE);
         final long speedMin = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_SPEED_MIN);
         final long speedLimit = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_SPEED_LIMITATION);
         final long parallelism = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_PARALLELISM);
+        final boolean useBinary = baseEc.getParamManager().getBoolean(ConnectionParams.BACKFILL_USING_BINARY);
 
         if (null == baseEc.getServerVariables()) {
             baseEc.setServerVariables(new HashMap<>());
@@ -85,10 +86,16 @@ public class BackfillExecutor {
             }
         }
         // Init extractor and loader
-        final Extractor extractor =
-            AlterTableGroupExtractor
-                .create(schemaName, tableName, tableName, batchSize, speedMin, speedLimit, parallelism, sourcePhyTables,
-                    baseEc);
+        Extractor extractor;
+        if (useChangeSet) {
+            extractor = ChangeSetExecutor
+                .create(schemaName, tableName, tableName, batchSize, speedMin, speedLimit, parallelism, useBinary,
+                    null, sourcePhyTables, baseEc);
+        } else {
+            extractor = AlterTableGroupExtractor
+                .create(schemaName, tableName, tableName, batchSize, speedMin, speedLimit, parallelism, useBinary,
+                    sourcePhyTables, baseEc);
+        }
         final Loader loader =
             AlterTableGroupLoader
                 .create(schemaName, tableName, tableName, this.executeFunc, baseEc.isUseHint(), baseEc,
@@ -109,7 +116,9 @@ public class BackfillExecutor {
                         loader.fillIntoIndex(batch, Pair.of(baseEc, extractEcAndIndexPair.getValue()), () -> {
                             try {
                                 // Commit and close extract statement
-                                extractEcAndIndexPair.getKey().getTransaction().commit();
+                                if (!useChangeSet) {
+                                    extractEcAndIndexPair.getKey().getTransaction().commit();
+                                }
                                 return true;
                             } catch (Exception e) {
                                 logger.error("Close extract statement failed!", e);

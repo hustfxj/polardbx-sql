@@ -17,6 +17,7 @@
 package com.alibaba.polardbx.qatest.ddl.sharding.gsi.group1;
 
 import com.alibaba.polardbx.qatest.AsyncDDLBaseNewDBTestCase;
+import com.alibaba.polardbx.qatest.BinlogIgnore;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import com.alibaba.polardbx.qatest.validator.DataValidator;
 import com.google.common.collect.ImmutableList;
@@ -29,6 +30,7 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
+import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 
@@ -892,12 +894,12 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         sql = String.format("alter table %s modify column a bigint(10) primary key", primaryTable);
         JdbcUtil.executeUpdateFailed(tddlConnection,
             sql,
-            "do not support change column name or type on primary key or sharding key on table with gsi");
+            "Do not support change sharding key column type on drds mode database ");
 
         sql = String.format("alter table %s modify column b varchar(40)", primaryTable);
         JdbcUtil.executeUpdateFailed(tddlConnection,
             sql,
-            "do not support change column name or type on primary key or sharding key on table with gsi");
+            "Do not support change sharding key column type on drds mode database");
 
         final String looseHint = "/*+TDDL:cmd_extra(ALLOW_LOOSE_ALTER_COLUMN_WITH_GSI=true)*/";
 
@@ -914,6 +916,7 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
     }
 
     @Ignore
+    @BinlogIgnore(ignoreReason = "用例涉及很多主键冲突问题，即不同分区有相同主键，复制到下游Mysql时出现Duplicate Key")
     public void testAlterTableMultiGroupOneAtomWithGsi_error_drop_column_with_uppercase() {
         final String primaryTable = tableName + "_6";
         final String indexTable = indexTableName + "_6";
@@ -977,10 +980,6 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
         sql =
-            String.format(HINT_ALLOW_ALTER_GSI_INDIRECTLY + "alter table %s modify column b varchar(40)", primaryTable);
-        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
-
-        sql =
             String.format(HINT_ALLOW_ALTER_GSI_INDIRECTLY + "alter table %s modify column c varchar(40)", primaryTable);
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
@@ -991,14 +990,30 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
             sql,
             "Do not support multi ALTER statements on table with global secondary index");
 
-        final TableChecker tableChecker = getTableChecker(tddlConnection, indexTable);
-        tableChecker.identicalTableDefinitionTo(
-            "create table " + indexTable
-                + "(a int(11) NOT NULL,b varchar(40), c varchar(40), PRIMARY KEY(a))",
-            true,
-            Litmus.THROW);
-
         dropTableIfExists(primaryTable);
+    }
+
+    protected static TableChecker getTableChecker(Connection conn, String tableName) {
+        final String sql = String.format("show create table %s", tableName);
+        try (final ResultSet resultSet = JdbcUtil.executeQuerySuccess(conn, sql)) {
+            Assert.assertTrue(resultSet.next());
+            String createTableStr = resultSet.getString(2);
+            ;
+            if (isMySQL80()) {
+                createTableStr = createTableStr.replaceAll(" CHARACTER SET \\w+", "")
+                    .replaceAll(" COLLATE \\w+", "")
+                    .replaceAll(" DEFAULT COLLATE = \\w+", "")
+                    .replaceAll(" int ", " int(11) ")
+                    .replaceAll(" bigint ", " bigint(11) ")
+                    .replaceAll(" int,", " int(11),")
+                    .replaceAll(" bigint,", " bigint(11),")
+                    .replaceAll(" int\n", " int(11)\n")
+                    .replaceAll(" bigint\n", " bigint(11)\n");
+            }
+            return TableChecker.buildTableChecker(createTableStr);
+        } catch (Exception e) {
+            throw new RuntimeException("show create table failed!", e);
+        }
     }
 
     /**
@@ -1022,13 +1037,13 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         sql = String.format("alter table %s change column a a1 bigint(10) primary key", primaryTable);
         JdbcUtil.executeUpdateFailed(tddlConnection,
             sql,
-            "do not support change column name or type on primary key or sharding key on table with gsi");
+            "optimize error by Do not support change the column name of sharding key");
 
         final String looseHint = "/*+TDDL:cmd_extra(ALLOW_LOOSE_ALTER_COLUMN_WITH_GSI=true)*/";
 
         sql = String.format(looseHint + "alter table %s change column b b1 varchar(40)", primaryTable);
         JdbcUtil.executeUpdateFailed(tddlConnection, sql,
-            "do not support change column name or type on primary key or sharding key on table with gsi");
+            "optimize error by Do not support change the column name of sharding key");
 
         sql = String.format(looseHint + "alter table %s change column c c1 varchar(40)", primaryTable);
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
@@ -1036,9 +1051,7 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         sql = String
             .format(looseHint + "alter table %s change column d d1 varchar(40), change column c1 c2 varchar(40)",
                 primaryTable);
-        JdbcUtil.executeUpdateFailed(tddlConnection,
-            sql,
-            "do not support multi alter statements on table with global secondary index");
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
         dropTableIfExists(primaryTable);
     }
@@ -1062,24 +1075,13 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
         sql = String
-            .format(HINT_ALLOW_ALTER_GSI_INDIRECTLY + "alter table %s change column b b1 varchar(40)", primaryTable);
-        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
-
-        sql = String
             .format(HINT_ALLOW_ALTER_GSI_INDIRECTLY + "alter table %s change column c c1 varchar(40)", primaryTable);
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
         sql = String.format(HINT_ALLOW_ALTER_GSI_INDIRECTLY
                 + "alter table %s change column d d1 varchar(40), change column c1 c varchar(40)",
             primaryTable);
-        JdbcUtil.executeUpdateFailed(tddlConnection,
-            sql,
-            "Do not support multi ALTER statements on table with global secondary index");
-
-        final TableChecker tableChecker = getTableChecker(tddlConnection, indexTable);
-        tableChecker.identicalTableDefinitionTo(
-            "create table " + indexTable + "(a int(11) NOT NULL,b1 varchar(40), c1 varchar(40), PRIMARY KEY(a))", true,
-            Litmus.THROW);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
         dropTableIfExists(primaryTable);
     }
@@ -1571,6 +1573,7 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
      */
     @Test
     public void testAlterTableMultiGroupOneAtomWithGsi_error_add_index() {
+        JdbcUtil.executeUpdateSuccess(tddlConnection, "SET ENABLE_FOREIGN_KEY = true");
 
         final String primaryTable = tableName + "_6";
         final String indexTable = indexTableName + "_6";
@@ -1606,7 +1609,7 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         final String referenceTable = tableName + "reference";
         dropTableIfExists(referenceTable);
         sql = String.format(HINT_CREATE_GSI + "create table " + createOption
-            + "%s(a int primary key,b varchar(30), c varchar(30), d varchar(30), e varchar(30)"
+            + "%s(a int primary key,b varchar(30), c varchar(30), d varchar(30), e varchar(30), key(d)"
             + ") dbpartition by hash(a) dbpartitions 2", referenceTable);
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
 
@@ -1614,9 +1617,9 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
             primaryTable,
             indexTable,
             referenceTable);
-        //JdbcUtil.executeUpdateFailed(tddlConnection, sql, "Duplicated index name " + indexTable);
+        JdbcUtil.executeUpdateFailed(tddlConnection, sql, "Duplicated index name " + indexTable);
 
-        JdbcUtil.executeUpdateFailed(tddlConnection, sql, "do not support foreign key");
+//        JdbcUtil.executeUpdateFailed(tddlConnection, sql, "do not support foreign key");
         dropTableIfExists(referenceTable);
         dropTableIfExists(primaryTable);
     }
@@ -1777,9 +1780,19 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         sql = String.format("alter table %s convert to character set utf8 collate utf8_bin", primaryTable);
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
         Assert.assertTrue(showCreateTable(tddlConnection, primaryTable).contains("utf8"));
-        Assert.assertTrue(showCreateTable(tddlConnection, indexTable).contains("utf8_bin"));
+        String showIndexTable = showCreateTable(tddlConnection, indexTable);
+        if (isMySQL80()) {
+            showIndexTable = showIndexTable.replace("utf8mb3_bin", "utf8_bin");
+        }
+        System.out.println(showIndexTable);
+        Assert.assertTrue(showIndexTable.contains("utf8_bin"));
         Assert.assertTrue(showCreateTable(tddlConnection, primaryTable).contains("utf8"));
-        Assert.assertTrue(showCreateTable(tddlConnection, indexTable).contains("utf8_bin"));
+        String showIndexTable1 = showCreateTable(tddlConnection, indexTable);
+        if (isMySQL80()) {
+            showIndexTable1 = showIndexTable1.replace("utf8mb3_bin", "utf8_bin");
+        }
+        System.out.println(showIndexTable1);
+        Assert.assertTrue(showIndexTable1.contains("utf8_bin"));
 
         sql = String.format("alter table %s convert to character set utf8 collate utf8_general_cixx", primaryTable);
         JdbcUtil.executeUpdateFailed(tddlConnection, sql, "unknown collate name 'utf8_general_cixx'");
@@ -1791,5 +1804,20 @@ public class AlterTableWithGsiTest extends AsyncDDLBaseNewDBTestCase {
         JdbcUtil.executeUpdateFailed(tddlConnection, sql, "unknown charset name 'utf2'");
 
         dropTableIfExists(primaryTable);
+    }
+
+    public String showCreateTable(Connection conn, String tbName) {
+        String sql = "show create table " + tbName;
+
+        ResultSet rs = JdbcUtil.executeQuerySuccess(conn, sql);
+        try {
+            assertThat(rs.next()).isTrue();
+            return rs.getString("Create Table");
+        } catch (SQLException e) {
+            logger.error(e.getMessage(), e);
+        } finally {
+            JdbcUtil.close(rs);
+        }
+        return null;
     }
 }

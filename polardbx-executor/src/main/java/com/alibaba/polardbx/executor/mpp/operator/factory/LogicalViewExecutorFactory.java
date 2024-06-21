@@ -28,6 +28,18 @@ import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
 import com.alibaba.polardbx.optimizer.core.rel.OrcTableScan;
 import com.google.common.base.Preconditions;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
+import com.alibaba.polardbx.common.utils.GeneralUtil;
+import com.alibaba.polardbx.common.utils.logger.Logger;
+import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.executor.chunk.MutableChunk;
+import com.alibaba.polardbx.executor.mpp.operator.LocalExecutionPlanner;
+import com.alibaba.polardbx.executor.mpp.planner.FragmentRFItem;
+import com.alibaba.polardbx.executor.mpp.planner.FragmentRFItemKey;
+import com.alibaba.polardbx.executor.mpp.planner.FragmentRFManager;
+import com.alibaba.polardbx.executor.mpp.planner.PipelineFragment;
+import com.alibaba.polardbx.executor.operator.AbstractOSSTableScanExec;
+import com.alibaba.polardbx.executor.operator.ColumnarDeletedScanExec;
+import com.alibaba.polardbx.executor.operator.ColumnarScanExec;
 import com.alibaba.polardbx.executor.operator.DrivingStreamTableScanExec;
 import com.alibaba.polardbx.executor.operator.DrivingStreamTableScanSortExec;
 import com.alibaba.polardbx.executor.operator.Executor;
@@ -62,34 +74,37 @@ import com.alibaba.polardbx.optimizer.core.rel.OrcTableScan;
 import com.alibaba.polardbx.optimizer.utils.CalciteUtils;
 import com.alibaba.polardbx.statistics.RuntimeStatHelper;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
+import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Join;
+import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.metadata.JaninoRelMetadataProvider;
-import org.apache.calcite.rel.metadata.RelColumnOrigin;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
+import org.jetbrains.annotations.NotNull;
 
-import javax.validation.constraints.NotNull;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class LogicalViewExecutorFactory extends ExecutorFactory {
+    private static final Logger MPP_LOGGER = LoggerFactory.getLogger(LocalExecutionPlanner.class);
+    private final PipelineFragment fragment;
 
     private final int totalPrefetch;
     private final CursorMeta meta;
     private final AtomicInteger counter = new AtomicInteger(0);
     private final int parallelism;
     private final long maxRowCount;
-    private LogicalView logicalView;
+    private final LogicalView logicalView;
     private TableScanClient scanClient;
-    private SpillerFactory spillerFactory;
+    private final SpillerFactory spillerFactory;
 
-    private boolean bSort;
-    private long fetch;
-    private long skip;
+    private final boolean bSort;
+    private final Sort sort;
+    private final long fetch;
+    private final long skip;
 
     private BloomFilterExpression filterExpression;
 
@@ -100,37 +115,31 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
     private List<LookupEquiJoinKey> allJoinKeys; // including null-safe equal (`<=>`)
     private LookupPredicate predicates;
     private List<DataType> dataTypeList;
+    private boolean randomSplits;
 
     public LogicalViewExecutorFactory(
-        LogicalView logicalView, int totalPrefetch, int parallelism, long maxRowCount, boolean bSort,
+        PipelineFragment fragment, LogicalView logicalView,
+        int totalPrefetch, int parallelism, long maxRowCount, boolean bSort, Sort sort,
         long fetch, long skip, SpillerFactory spillerFactory, Map<Integer, BloomFilterExpression> bloomFilters,
-        boolean enableRuntimeFilter) {
+        boolean enableRuntimeFilter, boolean randomSplits) {
+        this.fragment = fragment;
         this.logicalView = logicalView;
         this.totalPrefetch = totalPrefetch;
         this.meta = CursorMeta.build(CalciteUtils.buildColumnMeta(logicalView, "TableScanColumns"));
         this.parallelism = parallelism;
         this.maxRowCount = maxRowCount;
         this.bSort = bSort;
+        this.sort = sort;
         this.fetch = fetch;
         this.skip = skip;
         this.spillerFactory = spillerFactory;
+        this.randomSplits = randomSplits;
 
         if (logicalView.getJoin() != null) {
             Join join = logicalView.getJoin();
             this.allJoinKeys = EquiJoinUtils.buildLookupEquiJoinKeys(join, join.getOuter(), join.getInner(),
-                (RexCall) join.getCondition(), join.getJoinType(), true);
-            RelMetadataQuery mq = join.getCluster().getMetadataQuery();
-            List<String> columnOrigins = Lists.newArrayList();
-            synchronized (mq) {
-                for (int i = 0; i < logicalView.getRowType().getFieldCount(); i++) {
-                    RelColumnOrigin columnOrigin = mq.getColumnOrigin(logicalView, i);
-                    if (columnOrigin == null) {
-                        columnOrigins.add(logicalView.getRowType().getFieldNames().get(i));
-                    } else {
-                        columnOrigins.add(columnOrigin.getColumnName());
-                    }
-                }
-            }
+                (RexCall) join.getCondition(), join.getJoinType());
+            List<String> columnOrigins = logicalView.getColumnOrigins();
             this.predicates = new LookupPredicateBuilder(join, columnOrigins).build(allJoinKeys);
         }
 
@@ -150,9 +159,6 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
 
     @Override
     public Executor createExecutor(ExecutionContext context, int index) {
-        RelMetadataQuery.THREAD_PROVIDERS
-            .set(JaninoRelMetadataProvider.of(logicalView.getCluster().getMetadataProvider()));
-
         if (logicalView instanceof OSSTableScan) {
             return buildOSSTableScanExec(context);
         } else {
@@ -162,7 +168,6 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
 
     @NotNull
     private Executor buildTableScanExec(ExecutionContext context) {
-
         TableScanExec scanExec;
         Join join = logicalView.getJoin();
         if (join != null) {
@@ -179,7 +184,7 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
 
             if (bSort) {
                 long limit = context.getParamManager().getLong(ConnectionParams.MERGE_SORT_BUFFER_SIZE);
-                if (limit > 0) {
+                if (limit > 0 && logicalView.pushedRelNodeIsSort()) {
                     this.scanClient = new MergeSortWithBufferTableScanClient(
                         context, meta, useTransactionConnection, totalPrefetch);
                 } else {
@@ -203,21 +208,88 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
             }
 
             scanExec = buildTableScanExec(scanClient, context);
+
+            if (randomSplits) {
+                scanExec.setRandomSplits(randomSplits);
+            }
         }
-        scanExec.setId(logicalView.getRelatedId());
-        if (context.getRuntimeStatistics() != null) {
-            RuntimeStatHelper.registerStatForExec(logicalView, scanExec, context);
-        }
+        registerRuntimeStat(scanExec, logicalView, context);
+
         return scanExec;
+    }
+
+    @Override
+    protected void registerRuntimeStat(Executor scanExec, RelNode relNode, ExecutionContext context) {
+        super.registerRuntimeStat(scanExec, relNode, context);
+        if (context.getRuntimeStatistics() != null) {
+            if (bSort && scanExec instanceof TableScanSortExec) {
+                RuntimeStatHelper.registerStatForExec(sort, scanExec, context);
+            }
+        }
     }
 
     private Executor buildOSSTableScanExec(ExecutionContext context) {
         OSSTableScan ossTableScan = (OSSTableScan) logicalView;
+
+        if (context.isEnableOrcDeletedScan()) {
+            // Special path for check cci consistency.
+            // Normal oss read should not get here.
+            Executor exec = new ColumnarDeletedScanExec(ossTableScan, context, dataTypeList);
+            registerRuntimeStat(exec, logicalView, context);
+            return exec;
+        }
+
+        // Use columnar table scan exec.
+        if (context.getParamManager().getBoolean(ConnectionParams.ENABLE_COLUMNAR_SCAN_EXEC)) {
+            ColumnarScanExec exec = new ColumnarScanExec(ossTableScan, context, dataTypeList);
+            registerRuntimeStat(exec, logicalView, context);
+
+            if (fragment.getFragmentRFManager() != null) {
+                FragmentRFManager fragmentRFManager = fragment.getFragmentRFManager();
+
+                Map<FragmentRFItemKey, FragmentRFItem> allItems = fragmentRFManager.getAllItems();
+
+                for (FragmentRFItemKey itemKey : allItems.keySet()) {
+                    FragmentRFItem item = allItems.get(itemKey);
+
+                    String probeColumnName = item.getProbeColumnName();
+
+                    // inspect the filter channel according to registered RF columns.
+                    List<String> fieldNames = logicalView.getRowType().getFieldNames();
+                    final int outProjectIndex = fieldNames.indexOf(probeColumnName);
+
+                    if (outProjectIndex == -1) {
+                        if (MPP_LOGGER.isDebugEnabled()) {
+                            MPP_LOGGER.debug(
+                                "Cannot find the filter channel according to registered RF columns "
+                                    + ", fragmentRFItemKey = " + itemKey
+                                    + ", for scan: " + logicalView);
+                        }
+
+                    } else {
+                        // Mapping to input index in file.
+                        final int inProjectIndex = ossTableScan.getOrcNode().getInProjects().get(outProjectIndex);
+                        item.setSourceRefInFile(inProjectIndex);
+                        item.setSourceFilterChannel(outProjectIndex);
+
+                        // register column scan exec in all threads into fragment RF manager.
+                        item.registerSource(exec);
+                    }
+                }
+
+            }
+
+            return exec;
+        }
+
         AbstractOSSTableScanExec exec = AbstractOSSTableScanExec.create(ossTableScan, context, dataTypeList);
+
         OrcTableScan orcTableScan = ossTableScan.getOrcNode();
         if (!orcTableScan.getFilters().isEmpty()) {
             RexNode filterCondition = orcTableScan.getFilters().get(0);
+
             List<DataType<?>> inputTypes = orcTableScan.getInProjectsDataType();
+
             // binding vec expression
             RexNode root = VectorizedExpressionBuilder.rewriteRoot(filterCondition, true);
             InputRefTypeChecker inputRefTypeChecker = new InputRefTypeChecker(inputTypes);
@@ -230,12 +302,14 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
                 .addEmptySlots(inputTypes)
                 .addEmptySlots(filterOutputTypes)
                 .build();
+
             // prepare filter bitmap
             List<Integer> inputIndex = VectorizedExpressionUtils.getInputIndex(vectorizedExpression);
             int[] filterBitmap = new int[inputTypes.size() + filterOutputTypes.size()];
             for (int i : inputIndex) {
                 filterBitmap[i] = 1;
             }
+
             exec.setPreAllocatedChunk(preAllocatedChunk);
             exec.setFilterInputTypes(inputTypes);
             exec.setFilterOutputTypes(filterOutputTypes);
@@ -246,17 +320,15 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
                 outProject[i] = orcTableScan.getOutProjects().get(i);
             }
             exec.setOutProject(outProject);
-            exec.setId(logicalView.getRelatedId());
-            if (context.getRuntimeStatistics() != null) {
-                RuntimeStatHelper.registerStatForExec(logicalView, exec, context);
-            }
         }
+        registerRuntimeStat(exec, logicalView, context);
+
         if (filterExpression != null) {
             exec.initWaitFuture(filterExpression.getWaitBloomFuture());
         }
+
         return exec;
     }
-
 
     private TableScanExec buildTableScanExec(TableScanClient scanClient, ExecutionContext context) {
         int stepSize = context.getParamManager().getInt(ConnectionParams.RESUME_SCAN_STEP_SIZE);
@@ -323,10 +395,7 @@ public class LogicalViewExecutorFactory extends ExecutorFactory {
         TableScanExec scanExec =
             new LookupTableScanExec(logicalView, context, scanClient.incrementSourceExec(), canShard, spillerFactory,
                 predicate, allJoinKeys, dataTypeList);
-        scanExec.setId(logicalView.getRelatedId());
-        if (context.getRuntimeStatistics() != null) {
-            RuntimeStatHelper.registerStatForExec(logicalView, scanExec, context);
-        }
+        registerRuntimeStat(scanExec, logicalView, context);
         return scanExec;
     }
 

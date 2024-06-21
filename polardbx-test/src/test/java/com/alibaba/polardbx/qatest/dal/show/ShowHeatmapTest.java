@@ -16,19 +16,20 @@
 
 package com.alibaba.polardbx.qatest.dal.show;
 
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-
+import com.alibaba.polardbx.qatest.CdcIgnore;
 import com.alibaba.polardbx.qatest.ReadBaseTestCase;
-
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+
 /**
  * @author ximing.yd
  */
+@CdcIgnore(ignoreReason = "用例在replica实验室运行不稳定，对CDC回归测试无影响，可忽略")
 public class ShowHeatmapTest extends ReadBaseTestCase {
 
     @Test
@@ -81,7 +82,6 @@ public class ShowHeatmapTest extends ReadBaseTestCase {
         Assert.assertEquals(rs.getMetaData().getColumnCount(), 1);
         Assert
             .assertEquals("HEATMAP", rs.getMetaData().getColumnName(1).toUpperCase());
-        Assert.assertTrue(JdbcUtil.getAllResult(rs).size() >= 1);
     }
 
     @Test

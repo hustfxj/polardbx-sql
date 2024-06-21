@@ -20,7 +20,6 @@ import com.alibaba.polardbx.common.DefaultSchema;
 import com.alibaba.polardbx.common.async.AsyncTask;
 import com.alibaba.polardbx.common.eventlogger.EventLogger;
 import com.alibaba.polardbx.common.eventlogger.EventType;
-import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.common.utils.logger.MDC;
@@ -55,11 +54,15 @@ public class AsyncTaskQueue {
     }
 
     public Future<?> submit(Runnable runnable) {
-        return executor.submit(schema, null, AsyncTask.build(runnable));
+        return executor.submit(null, null, AsyncTask.build(runnable));
     }
 
-    public TimerTask scheduleXARecoverTask(TransactionExecutor te, int interval) {
-        final XARecoverTask recoverTask = new XARecoverTask(te);
+    public Future<?> submitRandomBucket(Runnable runnable) {
+        return executor.submit(null, null, AsyncTask.build(runnable));
+    }
+
+    public TimerTask scheduleXARecoverTask(TransactionExecutor te, int interval, boolean supportAsyncCommit) {
+        final XARecoverTask recoverTask = new XARecoverTask(te, supportAsyncCommit);
         final ScheduleAsyncTask task = ScheduleAsyncTask.build(recoverTask);
 
         TimerTask timerTask = new TimerTask() {
@@ -81,7 +84,7 @@ public class AsyncTaskQueue {
         };
 
         timer.scheduleAtFixedRate(timerTask, 0, interval * 1000L);
-        TransactionLogger.info("Scheduled XA transaction recovery task");
+        TransactionLogger.warn("Scheduled XA transaction recovery task");
 
         return timerTask;
     }
@@ -168,7 +171,16 @@ public class AsyncTaskQueue {
 
         timer.scheduleAtFixedRate(timerTask, 0, interval);
 
-        TransactionLogger.info(schema + ": Scheduled deadlock detection task.");
+        TransactionLogger.warn(schema + ": Scheduled deadlock detection task.");
+        EventLogger.log(EventType.DEAD_LOCK_DETECTION, String.format(
+            "Deadlock detection task for schema:%s is online",
+            schema
+        ));
+
+        EventLogger.log(EventType.DEAD_LOCK_DETECTION, String.format(
+            "Deadlock detection task for schema:%s is online",
+            schema
+        ));
 
         return timerTask;
     }
@@ -196,9 +208,9 @@ public class AsyncTaskQueue {
         };
 
         timer.scheduleAtFixedRate(timerTask, 0, intervalInMs);
-        TransactionLogger.info("Scheduled deadlock detection task");
+        TransactionLogger.warn("Scheduled kill timeout transaction task");
         EventLogger.log(EventType.DEAD_LOCK_DETECTION, String.format(
-            "Deadlock detection task for schema:%s is online",
+            "Kill timeout transaction task for schema:%s is online",
             schema
         ));
 
@@ -229,7 +241,7 @@ public class AsyncTaskQueue {
         };
 
         timer.scheduleAtFixedRate(timerTask, 0, intervalInMs);
-        TransactionLogger.info("Scheduled MDL deadlock detection task");
+        TransactionLogger.warn("Scheduled MDL deadlock detection task");
         EventLogger.log(EventType.DEAD_LOCK_DETECTION, String.format(
             "MDL Deadlock detection task for schema:%s is online",
             schema
@@ -266,6 +278,35 @@ public class AsyncTaskQueue {
         return timerTask;
     }
 
+    public TimerTask scheduleBestEffortRecoverTask(TransactionExecutor te, GlobalTxLogManager globalTxManager,
+                                                   int interval) {
+        final ScanBestEffortPreparedTask recoverTask = new ScanBestEffortPreparedTask(te, globalTxManager);
+        final ScheduleAsyncTask task = ScheduleAsyncTask.build(recoverTask);
+
+        TimerTask timerTask = new TimerTask() {
+
+            @Override
+            public void run() {
+                if (!task.schedule()) {
+                    logger.warn("Ignore re-submit best-effort recover task");
+                    return;
+                }
+
+                try {
+                    executor.submit(schema, null, task);
+                } catch (Throwable e) {
+                    task.cancel();
+                    logger.error("Submit best-effort recover task failed", e);
+                }
+            }
+        };
+
+        timer.scheduleAtFixedRate(timerTask, 0, interval * 1000L);
+        TransactionLogger.info("Scheduled best-effort transaction recovery task");
+
+        return timerTask;
+    }
+
     public TimerTask scheduleTsoPurgeTask(int intervalMs) {
         final PurgeTsoTimerTask purgeTsoTimerTask = new PurgeTsoTimerTask(this);
         final ScheduleAsyncTask task = ScheduleAsyncTask.build(purgeTsoTimerTask);
@@ -290,6 +331,94 @@ public class AsyncTaskQueue {
 
         timer.scheduleAtFixedRate(timerTask, 0, intervalMs);
         TransactionLogger.info("Scheduled TSO purge task");
+
+        return timerTask;
+    }
+
+    public TimerTask scheduleTransactionStatisticsTask(final long interval, final Runnable rawTask) {
+        final ScheduleAsyncTask task = ScheduleAsyncTask.build(rawTask);
+
+        final TimerTask timerTask = new TimerTask() {
+
+            @Override
+            public void run() {
+                if (!task.schedule()) {
+                    logger.warn("Ignore re-submit transaction statistics task");
+                    return;
+                }
+
+                try {
+                    executor.submit(schema, null, task);
+                } catch (Throwable e) {
+                    task.cancel();
+                    logger.error("Submit transaction statistics task failed", e);
+                }
+            }
+
+            @Override
+            public boolean cancel() {
+                try {
+                    // Cancel the async task in case that
+                    // it is already submitted but not yet executed.
+                    task.cancel();
+                } catch (Throwable t) {
+                    // Ignore.
+                    logger.error("Cancel transaction statistics task failed", t);
+                }
+                final boolean returnVal = super.cancel();
+                // Release space of cancelled timer task.
+                timer.purge();
+                return returnVal;
+            }
+        };
+
+        timer.scheduleAtFixedRate(timerTask, 0, interval);
+
+        TransactionLogger.info(schema + ": Scheduled transaction statistics task.");
+
+        return timerTask;
+    }
+
+    public TimerTask scheduleTransactionIdleTimeoutTask(final int interval, final Runnable rawTask) {
+        final ScheduleAsyncTask task = ScheduleAsyncTask.build(rawTask);
+
+        final TimerTask timerTask = new TimerTask() {
+
+            @Override
+            public void run() {
+                if (!task.schedule()) {
+                    logger.warn("Ignore re-submit idle trx timeout task");
+                    return;
+                }
+
+                try {
+                    executor.submit(schema, null, task);
+                } catch (Throwable e) {
+                    task.cancel();
+                    logger.error("Submit idle trx timeout failed", e);
+                }
+            }
+
+            @Override
+            public boolean cancel() {
+                try {
+                    // Cancel the async task in case that
+                    // it is already submitted but not yet executed.
+                    task.cancel();
+                } catch (Throwable t) {
+                    // Ignore.
+                    logger.error("Submit idle trx timeout task failed", t);
+                }
+                final boolean returnVal = super.cancel();
+                // Release space of cancelled timer task.
+                timer.purge();
+                return returnVal;
+            }
+        };
+
+        timer.scheduleAtFixedRate(timerTask, 0, interval * 1000L);
+
+        TransactionLogger.info(schema + ": Scheduled idle trx timeout task.");
 
         return timerTask;
     }

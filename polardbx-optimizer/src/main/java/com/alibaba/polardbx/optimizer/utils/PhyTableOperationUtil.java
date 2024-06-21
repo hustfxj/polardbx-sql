@@ -32,41 +32,31 @@ import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.BaseQueryOperation;
 import com.alibaba.polardbx.optimizer.core.rel.BaseTableOperation;
+import com.alibaba.polardbx.optimizer.core.rel.DirectMultiDBTableOperation;
 import com.alibaba.polardbx.optimizer.core.rel.PhyQueryOperation;
 import com.alibaba.polardbx.optimizer.core.rel.PhyTableOperation;
 import com.alibaba.polardbx.optimizer.partition.PartSpecSearcher;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
 import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
-import com.mysql.cj.x.protobuf.PolarxExecPlan;
-import org.apache.calcite.schema.Table;
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlSelect;
 
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+
+import static com.alibaba.polardbx.common.jdbc.ITransactionPolicy.TransactionClass.ALLOW_GROUP_PARALLELISM_WITHOUT_SHARE_READVIEW_TRANSACTION;
+import static com.alibaba.polardbx.common.jdbc.ITransactionPolicy.TransactionClass.SUPPORT_PARALLEL_GET_CONNECTION_TRANSACTION;
+import static com.alibaba.polardbx.common.jdbc.ITransactionPolicy.TransactionClass.SUPPORT_SHARE_READVIEW_TRANSACTION;
 
 public class PhyTableOperationUtil {
 
     public final static Logger logger = LoggerFactory.getLogger(PhyTableOperationUtil.class);
     public final static Long DEFAULT_WRITE_CONN_ID = 0L;
     private final static XxHash_64Hasher XX_HASH_64_HASHER = new XxHash_64Hasher(0);
-
-    //========== methods for enable group parallelism ===========
-    private final static Set<ITransactionPolicy.TransactionClass> supportedGroupParallelismTransClassSet =
-        new HashSet<>();
-
-    static {
-        supportedGroupParallelismTransClassSet.add(ITransactionPolicy.TransactionClass.TSO);
-        supportedGroupParallelismTransClassSet.add(ITransactionPolicy.TransactionClass.XA);
-        supportedGroupParallelismTransClassSet.add(ITransactionPolicy.TransactionClass.AUTO_COMMIT);
-        supportedGroupParallelismTransClassSet.add(ITransactionPolicy.TransactionClass.AUTO_COMMIT_SINGLE_SHARD);
-        supportedGroupParallelismTransClassSet.add(ITransactionPolicy.TransactionClass.TSO_READONLY);
-    }
 
     public static void disableIntraGroupParallelism(String schemaName, ExecutionContext ec) {
         controlIntraGroupParallelism(schemaName, ec, false);
@@ -76,8 +66,9 @@ public class PhyTableOperationUtil {
         controlIntraGroupParallelism(schemaName, ec, true);
     }
 
-    private static void controlIntraGroupParallelism(String schemaName, ExecutionContext ec,
-                                                     boolean useGroupParallelism) {
+    @VisibleForTesting
+    protected static void controlIntraGroupParallelism(String schemaName, ExecutionContext ec,
+                                                       boolean useGroupParallelism) {
         if (schemaName == null) {
             schemaName = ec.getSchemaName();
         }
@@ -88,12 +79,27 @@ public class PhyTableOperationUtil {
         if (trans == null) {
             return;
         }
-        if (!supportedGroupParallelismTransClassSet.contains(trans.getTransactionClass())) {
+
+        if (!trans.getTransactionClass().isA(SUPPORT_PARALLEL_GET_CONNECTION_TRANSACTION)) {
             return;
         }
 
         if (!ec.isShareReadView()) {
-            return;
+            boolean allowGroupParallelismWithoutShareReadView =
+                ec.getParamManager().getBoolean(ConnectionParams.ALLOW_GROUP_PARALLELISM_WITHOUT_SHARE_READVIEW);
+            if (allowGroupParallelismWithoutShareReadView) {
+                if (trans.getTransactionClass().isA(ALLOW_GROUP_PARALLELISM_WITHOUT_SHARE_READVIEW_TRANSACTION)
+                    && ec.isAutoCommit()) {
+                    boolean isAutoCommitReadOnlyQuery = OptimizerUtils.isSelectQuery(ec);
+                    if (!isAutoCommitReadOnlyQuery) {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
         }
 
         if (!ec.getExtraCmds().containsKey(ConnectionProperties.ENABLE_GROUP_PARALLELISM)) {
@@ -154,6 +160,9 @@ public class PhyTableOperationUtil {
         if (phyOp instanceof PhyTableOperation) {
             Long connKey = fetchPhyOpIntraGroupConnKey((PhyTableOperation) phyOp, ec);
             return computeGrpConnIdByGrpConnKey(connKey, grpParallelism);
+        } else if (phyOp instanceof DirectMultiDBTableOperation) {
+            Long connKey = fetchMultiDBIntraGroupConnKey((DirectMultiDBTableOperation) phyOp, grpIdx, ec);
+            return computeGrpConnIdByGrpConnKey(connKey, grpParallelism);
         } else {
             Long connKey = fetchNonPhyOpIntraGroupConnKey(phyOp, grpIdx, phyTables, ec);
             return computeGrpConnIdByGrpConnKey(connKey, grpParallelism);
@@ -184,6 +193,8 @@ public class PhyTableOperationUtil {
         } else {
             if (phyOp instanceof PhyTableOperation) {
                 return fetchPhyOpIntraGroupConnKey((PhyTableOperation) phyOp, ec);
+            } else if (phyOp instanceof DirectMultiDBTableOperation) {
+                return fetchMultiDBIntraGroupConnKey((DirectMultiDBTableOperation) phyOp, grpIdx, ec);
             } else {
                 return fetchNonPhyOpIntraGroupConnKey((BaseTableOperation) phyOp, grpIdx, phyTables, ec);
             }
@@ -262,9 +273,51 @@ public class PhyTableOperationUtil {
         }
     }
 
+    // Use by DirectMultiDBTableOperation
+    @VisibleForTesting
+    protected static Long fetchMultiDBIntraGroupConnKey(
+        DirectMultiDBTableOperation phyTbOp, String grpIdx, ExecutionContext ec) {
+        try {
+            String schemaName = phyTbOp.getBaseSchemaName(ec);
+            if (!DbInfoManager.getInstance().isNewPartitionDb(schemaName)) {
+                return null;
+            }
+            SqlKind sqlKind = phyTbOp.getKind();
+            if (!sqlKind.belongsTo(SqlKind.DML) && !sqlKind.belongsTo(SqlKind.QUERY)) {
+                return null;
+            }
+
+            ITransaction trans = ec.getTransaction();
+            ITransactionPolicy.TransactionClass tranClass = trans.getTransactionClass();
+            if (!tranClass.isA(SUPPORT_SHARE_READVIEW_TRANSACTION)) {
+                return null;
+            }
+
+            List<String> logTbs = phyTbOp.getLogicalTables(schemaName);
+            List<String> phyTables = phyTbOp.getPhysicalTables(schemaName);
+            String logTb = logTbs.get(0);
+            String firstPhyTbl = phyTables.get(0);
+            boolean isReplicatedNode = phyTbOp.isReplicateRelNode();
+            PartitionInfo partInfo;
+            TableMeta tbMeta = ec.getSchemaManager(schemaName).getTable(logTb);
+            if (isReplicatedNode) {
+                partInfo = tbMeta.getNewPartitionInfo();
+            } else {
+                partInfo = tbMeta.getPartitionInfo();
+            }
+            Long connKey = tryFetchIntraGroupConnKeyFromPartSpec(grpIdx, firstPhyTbl, partInfo);
+            logConnGrpKeyIfNeed(grpIdx, firstPhyTbl, isReplicatedNode, partInfo, tbMeta, connKey, ec);
+            return connKey;
+        } catch (Throwable ex) {
+            logger.warn(ex);
+            throw ex;
+        }
+    }
+
     // Use by SingleTableOperation/SingleTableInsert/DirectTableOperation
-    private static Long fetchNonPhyOpIntraGroupConnKey(BaseTableOperation phyTbOp, String grpIdx,
-                                                       List<List<String>> phyTables, ExecutionContext ec) {
+    @VisibleForTesting
+    protected static Long fetchNonPhyOpIntraGroupConnKey(BaseTableOperation phyTbOp, String grpIdx,
+                                                         List<List<String>> phyTables, ExecutionContext ec) {
         try {
             String schemaName = phyTbOp.getSchemaName();
             if (!DbInfoManager.getInstance().isNewPartitionDb(schemaName)) {
@@ -272,18 +325,13 @@ public class PhyTableOperationUtil {
             }
 
             SqlKind sqlKind = phyTbOp.getKind();
-//            boolean isForUpdate = phyTbOp.isForUpdate();
-//            if (!sqlKind.belongsTo(SqlKind.DML) && !isForUpdate) {
-//                return null;
-//            }
             if (!sqlKind.belongsTo(SqlKind.DML) && !sqlKind.belongsTo(SqlKind.QUERY)) {
                 return null;
             }
 
             ITransaction trans = ec.getTransaction();
             ITransactionPolicy.TransactionClass tranClass = trans.getTransactionClass();
-            if (!(tranClass == ITransactionPolicy.TransactionClass.XA
-                || tranClass == ITransactionPolicy.TransactionClass.TSO)) {
+            if (!tranClass.isA(SUPPORT_SHARE_READVIEW_TRANSACTION)) {
                 return null;
             }
 
@@ -342,7 +390,8 @@ public class PhyTableOperationUtil {
             sb.append(", tbMetaAddr=").append(System.identityHashCode(tbMeta));
             sb.append(", partInfoAddr=").append(System.identityHashCode(partInfo));
             sb.append(", searcherAddr=").append(System.identityHashCode(specSearcher));
-            sb.append(", partSpecsAddr=").append(System.identityHashCode(partInfo.getPartitionBy().getPartitions()));
+            sb.append(", partSpecsAddr=")
+                .append(System.identityHashCode(partInfo.getPartitionBy().getPhysicalPartitions()));
             logger.warn(sb.toString());
         } catch (Exception ex) {
             logger.warn(ex);

@@ -16,9 +16,10 @@
 
 package com.alibaba.polardbx.server.response;
 
-import com.alibaba.polardbx.ErrorCode;
 import com.alibaba.polardbx.Fields;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.config.SchemaConfig;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.net.buffer.ByteBufferHolder;
 import com.alibaba.polardbx.net.compress.IPacketOutputProxy;
 import com.alibaba.polardbx.net.compress.PacketOutputProxyFactory;
@@ -48,7 +49,7 @@ public final class ShowNode {
     private static final int FIELD_COUNT = 6;
     private static final ResultSetHeaderPacket header = PacketUtil.getHeader(FIELD_COUNT);
     private static final FieldPacket[] fields = new FieldPacket[FIELD_COUNT];
-    private static final EOFPacket eof = new EOFPacket();
+    private static final byte packetId = FIELD_COUNT + 1;
 
     static {
         int i = 0;
@@ -72,11 +73,9 @@ public final class ShowNode {
 
         fields[i] = PacketUtil.getField("SLAVE_READ_PERCENT", Fields.FIELD_TYPE_VAR_STRING);
         fields[i++].packetId = ++packetId;
-
-        eof.packetId = ++packetId;
     }
 
-    public static void execute(ServerConnection c) {
+    public static boolean execute(ServerConnection c) {
         ByteBufferHolder buffer = c.allocate();
         IPacketOutputProxy proxy = PacketOutputProxyFactory.getInstance().createProxy(c, buffer);
         proxy.packetBegin();
@@ -89,23 +88,27 @@ public final class ShowNode {
             proxy = field.write(proxy);
         }
 
+        byte tmpPacketId = packetId;
         // write eof
-        proxy = eof.write(proxy);
+        if (!c.isEofDeprecated()) {
+            EOFPacket eof = new EOFPacket();
+            eof.packetId = ++tmpPacketId;
+            proxy = eof.write(proxy);
+        }
 
         // write rows
-        byte packetId = eof.packetId;
-        String charset = c.getCharset();
+        String charset = c.getResultSetCharset();
 
         String db = c.getSchema();
         if (db == null) {
             c.writeErrMessage(ErrorCode.ER_NO_DB_ERROR, "No database selected");
-            return;
+            return false;
         }
         // 取得配置文件
         SchemaConfig schema = c.getSchemaConfig();
         if (schema == null) {
             c.writeErrMessage(ErrorCode.ER_BAD_DB_ERROR, "Unknown database '" + db + "'");
-            return;
+            return false;
         }
 
         TDataSource ds = schema.getDataSource();
@@ -114,7 +117,7 @@ public final class ShowNode {
                 ds.init();
             } catch (Throwable e) {
                 c.handleError(ErrorCode.ERR_HANDLE_DATA, e);
-                return;
+                return false;
             }
         }
 
@@ -122,7 +125,8 @@ public final class ShowNode {
         int i = 0;
 
         List<List<Map<String, Object>>> results =
-            SyncManagerHelper.sync(new ShowNodeSyncAction(c.getSchema()), c.getSchema());
+            SyncManagerHelper.sync(
+                new ShowNodeSyncAction(c.getSchema()), c.getSchema(), SyncScope.CURRENT_ONLY);
 
         Map<String, Long> masterReadCounts = new HashMap();
         Map<String, Long> slaveReadCounts = new HashMap();
@@ -181,16 +185,17 @@ public final class ShowNode {
                 row.add(StringUtil.encode(percentFormat.format(0.0), charset));
             }
 
-            row.packetId = ++packetId;
+            row.packetId = ++tmpPacketId;
             proxy = row.write(proxy);
         }
 
         // write last eof
         EOFPacket lastEof = new EOFPacket();
-        lastEof.packetId = ++packetId;
+        lastEof.packetId = ++tmpPacketId;
         proxy = lastEof.write(proxy);
 
         // write buffer
         proxy.packetEnd();
+        return true;
     }
 }

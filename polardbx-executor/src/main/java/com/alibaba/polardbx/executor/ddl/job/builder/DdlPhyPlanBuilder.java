@@ -16,12 +16,14 @@
 
 package com.alibaba.polardbx.executor.ddl.job.builder;
 
+import com.alibaba.polardbx.common.Engine;
 import com.alibaba.polardbx.common.jdbc.BytesSql;
 import com.alibaba.polardbx.common.Engine;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
+import com.alibaba.polardbx.common.jdbc.BytesSql;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.model.Group;
 import com.alibaba.polardbx.common.utils.Pair;
@@ -45,6 +47,8 @@ import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.rule.TableRule;
 import com.alibaba.polardbx.rule.model.TargetDB;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
 import org.apache.calcite.rel.core.DDL;
 import org.apache.calcite.sql.SequenceBean;
 import org.apache.calcite.sql.SqlCreateTable;
@@ -110,6 +114,7 @@ public abstract class DdlPhyPlanBuilder {
         if (built) {
             return this;
         }
+        // 构建物理表拓扑
         buildTableRuleAndTopology();
         buildPhysicalPlans();
         built = true;
@@ -137,10 +142,12 @@ public abstract class DdlPhyPlanBuilder {
 
         if (relDdl.sqlNode instanceof SqlCreateTable) {
             Engine tableEngine = ((SqlCreateTable) relDdl.sqlNode).getEngine();
+            boolean pushDownFk = ((SqlCreateTable) relDdl.sqlNode).getPushDownForeignKeys();
             return DdlJobDataConverter.convertToPhysicalPlanData(tableTopology, physicalPlans, false, autoPartition,
-                Engine.isFileStore(tableEngine));
+                Engine.isFileStore(tableEngine), pushDownFk, executionContext);
         } else {
-            return DdlJobDataConverter.convertToPhysicalPlanData(tableTopology, physicalPlans, false, autoPartition);
+            return DdlJobDataConverter.convertToPhysicalPlanData(tableTopology, physicalPlans, false, autoPartition,
+                executionContext);
         }
     }
 
@@ -190,7 +197,7 @@ public abstract class DdlPhyPlanBuilder {
         tableTopology = convertTargetDBs(schemaName, targetDBs);
     }
 
-    private Map<String, List<List<String>>> convertTargetDBs(String schemaName, List<List<TargetDB>> targetDBs) {
+    protected Map<String, List<List<String>>> convertTargetDBs(String schemaName, List<List<TargetDB>> targetDBs) {
         final Set<String> groupIntersection = PlannerUtils.getGroupIntersection(targetDBs);
         targetDBs = PlannerUtils.filterGroup(targetDBs, groupIntersection, schemaName);
 
@@ -210,6 +217,8 @@ public abstract class DdlPhyPlanBuilder {
             String group = t.getKey();
             List<List<String>> tableNames = t.getValue();
             for (List<String> subTableNames : tableNames) {
+                // 这里是为每个分表 构建 mysql 物理执行计划 （建物理表）
+                // 需要替换为 oss 表构建计划
                 PhyDdlTableOperation phyDdlTable =
                     PhyDdlTableOperation.create(ddlPreparedData.getSchemaName(), tableName, executionContext);
                 phyDdlTable.setDbIndex(group);
@@ -316,4 +325,7 @@ public abstract class DdlPhyPlanBuilder {
         return physicalPlans;
     }
 
+    public SqlNode getSqlTemplate() {
+        return sqlTemplate;
+    }
 }

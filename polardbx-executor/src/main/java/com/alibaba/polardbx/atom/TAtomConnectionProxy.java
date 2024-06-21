@@ -43,7 +43,6 @@ import java.sql.SQLXML;
 import java.sql.Statement;
 import java.sql.Struct;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -113,6 +112,11 @@ public class TAtomConnectionProxy extends ConnectionProxyImpl {
 
             // 不处理 DRDS 自定义的系统变量
             if (ServerVariables.extraVariables.contains(key)) {
+                continue;
+            }
+
+            // 对于 DN 仅支持 set global 设置的变量，禁止 set session
+            if (!isGlobal && ServerVariables.isMysqlGlobal(key)) {
                 continue;
             }
 
@@ -209,7 +213,11 @@ public class TAtomConnectionProxy extends ConnectionProxyImpl {
             if (!first) {
                 query.append(", ");
             }
-            query.append("@").append(key).append("=").append("NULL");
+            if (key.equalsIgnoreCase("sql_log_bin")) {
+                query.append(key).append("=").append("'ON'");
+            } else {
+                query.append("@").append(key).append("=").append("NULL");
+            }
         }
 
         if (!first) { // 需要确保SET指令是完整的, 而不是只有一个SET前缀.
@@ -225,6 +233,10 @@ public class TAtomConnectionProxy extends ConnectionProxyImpl {
                 ps.close();
                 ps = null;
                 if (!isGlobal) {
+                    for (String key : serverVariablesNeedToRemove) {
+                        sessionVariables.remove(key);
+                        sessionVariablesChanged.remove(key);
+                    }
                     for (Entry<String, Object> e : tmpVariablesChanged.entrySet()) {
                         sessionVariables.put(e.getKey(), e.getValue());
                         sessionVariablesChanged.put(e.getKey(), e.getValue());

@@ -72,9 +72,9 @@ public class OSSBackFillExtractor extends Extractor {
                                    Map<String, Set<String>> sourcePhyTables,
                                    Engine sourceEngine,
                                    Engine targetEngine) {
-        super(schemaName, sourceTableName, targetTableName, batchSize, speedMin, speedLimit, parallelism,
-            planSelectWithMax,
-            planSelectWithMin, planSelectWithMinAndMax, planSelectMaxPk, null, null, primaryKeysId);
+        super(schemaName, sourceTableName, targetTableName, batchSize, speedMin, speedLimit, parallelism, false,
+            null, planSelectWithMax,
+            planSelectWithMin, planSelectWithMinAndMax, planSelectMaxPk, null, primaryKeysId);
         this.sourcePhyTables = sourcePhyTables;
         this.sourceEngine = GeneralUtil.coalesce(sourceEngine, Engine.INNODB);
         this.targetEngine = GeneralUtil.coalesce(targetEngine, Engine.INNODB);
@@ -86,8 +86,9 @@ public class OSSBackFillExtractor extends Extractor {
                                               Map<String, Set<String>> sourcePhyTables,
                                               ExecutionContext ec, String physicalPartition, Engine sourceEngine,
                                               Engine targetEngine) {
+
         // we use sourceTableName instead of targetTableName, because targetTableMeta couldn't be fetched during backfill.
-        ExtractorInfo info = Extractor.buildExtractorInfo(ec, schemaName, sourceTableName, sourceTableName);
+        ExtractorInfo info = Extractor.buildExtractorInfo(ec, schemaName, sourceTableName, sourceTableName, false);
         final PhysicalPlanBuilder builder = new PhysicalPlanBuilder(schemaName, ec);
 
         return new OSSBackFillExtractor(schemaName,
@@ -97,11 +98,17 @@ public class OSSBackFillExtractor extends Extractor {
             speedMin,
             speedLimit,
             parallelism,
-            builder.buildSelectForBackfill(info, false, true,
+            builder.buildSelectForBackfill(info.getSourceTableMeta(), info.getTargetTableColumns(),
+                info.getPrimaryKeys(),
+                false, true,
                 SqlSelect.LockMode.SHARED_LOCK, physicalPartition),
-            builder.buildSelectForBackfill(info, true, false,
+            builder.buildSelectForBackfill(info.getSourceTableMeta(), info.getTargetTableColumns(),
+                info.getPrimaryKeys(),
+                true, false,
                 SqlSelect.LockMode.SHARED_LOCK, physicalPartition),
-            builder.buildSelectForBackfill(info, true, true,
+            builder.buildSelectForBackfill(info.getSourceTableMeta(), info.getTargetTableColumns(),
+                info.getPrimaryKeys(),
+                true, true,
                 SqlSelect.LockMode.SHARED_LOCK, physicalPartition),
             builder.buildSelectMaxPkForBackfill(info.getSourceTableMeta(), info.getPrimaryKeys()),
             info.getPrimaryKeysId(),
@@ -161,7 +168,7 @@ public class OSSBackFillExtractor extends Extractor {
                                                                Cursor extractCursor) {
         final List<Map<Integer, ParameterContext>> result;
         try {
-            result = com.alibaba.polardbx.executor.gsi.utils.Transformer.buildBatchParam(extractCursor);
+            result = com.alibaba.polardbx.executor.gsi.utils.Transformer.buildBatchParam(extractCursor, false, null);
         } finally {
             extractCursor.close(new ArrayList<>());
         }

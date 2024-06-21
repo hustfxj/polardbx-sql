@@ -380,6 +380,7 @@ public final class FnvHash {
         long START = fnv1a_64_lower("START");
         long BTREE = fnv1a_64_lower("BTREE");
         long HASH = fnv1a_64_lower("HASH");
+        long CO_HASH = fnv1a_64_lower("CO_HASH");
         long LIST = fnv1a_64_lower("LIST");
         long NO_WAIT = fnv1a_64_lower("NO_WAIT");
         long WAIT = fnv1a_64_lower("WAIT");
@@ -456,7 +457,9 @@ public final class FnvHash {
         long STDDEV = fnv1a_64_lower("STDDEV");
         long RANK = fnv1a_64_lower("RANK");
         long SUM = fnv1a_64_lower("SUM");
+        long HYPERLOGLOG = fnv1a_64_lower("HYPERLOGLOG");
         long CHECK_SUM = fnv1a_64_lower("CHECK_SUM");
+        long CHECK_SUM_V2 = fnv1a_64_lower("CHECK_SUM_V2");
         long ARBITRARY = fnv1a_64_lower("ARBITRARY");
         long GROUP_CONCAT = fnv1a_64_lower("GROUP_CONCAT");
         long CONVERT_TZ = fnv1a_64_lower("CONVERT_TZ");
@@ -504,6 +507,9 @@ public final class FnvHash {
         long CURRENT_DATE = fnv1a_64_lower("CURRENT_DATE");
         long CURRENT_TIME = fnv1a_64_lower("CURRENT_TIME");
         long CURTIME = fnv1a_64_lower("CURTIME");
+        long UTC_DATE = fnv1a_64_lower("UTC_DATE");
+        long UTC_TIME = fnv1a_64_lower("UTC_TIME");
+        long UTC_TIMESTAMP = fnv1a_64_lower("UTC_TIMESTAMP");
         long CURRENT_USER = fnv1a_64_lower("CURRENT_USER");
         long FALSE = fnv1a_64_lower("FALSE");
         long TRUE = fnv1a_64_lower("TRUE");
@@ -564,6 +570,7 @@ public final class FnvHash {
         long STORAGE = fnv1a_64_lower("STORAGE");
         long STORED = fnv1a_64_lower("STORED");
         long VIRTUAL = fnv1a_64_lower("VIRTUAL");
+        long LOGICAL = fnv1a_64_lower("LOGICAL");
         long SIGNED = fnv1a_64_lower("SIGNED");
         long UNSIGNED = fnv1a_64_lower("UNSIGNED");
         long ZEROFILL = fnv1a_64_lower("ZEROFILL");
@@ -748,18 +755,19 @@ public final class FnvHash {
         long EXTERNAL = fnv1a_64_lower("EXTERNAL");
         long SORTED = fnv1a_64_lower("SORTED");
         long CLUSTERED = fnv1a_64_lower("CLUSTERED");
+        long COLUMNAR = fnv1a_64_lower("COLUMNAR");
         long LIFECYCLE = fnv1a_64_lower("LIFECYCLE");
         long LOCATION = fnv1a_64_lower("LOCATION");
         long LOCALITY = fnv1a_64_lower("LOCALITY");
         long PARTITION_MODE = fnv1a_64_lower("PARTITION_MODE");
+        long DEFAULT_SINGLE = fnv1a_64_lower("DEFAULT_SINGLE");
         long ARCHIVE_MODE = fnv1a_64_lower("ARCHIVE_MODE");
         long MODE = fnv1a_64_lower("MODE");
         long PARTITIONS = fnv1a_64_lower("PARTITIONS");
         long FORMAT = fnv1a_64_lower("FORMAT");
         long ENCODE = fnv1a_64_lower("ENCODE");
         long HEATMAP = fnv1a_64_lower("HEATMAP");
-
-
+        long REORGANIZE = fnv1a_64_lower("REORGANIZE");
         long SELECT = fnv1a_64_lower("SELECT");
         long DELETE = fnv1a_64_lower("DELETE");
         long UPDATE = fnv1a_64_lower("UPDATE");
@@ -767,6 +775,7 @@ public final class FnvHash {
         long REPLACE = fnv1a_64_lower("REPLACE");
         long TRUNCATE = fnv1a_64_lower("TRUNCATE");
         long CREATE = fnv1a_64_lower("CREATE");
+        long SPLIT = fnv1a_64_lower("SPLIT");
         long MERGE = fnv1a_64_lower("MERGE");
         long SHOW = fnv1a_64_lower("SHOW");
         long ALTER = fnv1a_64_lower("ALTER");
@@ -802,6 +811,7 @@ public final class FnvHash {
         long TBLPROPERTIES = fnv1a_64_lower("TBLPROPERTIES");
         long TABLEGROUP = fnv1a_64_lower("TABLEGROUP");
         long TABLEGROUPS = fnv1a_64_lower("TABLEGROUPS");
+        long HOTKEY = fnv1a_64_lower("HOTKEY");
         long DIMENSION = fnv1a_64_lower("DIMENSION");
         long OPTIONS = fnv1a_64_lower("OPTIONS");
         long OPTIMIZER = fnv1a_64_lower("OPTIMIZER");
@@ -813,6 +823,7 @@ public final class FnvHash {
         long EXTRA = fnv1a_64_lower("EXTRA");
         long DATABASES = fnv1a_64_lower("DATABASES");
         long COLUMNS = fnv1a_64_lower("COLUMNS");
+        long DICTIONARY_COLUMNS = fnv1a_64_lower("DICTIONARY_COLUMNS");
         long PROCESS = fnv1a_64_lower("PROCESS");
         long PROCESSLIST = fnv1a_64_lower("PROCESSLIST");
         long MPP = fnv1a_64_lower("MPP");

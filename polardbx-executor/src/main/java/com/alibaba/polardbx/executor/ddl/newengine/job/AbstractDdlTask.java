@@ -35,6 +35,9 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.commons.lang3.StringUtils;
 
 import java.sql.Connection;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.BooleanSupplier;
 
 import static com.alibaba.polardbx.executor.utils.failpoint.FailPointKey.FP_EACH_DDL_TASK_FAIL_ONCE;
 import static com.alibaba.polardbx.executor.utils.failpoint.FailPointKey.FP_FAIL_ON_DDL_TASK_NAME;
@@ -66,14 +69,14 @@ public abstract class AbstractDdlTask extends HandlerCommon implements DdlTask {
     @Override
     public void execute(ExecutionContext executionContext) {
         beginExecuteTs = System.nanoTime();
-        beforeTransaction(executionContext);
+        skipExecuteWrapper("beforeTransaction", () -> beforeTransaction(executionContext));
         final DdlTask currentTask = this;
         DdlEngineAccessorDelegate delegate = new DdlEngineAccessorDelegate<Integer>() {
 
             @Override
             protected Integer invoke() {
                 int result = 0;
-                duringTransaction(getConnection(), executionContext);
+                skipExecuteWrapper("duringTransaction", () -> duringTransaction(getConnection(), executionContext));
                 DdlEngineTaskRecord taskRecord = TaskHelper.toDdlEngineTaskRecord(currentTask);
                 taskRecord.setState(DdlTaskState.SUCCESS.name());
                 result += engineTaskAccessor.updateTask(taskRecord);
@@ -94,7 +97,7 @@ public abstract class AbstractDdlTask extends HandlerCommon implements DdlTask {
         };
         delegate.execute();
         //will not execute this if there's a failure
-        onExecutionSuccess(executionContext);
+        skipExecuteWrapper("onExecutionSuccess", () -> onExecutionSuccess(executionContext));
         currentTask.setState(DdlTaskState.SUCCESS);
         endExecuteTs = System.nanoTime();
     }
@@ -109,18 +112,30 @@ public abstract class AbstractDdlTask extends HandlerCommon implements DdlTask {
     protected abstract void onExecutionSuccess(final ExecutionContext executionContext);
 
     @Override
+    public void handleError(ExecutionContext executionContext) {
+
+    }
+
+    @Override
     public void rollback(ExecutionContext executionContext) {
         beginRollbackTs = System.nanoTime();
         final DdlTask currentTask = this;
-        beforeRollbackTransaction(executionContext);
+        skipRollbackWrapper("beforeRollbackTransaction", () -> beforeRollbackTransaction(executionContext));
         DdlEngineAccessorDelegate delegate = new DdlEngineAccessorDelegate<Integer>() {
 
             @Override
             protected Integer invoke() {
                 int result = 0;
-                duringRollbackTransaction(getConnection(), executionContext);
+                skipRollbackWrapper(
+                    "duringRollbackTransaction",
+                    () -> duringRollbackTransaction(getConnection(), executionContext));
                 DdlEngineTaskRecord taskRecord = TaskHelper.toDdlEngineTaskRecord(currentTask);
-                taskRecord.setState(DdlTaskState.ROLLBACK_SUCCESS.name());
+                if (executionContext.getDdlContext().isRollbackToReady()) {
+                    taskRecord.setState(DdlTaskState.READY.name());
+                } else {
+                    taskRecord.setState(DdlTaskState.ROLLBACK_SUCCESS.name());
+                }
+
                 result += engineTaskAccessor.updateTask(taskRecord);
 
                 //inject exceptions
@@ -138,7 +153,7 @@ public abstract class AbstractDdlTask extends HandlerCommon implements DdlTask {
             }
         };
         delegate.execute();
-        onRollbackSuccess(executionContext);
+        skipRollbackWrapper("onRollbackSuccess", () -> onRollbackSuccess(executionContext));
         currentTask.setState(DdlTaskState.ROLLBACK_SUCCESS);
         endRollbackTs = System.nanoTime();
     }
@@ -179,9 +194,9 @@ public abstract class AbstractDdlTask extends HandlerCommon implements DdlTask {
                                         boolean supportCancel,
                                         Connection connection) {
         if (connection != null) {
-            DdlJobManagerUtils.updateSupportedCommands(jobId, supportContinue, supportCancel, connection);
+            DdlJobManagerUtils.updateSupportedCommands(jobId, supportContinue, supportCancel, false, connection);
         } else {
-            DdlJobManagerUtils.updateSupportedCommands(jobId, supportContinue, supportCancel);
+            DdlJobManagerUtils.updateSupportedCommands(jobId, supportContinue, supportCancel, false);
         }
     }
 
@@ -294,37 +309,42 @@ public abstract class AbstractDdlTask extends HandlerCommon implements DdlTask {
     public String nodeInfo() {
         try {
             return String.format(
-                    "%s [shape=record  %s label=\"{%s|taskId:%s|onException:%s|state:%s%s%s%s}\"];",
-                    this.taskId,
-                    color(state),
-                    this.getName(),
-                    this.taskId,
-                    this.exceptionAction.name(),
-                    state.name(),
-                    cost("|execute cost:%s", beginExecuteTs, endExecuteTs),
-                    cost("|rollback cost:%s", beginRollbackTs, endRollbackTs),
-                    remark()
+                "%s [shape=record  %s label=\"{%s|taskId:%s|onException:%s|state:%s%s%s%s}\"];",
+                this.taskId,
+                color(state),
+                this.getName(),
+                this.taskId,
+                this.exceptionAction.name(),
+                state.name(),
+                cost("|execute cost:%s", beginExecuteTs, endExecuteTs),
+                cost("|rollback cost:%s", beginRollbackTs, endRollbackTs),
+                remark()
             );
-        }catch (Exception e){
+        } catch (Exception e) {
             return "";
         }
+    }
+
+    @Override
+    public List<String> explainInfo() {
+        return new ArrayList<>();
     }
 
     @Override
     public String executionInfo() {
         try {
             return String.format(
-                    "[shape=record  %s label=\"{%s|taskId:%s|onException:%s|state:%s%s%s%s}\"];",
-                    color(state),
-                    this.getName(),
-                    this.taskId,
-                    this.exceptionAction.name(),
-                    state.name(),
-                    cost("|execute cost:%s", beginExecuteTs, endExecuteTs),
-                    cost("|rollback cost:%s", beginRollbackTs, endRollbackTs),
-                    remark()
+                "[shape=record  %s label=\"{%s|taskId:%s|onException:%s|state:%s%s%s%s}\"];",
+                color(state),
+                this.getName(),
+                this.taskId,
+                this.exceptionAction.name(),
+                state.name(),
+                cost("|execute cost:%s", beginExecuteTs, endExecuteTs),
+                cost("|rollback cost:%s", beginRollbackTs, endRollbackTs),
+                remark()
             );
-        }catch (Exception e){
+        } catch (Exception e) {
             return "";
         }
     }
@@ -351,13 +371,48 @@ public abstract class AbstractDdlTask extends HandlerCommon implements DdlTask {
     }
 
     private String color(DdlTaskState ddlTaskState) {
-        if (ddlTaskState == DdlTaskState.SUCCESS) {
+        if (ddlTaskState == DdlTaskState.SUCCESS && !isSkipExecute()) {
             return "fillcolor=\"#90ee90\" style=filled";
         } else if (ddlTaskState == DdlTaskState.DIRTY) {
             return "fillcolor=\"#fff68f\" style=filled";
-        } else if (ddlTaskState == DdlTaskState.ROLLBACK_SUCCESS) {
+        } else if (ddlTaskState == DdlTaskState.ROLLBACK_SUCCESS && !isSkipRollback()) {
             return "fillcolor=\"#f08080\" style=filled";
         }
         return "";
+    }
+
+    private void skipWrapper(BooleanSupplier skip, String actMsg, Runnable action) {
+        if (skip.getAsBoolean()) {
+            LOGGER.warn(
+                String.format(
+                    "%s for %s is skipped because of hint SKIP_DDL_TASKS = %s",
+                    actMsg,
+                    this.getName(),
+                    this.getName()));
+        } else {
+            action.run();
+        }
+    }
+
+    private void skipExecuteWrapper(String step, Runnable action) {
+        skipWrapper(this::isSkipExecute, "execute " + step, action);
+    }
+
+    private void skipRollbackWrapper(String step, Runnable action) {
+        skipWrapper(this::isSkipRollback, "rollback " + step, action);
+    }
+
+    /**
+     * FOR TEST USE ONLY !!
+     */
+    protected boolean isSkipExecute() {
+        return false;
+    }
+
+    /**
+     * FOR TEST USE ONLY !!
+     */
+    protected boolean isSkipRollback() {
+        return false;
     }
 }

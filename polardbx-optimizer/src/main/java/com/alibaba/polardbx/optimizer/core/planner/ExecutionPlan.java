@@ -16,14 +16,21 @@
 
 package com.alibaba.polardbx.optimizer.core.planner;
 
+import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.privilege.PrivilegeVerifyItem;
 import com.alibaba.polardbx.common.utils.Pair;
+import com.alibaba.polardbx.gms.metadb.encdb.EncdbRule;
 import com.alibaba.polardbx.optimizer.core.profiler.memory.PlanMemEstimation;
+import com.alibaba.polardbx.optimizer.core.rel.GatherReferencedGsiNameRelVisitor;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.core.CursorMeta;
+import com.alibaba.polardbx.optimizer.core.profiler.memory.PlanMemEstimation;
+import com.alibaba.polardbx.optimizer.core.rel.GatherReferencedGsiNameRelVisitor;
+import com.alibaba.polardbx.optimizer.hint.util.HintConverter;
 import com.alibaba.polardbx.optimizer.memory.MemoryPool;
 import com.alibaba.polardbx.optimizer.sharding.result.PlanShardInfo;
+import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.google.common.collect.Maps;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.sql.SqlNode;
@@ -41,8 +48,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * @author lingce.ldm 2017-09-08 15:23
@@ -61,12 +66,14 @@ public class ExecutionPlan {
     public enum DirectMode {
         // 访问的表都是在同一个库的单表的转发
         TABLE_DIRECT,
+        // 访问的表都是在同一个DN的单表的转发
+        MULTI_DB_TABLE_DIRECT,
         // 根据分片键点查的转发
         SHARDING_KEY_DIRECT,
         NONE;
 
         public boolean isDirect() {
-            return this == TABLE_DIRECT || this == SHARDING_KEY_DIRECT;
+            return this == TABLE_DIRECT || this == SHARDING_KEY_DIRECT || this == MULTI_DB_TABLE_DIRECT;
         }
     }
 
@@ -103,6 +110,12 @@ public class ExecutionPlan {
     private Set<String> schemaNames;
 
     /**
+     * all the gsi name that is referenced by plan
+     * Map<schema, Set<GsiName>>
+     */
+    private Map<String, Set<String>> referencedGsiNames;
+
+    /**
      * all shard info of plan
      */
     private Map<String, PlanShardInfo> planShardInfo = Maps.newConcurrentMap();
@@ -127,15 +140,54 @@ public class ExecutionPlan {
      */
     private boolean canOptByForcePrimary = false;
 
+    /**
+     * forbid xplan if the flag is set
+     */
+    private volatile boolean forbidXplan = false;
+
+    /**
+     * check tpSlow or not
+     */
+    private boolean checkTpSlow = true;
+
+    private Map<Integer, ParameterContext> constantParams = null;
+
+    /**
+     * A collection of hints used for this plan
+     */
+    private HintConverter.HintCollection hintCollection = null;
+
+    private boolean useColumnar = false;
+
+    /**
+     * plan输出的列对应的的origin column name
+     */
+    private List<List<String[]>> originColumnNames;
+
     public ExecutionPlan(SqlNode ast, RelNode plan, CursorMeta columnMeta, BitSet planProperties) {
         this(ast, plan, columnMeta);
         this.planProperties = planProperties;
+        if (this.referencedGsiNames == null) {
+            GatherReferencedGsiNameRelVisitor visitor = new GatherReferencedGsiNameRelVisitor();
+            if (plan != null) {
+                plan.accept(visitor);
+            }
+            this.referencedGsiNames = visitor.getReferencedGsiNames();
+        }
     }
 
     public ExecutionPlan(SqlNode ast, RelNode plan, CursorMeta columnMeta) {
         this.ast = ast;
         this.plan = plan;
         this.cursorMeta = columnMeta;
+
+        if (this.referencedGsiNames == null) {
+            GatherReferencedGsiNameRelVisitor visitor = new GatherReferencedGsiNameRelVisitor();
+            if (plan != null) {
+                plan.accept(visitor);
+            }
+            this.referencedGsiNames = visitor.getReferencedGsiNames();
+        }
     }
 
     public RelNode getPlan() {
@@ -197,6 +249,13 @@ public class ExecutionPlan {
         newExecutionPlan.isDirectShardingKey = this.isDirectShardingKey;
         newExecutionPlan.dbIndexAndTableName = this.dbIndexAndTableName;
         newExecutionPlan.canOptByForcePrimary = this.canOptByForcePrimary;
+        newExecutionPlan.referencedGsiNames = this.referencedGsiNames;
+        newExecutionPlan.constantParams = this.constantParams;
+        newExecutionPlan.hintCollection = this.hintCollection;
+        newExecutionPlan.useColumnar = this.useColumnar;
+        newExecutionPlan.forbidXplan = this.forbidXplan;
+        newExecutionPlan.originColumnNames = this.originColumnNames;
+        newExecutionPlan.checkTpSlow = this.checkTpSlow;
         return newExecutionPlan;
     }
 
@@ -315,9 +374,6 @@ public class ExecutionPlan {
     }
 
     public PlanShardInfo getPlanShardInfo(String key) {
-        if (!planShardInfo.containsKey(key)) {
-
-        }
         return planShardInfo.get(key);
     }
 
@@ -343,6 +399,60 @@ public class ExecutionPlan {
 
     public void setCanOptByForcePrimary(boolean canOptByForcePrimary) {
         this.canOptByForcePrimary = canOptByForcePrimary;
+    }
+
+    public boolean isForbidXplan() {
+        return forbidXplan;
+    }
+
+    public void disableXplanByFeedBack() {
+        this.forbidXplan = true;
+    }
+
+    public boolean isCheckTpSlow() {
+        return checkTpSlow;
+    }
+
+    public void disableCheckTpSlow() {
+        this.checkTpSlow = false;
+    }
+
+    public Map<String, Set<String>> getReferencedGsiNames() {
+        return referencedGsiNames;
+    }
+
+    public boolean isUseColumnar() {
+        return useColumnar;
+    }
+
+    public void setUseColumnar(boolean useColumnar) {
+        this.useColumnar = useColumnar;
+    }
+
+    public Map<Integer, ParameterContext> getConstantParams() {
+        return constantParams;
+    }
+
+    public void setConstantParams(Map<Integer, ParameterContext> constantParams) {
+        this.constantParams = constantParams;
+    }
+
+    public HintConverter.HintCollection getHintCollection() {
+        return hintCollection;
+    }
+
+    public ExecutionPlan setHintCollection(
+        HintConverter.HintCollection hintCollection) {
+        this.hintCollection = hintCollection;
+        return this;
+    }
+
+    public List<List<String[]>> getOriginColumnNames() {
+        return originColumnNames;
+    }
+
+    public void setOriginColumnNames(List<List<String[]>> originColumnNames) {
+        this.originColumnNames = originColumnNames;
     }
 
 }

@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.optimizer.view;
 
+import com.google.common.collect.Lists;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelInput;
@@ -53,9 +54,17 @@ public class InformationSchemaTableDetail extends VirtualView {
         columns.add(new RelDataTypeFieldImpl("TABLE_NAME", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
         columns.add(new RelDataTypeFieldImpl("INDEX_NAME", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
         columns.add(new RelDataTypeFieldImpl("PHYSICAL_TABLE", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+
         columns.add(
             new RelDataTypeFieldImpl("PARTITION_SEQ", i++, typeFactory.createSqlType(SqlTypeName.BIGINT_UNSIGNED)));
         columns.add(new RelDataTypeFieldImpl("PARTITION_NAME", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+
+        columns.add(
+            new RelDataTypeFieldImpl("SUBPARTITION_NAME", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+        columns.add(
+            new RelDataTypeFieldImpl("SUBPARTITION_TEMPLATE_NAME", i++,
+                typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+
         columns.add(
             new RelDataTypeFieldImpl("TABLE_ROWS", i++, typeFactory.createSqlType(SqlTypeName.BIGINT_UNSIGNED)));
         columns.add(
@@ -63,6 +72,7 @@ public class InformationSchemaTableDetail extends VirtualView {
         columns.add(
             new RelDataTypeFieldImpl("INDEX_LENGTH", i++, typeFactory.createSqlType(SqlTypeName.BIGINT_UNSIGNED)));
         columns.add(new RelDataTypeFieldImpl("BOUND_VALUE", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
+        columns.add(new RelDataTypeFieldImpl("SUB_BOUND_VALUE", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
         columns.add(new RelDataTypeFieldImpl("PERCENT", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
         columns.add(new RelDataTypeFieldImpl("STORAGE_INST_ID", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
         columns.add(new RelDataTypeFieldImpl("GROUP_NAME", i++, typeFactory.createSqlType(SqlTypeName.VARCHAR)));
@@ -84,11 +94,22 @@ public class InformationSchemaTableDetail extends VirtualView {
         return i == getTableSchemaIndex() || i == getTableNameIndex();
     }
 
-    public int getTableSchemaIndex() {
+    private static final List<Integer> INDEXABLE_COLUMNS;
+
+    static {
+        INDEXABLE_COLUMNS = Lists.newArrayList(getTableSchemaIndex(), getTableNameIndex());
+    }
+
+    @Override
+    List<Integer> indexableColumnList() {
+        return INDEXABLE_COLUMNS;
+    }
+
+    static public int getTableSchemaIndex() {
         return 0;
     }
 
-    public int getTableNameIndex() {
+    static public int getTableNameIndex() {
         return 2;
     }
 }

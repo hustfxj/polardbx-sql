@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.executor.balancer.stats;
 
+import com.alibaba.fastjson.JSON;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
@@ -31,6 +32,7 @@ import com.alibaba.polardbx.gms.partition.TablePartitionRecord;
 import com.alibaba.polardbx.gms.tablegroup.PartitionGroupRecord;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupAccessor;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupConfig;
+import com.alibaba.polardbx.gms.tablegroup.TableGroupDetailConfig;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupRecord;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupUtils;
 import com.alibaba.polardbx.gms.topology.GroupDetailInfoAccessor;
@@ -41,12 +43,16 @@ import com.alibaba.polardbx.gms.util.MetaDbLogUtil;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.config.table.ColumnMeta;
+import com.alibaba.polardbx.optimizer.config.table.SchemaManager;
+import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
 import com.alibaba.polardbx.optimizer.core.function.calc.scalar.filter.Like;
+import com.alibaba.polardbx.optimizer.partition.PartitionByDefinition;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
-import com.alibaba.polardbx.optimizer.partition.PartitionStrategy;
+import com.alibaba.polardbx.optimizer.partition.PartitionSpec;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionStrategy;
 import com.alibaba.polardbx.optimizer.partition.datatype.PartitionField;
 import com.alibaba.polardbx.optimizer.partition.datatype.PartitionFieldBuilder;
 import com.alibaba.polardbx.optimizer.partition.pruning.SearchDatumInfo;
@@ -56,8 +62,8 @@ import org.apache.calcite.jdbc.JavaTypeFactoryImpl;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeFieldImpl;
-import org.bouncycastle.util.StringList;
 import org.apache.commons.collections.CollectionUtils;
+import org.jetbrains.annotations.NotNull;
 
 import javax.annotation.Nullable;
 import java.math.BigDecimal;
@@ -80,6 +86,8 @@ import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static com.alibaba.polardbx.gms.tablegroup.TableGroupRecord.TG_TYPE_COLUMNAR_TBL_TG;
+
 /**
  * Maintain statistics of table-group
  *
@@ -89,24 +97,6 @@ import java.util.stream.IntStream;
 public class StatsUtils {
 
     private static final Logger logger = LoggerFactory.getLogger(StatsUtils.class);
-
-    public static List<TableGroupConfig> getTableGroupConfigs() {
-        List<TableGroupConfig> res = new ArrayList<>();
-
-        try (Connection connection = MetaDbUtil.getConnection()) {
-            TableGroupAccessor tableGroupAccessor = new TableGroupAccessor();
-            tableGroupAccessor.setConnection(connection);
-
-            List<String> schemaNames = tableGroupAccessor.getDistinctSchemaNames();
-            for (String schemaName : schemaNames) {
-                res.addAll(TableGroupUtils.getAllTableGroupInfoByDb(schemaName));
-            }
-        } catch (SQLException e) {
-            MetaDbLogUtil.META_DB_LOG.error(e);
-            throw GeneralUtil.nestedException(e);
-        }
-        return res;
-    }
 
     public static List<TableGroupConfig> getTableGroupConfigs(Set<String> schemaNames) {
         List<TableGroupConfig> res = new ArrayList<>();
@@ -178,7 +168,7 @@ public class StatsUtils {
     }
 
     public static List<TableGroupStat> getTableGroupsStats(String targetSchema, String targetTableGroup, Boolean idle) {
-        List<TableGroupConfig> tableGroupConfigs = TableGroupUtils.getAllTableGroupInfoByDb(targetSchema);
+        List<TableGroupDetailConfig> tableGroupConfigs = TableGroupUtils.getAllTableGroupDetailInfoByDb(targetSchema);
         tableGroupConfigs = tableGroupConfigs.stream()
             .filter(tgConfig -> tgConfig.getTableGroupRecord().getTg_name().equals(targetTableGroup))
             .collect(Collectors.toList());
@@ -196,20 +186,31 @@ public class StatsUtils {
             String.format("got table-group stats for schema(%s) cost %dms: %s", targetSchema, elapsed, tablesStatInfo));
 
         // iterate all table-groups
-        for (TableGroupConfig tableGroupConfig : tableGroupConfigs) {
+        for (TableGroupDetailConfig tableGroupConfig : tableGroupConfigs) {
             String schema = tableGroupConfig.getTableGroupRecord().schema;
             if (targetSchema != null && !targetSchema.equalsIgnoreCase(schema)) {
+                continue;
+            }
+            if (tableGroupConfig.getTableGroupRecord().tg_type == TG_TYPE_COLUMNAR_TBL_TG) {
                 continue;
             }
             TableGroupStat tableGroupStat = new TableGroupStat(tableGroupConfig);
 
             // iterate all tables in a table-group
-            for (TablePartRecordInfoContext tableContext : tableGroupConfig.getAllTables()) {
+            for (TablePartRecordInfoContext tableContext : tableGroupConfig.getTablesPartRecordInfoContext()) {
                 String table = tableContext.getTableName().toLowerCase(Locale.ROOT);
 
-                List<TablePartitionRecord> tablePartitionRecords =
-                    tableContext
-                        .filterPartitions(x -> x.partLevel != TablePartitionRecord.PARTITION_LEVEL_LOGICAL_TABLE);
+                List<TablePartitionRecord> tablePartitionRecords = null;
+                if (tableContext.getSubPartitionRecList().isEmpty()) {
+                    tablePartitionRecords =
+                        tableContext
+                            .filterPartitions(x -> x.partLevel != TablePartitionRecord.PARTITION_LEVEL_LOGICAL_TABLE);
+                } else {
+                    tablePartitionRecords =
+                        tableContext
+                            .filterSubPartitions(
+                                x -> x.partLevel != TablePartitionRecord.PARTITION_LEVEL_LOGICAL_TABLE);
+                }
                 Map<String, MySQLTablesRowVO> tableStatInfo = tablesStatInfo.get(table);
 
                 // TODO: use lock to avoid meta too old exception
@@ -248,7 +249,7 @@ public class StatsUtils {
      * @return stats
      */
     public static List<TableGroupStat> getTableGroupsStats(String targetSchema, @Nullable String targetTable) {
-        List<TableGroupConfig> tableGroupConfigs = TableGroupUtils.getAllTableGroupInfoByDb(targetSchema);
+        List<TableGroupDetailConfig> tableGroupConfigs = TableGroupUtils.getAllTableGroupDetailInfoByDb(targetSchema);
         List<TableGroupStat> res = new ArrayList<>();
         OptimizerContext oc =
             Objects.requireNonNull(OptimizerContext.getContext(targetSchema), targetSchema + " not exists");
@@ -260,26 +261,38 @@ public class StatsUtils {
             queryTableGroupStats(targetSchema, tableGroupConfigs);
         long elapsed = System.currentTimeMillis() - startMilli;
         SQLRecorderLogger.ddlLogger.info(
-            String.format("got table-group stats for schema(%s) cost %dms: %s", targetSchema, elapsed, tablesStatInfo));
+            String.format("got table-group stats for schema(%s) cost %dms: %s", targetSchema, elapsed,
+                JSON.toJSONString(tablesStatInfo)));
 
         // iterate all table-groups
-        for (TableGroupConfig tableGroupConfig : tableGroupConfigs) {
+        for (TableGroupDetailConfig tableGroupConfig : tableGroupConfigs) {
             String schema = tableGroupConfig.getTableGroupRecord().schema;
             if (targetSchema != null && !targetSchema.equalsIgnoreCase(schema)) {
+                continue;
+            }
+            if (tableGroupConfig.getTableGroupRecord().isColumnarTableGroup()) {
                 continue;
             }
             TableGroupStat tableGroupStat = new TableGroupStat(tableGroupConfig);
 
             // iterate all tables in a table-group
-            for (TablePartRecordInfoContext tableContext : tableGroupConfig.getAllTables()) {
+            for (TablePartRecordInfoContext tableContext : tableGroupConfig.getTablesPartRecordInfoContext()) {
                 String table = tableContext.getTableName().toLowerCase(Locale.ROOT);
                 if (targetTable != null && !targetTable.equalsIgnoreCase(table)) {
                     continue;
                 }
 
-                List<TablePartitionRecord> tablePartitionRecords =
-                    tableContext
-                        .filterPartitions(x -> x.partLevel != TablePartitionRecord.PARTITION_LEVEL_LOGICAL_TABLE);
+                List<TablePartitionRecord> tablePartitionRecords = null;
+                if (tableContext.getSubPartitionRecList().isEmpty()) {
+                    tablePartitionRecords =
+                        tableContext
+                            .filterPartitions(x -> x.partLevel != TablePartitionRecord.PARTITION_LEVEL_LOGICAL_TABLE);
+                } else {
+                    tablePartitionRecords =
+                        tableContext
+                            .filterSubPartitions(
+                                x -> x.partLevel != TablePartitionRecord.PARTITION_LEVEL_LOGICAL_TABLE);
+                }
                 Map<String, MySQLTablesRowVO> tableStatInfo = tablesStatInfo.get(table);
 
                 // TODO: use lock to avoid meta too old exception
@@ -423,11 +436,11 @@ public class StatsUtils {
      * @return <LogicalTable, <PhysicalTable, MySQLTablesRow>>
      */
     public static Map<String, Map<String, MySQLTablesRowVO>> queryTableGroupStats(String schema,
-                                                                                  List<TableGroupConfig> tableGroups) {
+                                                                                  List<TableGroupDetailConfig> tableGroups) {
         Map<String, Map<String, MySQLTablesRowVO>> result = new HashMap<>();
 
         Map<String, String> phyTable2LogicalTableMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        for (TableGroupConfig tg : tableGroups) {
+        for (TableGroupDetailConfig tg : tableGroups) {
             phyTable2LogicalTableMap.putAll(tg.phyToLogicalTables());
         }
 
@@ -442,6 +455,9 @@ public class StatsUtils {
                 String sql = genQueryPartitionGroupStatsSQL(physicalDb);
 
                 List<List<Object>> rows = queryGroupByPhyDb(schema, physicalDb, sql);
+//                SQLRecorderLogger.ddlLogger.info(
+//                    String.format("got group for phydb stats for schema(%s): %s", schema, JSON.toJSONString(rows)));
+
                 for (List<Object> row : rows) {
                     MySQLTablesRowVO rowVO = MySQLTablesRowVO.fromRow(row);
                     String physicalTable = rowVO.getPhyTable();
@@ -548,7 +564,46 @@ public class StatsUtils {
         return storageInstIdGroupNames;
     }
 
+    public static Map<String, List<String>> queryAllGroupNameAndInstId(String schemaName) {
+        Map<String, List<String>> storageInstIdGroupNames = new HashMap<>();
+        try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
+
+            GroupDetailInfoAccessor groupDetailInfoAccessor = new GroupDetailInfoAccessor();
+            groupDetailInfoAccessor.setConnection(metaDbConn);
+            List<GroupDetailInfoExRecord> completedGroupInfos =
+                groupDetailInfoAccessor.getCompletedGroupInfosByInstId(InstIdUtil.getInstId());
+            Collections.sort(completedGroupInfos);
+
+            for (GroupDetailInfoExRecord groupDetailInfoExRecord : completedGroupInfos) {
+                if (schemaName == null || !schemaName.equalsIgnoreCase(groupDetailInfoExRecord.getDbName())) {
+                    continue;
+                }
+                String instId = groupDetailInfoExRecord.storageInstId;
+                String groupName = groupDetailInfoExRecord.groupName;
+                storageInstIdGroupNames.putIfAbsent(instId, new ArrayList<>());
+                storageInstIdGroupNames.get(instId).add(groupName);
+            }
+        } catch (Throwable ex) {
+            throw GeneralUtil.nestedException("Failed to get storage and phy db info", ex);
+        }
+        return storageInstIdGroupNames;
+    }
+
     /**
+     * <pre>
+     *
+     * 0: PART_DESC
+     * 1: LOGICAL_TABLE_NAME
+     * 2: PHYSICAL_TABLE
+     * 3: PHYSICAL_SCHEMA
+     * 4: TABLE_ROWS
+     * 5: DATA_LENGTH
+     * 6: INDEX_LENGTH
+     * 7: ROWS_READ
+     * 8: ROWS_INSERTED
+     * 9: ROWS_UPDATED
+     * 10: ROWS_DELETED
+     * </pre>
      * Query statistics of all filtered schema
      */
     public static Map<String, Map<String, List<Object>>> queryTableSchemaStats(Set<String> schemaNames,
@@ -582,10 +637,11 @@ public class StatsUtils {
             }
 
             // get phy tables info from each data node
-            String sql = generateQueryPhyTablesStatsSQL(allPhyDbNames, indexTableNames, tableLike);
+            String sql = generateQueryPhyTablesStatsSQL(schemaName, allPhyDbNames, indexTableNames, tableLike);
 
             // get phy tables statistic
-            String statisticSql = generateQueryPhyTablesStatisticsSQL(allPhyDbNames, indexTableNames, tableLike);
+            String statisticSql =
+                generateQueryPhyTablesStatisticsSQL(schemaName, allPhyDbNames, indexTableNames, tableLike);
 
             List<List<Object>> rows = new ArrayList<>();
             List<List<Object>> statisticRows = new ArrayList<>();
@@ -662,9 +718,10 @@ public class StatsUtils {
             }
 
             String sql =
-                generateQueryPhyTablesStatsSQLForHeatmap(allPhyDbNames, indexTableNames, maxSingleLogicSchemaCount);
+                generateQueryPhyTablesStatsSQLForHeatmap(schemaName, allPhyDbNames, indexTableNames,
+                    maxSingleLogicSchemaCount);
 
-            String countSql = generateQueryPhyTablesCountSQLForHeatmap(allPhyDbNames, indexTableNames);
+            String countSql = generateQueryPhyTablesCountSQLForHeatmap(schemaName, allPhyDbNames, indexTableNames);
 
             List<List<Object>> rows = new ArrayList<>();
             for (String phyDbName : phyDbNames) {
@@ -746,9 +803,11 @@ public class StatsUtils {
             }
 
             String sql =
-                generateQueryPhyStaticsSQLForHeatmap(allPhyDbNames, indexTableNames, maxSingleLogicSchemaCount);
+                generateQueryPhyStaticsSQLForHeatmap(schemaName, allPhyDbNames, indexTableNames,
+                    maxSingleLogicSchemaCount);
 
-            String countSql = generateQueryPhyTableStatisticsCountSQLForHeatmap(allPhyDbNames, indexTableNames);
+            String countSql =
+                generateQueryPhyTableStatisticsCountSQLForHeatmap(schemaName, allPhyDbNames, indexTableNames);
 
             List<List<Object>> rows = new ArrayList<>();
             for (String phyDbName : phyDbNames) {
@@ -789,47 +848,58 @@ public class StatsUtils {
         Set<String> indexTableNames,
         String tableLike,
         Map<String, Map<String, List<Object>>> phyDbTablesInfoForHeatmap) {
+        TableGroupRecord tableGroupRecord = tableGroupConfig.getTableGroupRecord();
+        String targetSchema = tableGroupRecord.getSchema();
+        OptimizerContext oc =
+            Objects.requireNonNull(OptimizerContext.getContext(targetSchema), targetSchema + " not exists");
+        PartitionInfoManager pm = oc.getPartitionInfoManager();
         Map<String, Map<String, List<Object>>> result = new HashMap<>();
         for (PartitionGroupRecord partitionGroupRecord : tableGroupConfig.getPartitionGroupRecords()) {
-            for (TablePartRecordInfoContext tablePartRecordInfoContext : tableGroupConfig.getAllTables()) {
+            for (String logicalTableName : tableGroupConfig.getAllTables()) {
                 // table name filter
-                String logicalTableName = tablePartRecordInfoContext.getTableName().toLowerCase();
+                logicalTableName = logicalTableName.toLowerCase();
                 if (!isFilterTable(indexTableNames, tableLike, logicalTableName)) {
                     continue;
                 }
-
-                long partitionGroupId = partitionGroupRecord.id;
-                List<TablePartitionRecord> tablePartitionRecords =
-                    tablePartRecordInfoContext.getPartitionRecListByGroupId(partitionGroupId);
-                if (CollectionUtils.isEmpty(tablePartitionRecords)) {
+                PartitionInfo partitionInfo = pm.getPartitionInfo(logicalTableName);
+                if (partitionInfo == null) {
                     logger.warn(String.format(
-                        "queryTableGroupStatsForHeatmap tablePartitionRecords is null. logicalTableName=%s, partitionGroupId=%s",
+                        "queryTableGroupStatsForHeatmap partitionInfo is null. logicalTableName=%s",
+                        logicalTableName));
+                    continue;
+                }
+                long partitionGroupId = partitionGroupRecord.id;
+                PartitionSpec partitionSpec =
+                    partitionInfo.getPartitionBy().getPhysicalPartitions().stream()
+                        .filter(o -> o.getLocation().getPartitionGroupId().longValue() == partitionGroupId).findFirst()
+                        .orElse(null);
+                if (partitionSpec == null) {
+                    logger.warn(String.format(
+                        "queryTableGroupStatsForHeatmap PartitionSpec is null. logicalTableName=%s, partitionGroupId=%s",
                         logicalTableName, partitionGroupId));
                     continue;
                 }
-                for (TablePartitionRecord tablePartitionRecord : tablePartitionRecords) {
-                    String phyDbName = partitionGroupRecord.phy_db.toLowerCase();
-                    String phyTbName = tablePartitionRecord.phyTable.toLowerCase();
-                    List<Object> row;
-                    try {
-                        Map<String, List<Object>> phyTablesMap = phyDbTablesInfoForHeatmap.get(phyDbName);
-                        if (phyTablesMap == null) {
-                            row = getDefaultRowList(phyTbName, phyDbName);
-                        } else {
-                            row = phyTablesMap.get(phyTbName);
-                        }
-                        if (row == null) {
-                            //row is null when phy table numbers is over max number. or not be accessed.
-                            row = getDefaultRowList(phyTbName, phyDbName);
-                        }
-                    } catch (Exception ex) {
-                        throw GeneralUtil.nestedException("Failed to get physical table info ", ex);
+                String phyDbName = partitionGroupRecord.phy_db.toLowerCase();
+                String phyTbName = partitionSpec.getLocation().getPhyTableName().toLowerCase();
+                List<Object> row;
+                try {
+                    Map<String, List<Object>> phyTablesMap = phyDbTablesInfoForHeatmap.get(phyDbName);
+                    if (phyTablesMap == null) {
+                        row = getDefaultRowList(phyTbName, phyDbName);
+                    } else {
+                        row = phyTablesMap.get(phyTbName);
                     }
-
-                    Map<String, List<Object>> table =
-                        result.computeIfAbsent(logicalTableName, x -> new HashMap<>());
-                    table.put(phyTbName, row);
+                    if (row == null) {
+                        //row is null when phy table numbers is over max number. or not be accessed.
+                        row = getDefaultRowList(phyTbName, phyDbName);
+                    }
+                } catch (Exception ex) {
+                    throw GeneralUtil.nestedException("Failed to get physical table info ", ex);
                 }
+
+                Map<String, List<Object>> table =
+                    result.computeIfAbsent(logicalTableName, x -> new HashMap<>());
+                table.put(phyTbName, row);
             }
         }
 
@@ -841,115 +911,277 @@ public class StatsUtils {
     }
 
     /**
+     * <pre>
+     *  key: logTbName
+     *  val:
+     *      key: phyTb
+     *      val: Map:
+     *          key: boundValue
+     *          key: subBoundValue
+     *          key: phyPartPosition
+     *          key: logicalTable
+     *          key: partitionName
+     *          key: subPartitionName
+     *          key: subPartitionTemplateName
+     *          key: phyPartPosition
+     *          key: physicalTable
+     *          key: physicalSchema
+     *          key: physicalTableRows
+     *          key: physicalDataLength
+     *          key: physicalIndexLength
+     *          key: physicalRowsRead
+     *          key: physicalRowsInserted
+     *          key: physicalRowsUpdated
+     *          key: physicalRowsDeleted
+     * </pre>
+     * <p>
      * Query statistics of a table-group
      */
-    public static Map<String, Map<String, List<Object>>> queryTableGroupStats(TableGroupConfig tableGroupConfig,
-                                                                              Set<String> indexTableNames,
-                                                                              String tableLike,
-                                                                              Map<String, Map<String, List<Object>>> phyDbTablesInfo) {
-        Map<String, Map<String, List<Object>>> result = new HashMap<>();
+    public static Map<String, Map<String, Map<String, Object>>> queryTableGroupStatInfos(
+        TableGroupConfig tableGroupConfig,
+        Set<String> indexTableNames,
+        String tableLike,
+        Map<String, Map<String, List<Object>>> phyDbTablesInfo) {
+        Map<String, Map<String, Map<String, Object>>> result = new HashMap<>();
         int tableGroupType =
             tableGroupConfig.getTableGroupRecord() != null ? tableGroupConfig.getTableGroupRecord().tg_type :
                 TableGroupRecord.TG_TYPE_PARTITION_TBL_TG;
         boolean isBroadCastTg = (tableGroupType == TableGroupRecord.TG_TYPE_BROADCAST_TBL_TG);
 
+        /**
+         * scan each partition group
+         */
+        String dbName = tableGroupConfig.getTableGroupRecord().getSchema();
+        SchemaManager latestSchemaManager = OptimizerContext.getContext(dbName).getLatestSchemaManager();
         for (PartitionGroupRecord partitionGroupRecord : tableGroupConfig.getPartitionGroupRecords()) {
-            for (TablePartRecordInfoContext tablePartRecordInfoContext : tableGroupConfig.getAllTables()) {
-                // table name filter
-                String logicalTableName = tablePartRecordInfoContext.getTableName().toLowerCase();
+
+            /**
+             * scan each logical table of table group
+             */
+            for (String logicalTableName : tableGroupConfig.getAllTables()) {
+
+                /**
+                 * Filter unused tableName by tableLike, logicalTableName may be gsi or logTb
+                 */
+                logicalTableName = logicalTableName.toLowerCase();
                 if (!isFilterTable(indexTableNames, tableLike, logicalTableName)) {
                     continue;
                 }
 
-                long partitionGroupId = partitionGroupRecord.id;
-                List<TablePartitionRecord> tablePartitionRecords =
-                    tablePartRecordInfoContext.getPartitionRecListByGroupId(partitionGroupId);
-                assert GeneralUtil.isNotEmpty(tablePartitionRecords);
-                int partCols = GeneralUtil.isNotEmpty(tablePartitionRecords) ?
-                    countPartitionColumns(tablePartitionRecords.get(0)) : 1;
-                boolean multiDatum = (partCols > 1) && !isHashPartitionStrategy(tablePartitionRecords.get(0));
-                boolean isList = GeneralUtil.isNotEmpty(tablePartitionRecords) ?
-                    isListPartitionStrategy(tablePartitionRecords.get(0)) : false;
-                for (TablePartitionRecord tablePartitionRecord : tablePartitionRecords) {
-                    String phyDbName = partitionGroupRecord.phy_db.toLowerCase();
-                    String phyTbName = tablePartitionRecord.phyTable.toLowerCase();
-                    List<Object> row;
-                    try {
-                        Map<String, List<Object>> phyTablesMap = phyDbTablesInfo.get(phyDbName);
-                        if (phyTablesMap == null) {
-                            continue;
-                        }
-                        row = phyTablesMap.get(phyTbName);
-                        if (row == null) {
-                            //row is null when phy table numbers is over max number.
-                            continue;
-                        }
-                    } catch (Exception ex) {
-                        throw GeneralUtil.nestedException("Failed to get physical table info ", ex);
+                String pgName = partitionGroupRecord.partition_name;
+
+                /**
+                 * Fetch partInfo by dbName and logicalTableName
+                 */
+                TableMeta tableMeta = latestSchemaManager.getTable(logicalTableName);
+                PartitionInfo partInfo = tableMeta.getPartitionInfo();
+                boolean useSubPart = partInfo.getPartitionBy().getSubPartitionBy() != null;
+
+                PartitionSpec phySpec = partInfo.getPartSpecSearcher().getPartSpecByPartName(pgName);
+                PartitionSpec parentPartSpec = null;
+                PartitionSpec lastPhySpec = null;
+                PartitionSpec lastParentPartSpec = null;
+                Long parentPartPosi = phySpec.getParentPartPosi();
+                Long partPosiOfPhyPart = phySpec.getPosition();
+                List<PartitionSpec> topLevelPartSpecs = partInfo.getPartitionBy().getPartitions();
+                if (useSubPart) {
+                    parentPartSpec = topLevelPartSpecs.get(parentPartPosi.intValue() - 1);
+                    if (partPosiOfPhyPart.intValue() > 1) {
+                        Long partPosiOfLastPhyPart = partPosiOfPhyPart - 1;
+                        lastPhySpec = parentPartSpec.getSubPartitions().get(partPosiOfLastPhyPart.intValue() - 1);
+                    }
+                    if (parentPartPosi > 1) {
+                        Long partPosiOfLastParentPart = parentPartPosi - 1;
+                        lastParentPartSpec = topLevelPartSpecs.get(partPosiOfLastParentPart.intValue() - 1);
+                    }
+                } else {
+                    Long partPosiOfLastPhyPart = partPosiOfPhyPart - 1;
+                    if (partPosiOfPhyPart.intValue() > 1) {
+                        lastPhySpec = topLevelPartSpecs.get(partPosiOfLastPhyPart.intValue() - 1);
+                    }
+                }
+
+                String phyDbName = partitionGroupRecord.phy_db.toLowerCase();
+                String phyTbName = phySpec.getLocation().getPhyTableName().toLowerCase();
+                List<Object> row;
+                try {
+                    Map<String, List<Object>> phyTablesMap = phyDbTablesInfo.get(phyDbName);
+                    if (phyTablesMap == null) {
+                        continue;
+                    }
+                    row = phyTablesMap.get(phyTbName);
+                    if (row == null) {
+                        //row is null when phy table numbers is over max number.
+                        continue;
                     }
 
-                    StringBuilder partDesc = new StringBuilder();
-                    if (!isBroadCastTg) {
-                        if (tablePartitionRecord.partPosition > 1) {
-                            TablePartitionRecord lastPart =
-                                tablePartRecordInfoContext
-                                    .getPartitionByPosition((int) (tablePartitionRecord.partPosition - 1));
-                            if (isList) {
-                                partDesc.append("(");
-                            } else {
-                                partDesc.append("[");
-                            }
-                            if (lastPart != null && !isList) {
-                                if (multiDatum) {
-                                    partDesc.append("(");
-                                }
-                                partDesc.append(lastPart.partDesc.replaceAll("'", ""));
-                                if (multiDatum) {
-                                    partDesc.append(")");
-                                }
-                                partDesc.append(", ");
-                            }
-                        } else {
-                            if (!isList) {
-                                if (multiDatum) {
-                                    for (int i = 0; i < partCols; i++) {
-                                        if (i == 0) {
-                                            partDesc.append("[(MINVALUE");
-                                        } else {
-                                            partDesc.append(",MINVALUE");
-                                        }
-                                    }
-                                    partDesc.append("),");
-                                } else {
-                                    partDesc.append("[MINVALUE, ");
-                                }
-                            } else {
-                                partDesc.append("(");
-                            }
+                    String pName = "";
+                    String spName = "";
+                    String spTempName = "";
+                    Long globalPhyPartSpecPosi = null;
+
+                    String boundValue = "";
+                    String subBoundValue = "";
+                    if (useSubPart) {
+                        PartitionByDefinition subPartBy = partInfo.getPartitionBy().getSubPartitionBy();
+                        Long subPartPosi = partPosiOfPhyPart;
+                        String subPartDescVal = phySpec.getBoundSpec().toString();
+                        String lastSubPartDescVal = null;
+                        if (lastPhySpec != null) {
+                            lastSubPartDescVal = lastPhySpec.getBoundSpec().toString();
                         }
-                        if (multiDatum) {
-                            partDesc.append("(");
+                        int subpartCols = subPartBy.getPartitionColumnNameList().size();
+                        boolean multiDatumOfSubPart = (subpartCols > 1) && !subPartBy.getStrategy().isHashed();
+                        boolean isSubPartList = subPartBy.getStrategy().isList();
+                        subBoundValue =
+                            buildCompleteBoundVal(isBroadCastTg, subPartPosi, subPartDescVal, lastSubPartDescVal,
+                                subpartCols, multiDatumOfSubPart, isSubPartList);
+
+                        PartitionByDefinition partBy = partInfo.getPartitionBy();
+                        Long partPosi = parentPartPosi;
+                        String partDescVal = parentPartSpec.getBoundSpec().toString();
+                        String lastPartDescVal = null;
+                        if (lastParentPartSpec != null) {
+                            lastPartDescVal = lastParentPartSpec.getBoundSpec().toString();
                         }
-                        partDesc.append(tablePartitionRecord.partDesc.replaceAll("'", ""));
-                        if (multiDatum) {
-                            partDesc.append(")");
-                        }
-                        partDesc.append(")");
+                        int partCols = partBy.getPartitionColumnNameList().size();
+                        boolean multiDatumOfPart = (partCols > 1) && !partBy.getStrategy().isHashed();
+                        boolean isPartList = partBy.getStrategy().isList();
+                        boundValue = buildCompleteBoundVal(isBroadCastTg, partPosi, partDescVal, lastPartDescVal,
+                            partCols, multiDatumOfPart, isPartList);
+
+                        spName = phySpec.getName();
+                        spTempName = phySpec.getTemplateName();
+                        pName = parentPartSpec.getName();
                     } else {
-                        partDesc.append("[MINVALUE, MAXVALUE)");
+                        PartitionByDefinition partBy = partInfo.getPartitionBy();
+                        Long partPosi = phySpec.getPosition();
+                        String partDescVal = phySpec.getBoundSpec().toString();
+                        String lastPartDescVal = null;
+                        if (lastPhySpec != null) {
+                            lastPartDescVal = lastPhySpec.getBoundSpec().toString();
+                        }
+                        int partCols = partBy.getPartitionColumnNameList().size();
+                        boolean multiDatumOfPart = (partCols > 1) && !partBy.getStrategy().isHashed();
+                        boolean isPartList = partBy.getStrategy().isList();
+                        boundValue = buildCompleteBoundVal(isBroadCastTg, partPosi, partDescVal, lastPartDescVal,
+                            partCols, multiDatumOfPart, isPartList);
+                        pName = phySpec.getName();
                     }
-                    row.set(0, partDesc.toString());
-                    row.set(1, logicalTableName);
-                    row.remove(3);
+                    globalPhyPartSpecPosi = phySpec.getPhyPartPosition();
 
-                    Map<String, List<Object>> table =
+                    Map<String, Object> phyTbStatInfo = new HashMap<>();
+
+                    phyTbStatInfo.put("boundValue", boundValue);
+                    phyTbStatInfo.put("subBoundValue", subBoundValue);
+                    phyTbStatInfo.put("logicalTable", logicalTableName.toLowerCase());
+                    phyTbStatInfo.put("partName", pName);
+                    phyTbStatInfo.put("subpartName", spName);
+                    phyTbStatInfo.put("subpartTemplateName", spTempName);
+                    phyTbStatInfo.put("phyPartPosition", globalPhyPartSpecPosi);
+
+                    Object physicalTable = row.get(2);
+                    phyTbStatInfo.put("physicalTable", physicalTable);
+
+                    Object physicalSchema = row.get(3);
+                    phyTbStatInfo.put("physicalSchema", physicalSchema);
+
+                    Object physicalTableRows = row.get(4);
+                    phyTbStatInfo.put("physicalTableRows", physicalTableRows);
+
+                    Object physicalDataLength = row.get(5);
+                    phyTbStatInfo.put("physicalDataLength", physicalDataLength);
+
+                    Object physicalIndexLength = row.get(6);
+                    phyTbStatInfo.put("physicalIndexLength", physicalIndexLength);
+
+                    if (row.size() > 7) {
+                        // ROWS_READ
+                        Object physicalRowsRead = row.get(7);
+                        phyTbStatInfo.put("physicalRowsRead", physicalRowsRead);
+
+                        // ROWS_INSERTED
+                        Object physicalRowsInserted = row.get(8);
+                        phyTbStatInfo.put("physicalRowsInserted", physicalRowsInserted);
+
+                        // ROWS_UPDATED
+                        Object physicalRowsUpdated = row.get(9);
+                        phyTbStatInfo.put("physicalRowsUpdated", physicalRowsUpdated);
+
+                        // ROWS_DELETED
+                        Object physicalRowsDeleted = row.get(10);
+                        phyTbStatInfo.put("physicalRowsDeleted", physicalRowsDeleted);
+                    }
+
+                    Map<String, Map<String, Object>> table =
                         result.computeIfAbsent(logicalTableName.toLowerCase(), x -> new HashMap<>());
-                    table.put(phyTbName.toLowerCase(), row);
+                    table.put(phyTbName.toLowerCase(), phyTbStatInfo);
+
+                } catch (Exception ex) {
+                    throw GeneralUtil.nestedException("Failed to get physical table info ", ex);
                 }
             }
         }
 
         return result;
+    }
+
+    @NotNull
+    private static String buildCompleteBoundVal(boolean isBroadCastTg,
+                                                Long partPosi,
+                                                String partDescVal,
+                                                String lastPartDescVal,
+                                                int partCols,
+                                                boolean multiDatum,
+                                                boolean isList) {
+        StringBuilder partDesc = new StringBuilder();
+        if (!isBroadCastTg) {
+            if (partPosi > 1) {
+                if (isList) {
+                    partDesc.append("(");
+                } else {
+                    partDesc.append("[");
+                }
+                if (lastPartDescVal != null && !isList) {
+                    if (multiDatum) {
+                        partDesc.append("(");
+                    }
+                    partDesc.append(lastPartDescVal.replaceAll("'", ""));
+                    if (multiDatum) {
+                        partDesc.append(")");
+                    }
+                    partDesc.append(", ");
+                }
+            } else {
+                if (!isList) {
+                    if (multiDatum) {
+                        for (int i = 0; i < partCols; i++) {
+                            if (i == 0) {
+                                partDesc.append("[(MINVALUE");
+                            } else {
+                                partDesc.append(",MINVALUE");
+                            }
+                        }
+                        partDesc.append("),");
+                    } else {
+                        partDesc.append("[MINVALUE, ");
+                    }
+                } else {
+                    partDesc.append("(");
+                }
+            }
+            if (multiDatum) {
+                partDesc.append("(");
+            }
+            partDesc.append(partDescVal.replaceAll("'", ""));
+            if (multiDatum) {
+                partDesc.append(")");
+            }
+            partDesc.append(")");
+        } else {
+            partDesc.append("[MINVALUE, MAXVALUE)");
+        }
+        return partDesc.toString();
     }
 
     public static boolean isFilterTable(Set<String> indexTableNames, String tableLike, String logicalTableName) {
@@ -1080,13 +1312,22 @@ public class StatsUtils {
             phyDb, phyTableName);
     }
 
+    public static String genAvgTableRowLengthSQL(String phyDb, String phyTableName) {
+        return String.format(
+            "SELECT IFNULL(`AVG_ROW_LENGTH`, 0) from INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = \"%s\" AND TABLE_NAME = \"%s\"",
+            phyDb, phyTableName
+        );
+    }
+
     /**
      * Build a SQL to collect stats of mysql table
      */
-    private static String generateQueryPhyTablesStatsSQL(Set<String> schemaNames, Set<String> indexTableNames,
+    private static String generateQueryPhyTablesStatsSQL(String logicalSchema, Set<String> schemaNames,
+                                                         Set<String> indexTableNames,
                                                          String tableLike) {
         StringBuilder sb = new StringBuilder();
         int schemaIndex = 0;
+        SchemaManager sm = OptimizerContext.getContext(logicalSchema).getLatestSchemaManager();
         for (String schemaName : schemaNames) {
             if (schemaIndex != 0) {
                 sb.append(" union all ");
@@ -1110,7 +1351,15 @@ public class StatsUtils {
                 sb.append(" and (");
                 schemaIndex = 0;
                 for (String tableName : indexTableNames) {
-                    String filter = "table_name like '" + tableName + "%'";
+                    String pattern;
+                    try {
+                        PartitionInfo partitionInfo = sm.getTable(tableName).getPartitionInfo();
+                        pattern = partitionInfo.getTableNamePattern();
+                    } catch (Exception ex) {
+                        pattern = tableName;
+                    }
+
+                    String filter = "table_name like '" + pattern + "%'";
                     if (schemaIndex != 0) {
                         sb.append(" or ");
                     }
@@ -1129,8 +1378,10 @@ public class StatsUtils {
         return sb.toString();
     }
 
-    private static String generateQueryPhyTablesCountSQLForHeatmap(Set<String> schemaNames,
+    private static String generateQueryPhyTablesCountSQLForHeatmap(String logicalSchema,
+                                                                   Set<String> schemaNames,
                                                                    Set<String> indexTableNames) {
+        SchemaManager sm = OptimizerContext.getContext(logicalSchema).getLatestSchemaManager();
         StringBuilder sb = new StringBuilder();
         int schemaIndex = 0;
         for (String schemaName : schemaNames) {
@@ -1151,7 +1402,15 @@ public class StatsUtils {
                 sb.append(" and (");
                 schemaIndex = 0;
                 for (String tableName : indexTableNames) {
-                    String filter = "table_name like '" + tableName + "%'";
+                    String pattern;
+                    try {
+                        PartitionInfo partitionInfo = sm.getTable(tableName).getPartitionInfo();
+                        pattern = partitionInfo.getTableNamePattern();
+                    } catch (Exception ex) {
+                        pattern = tableName;
+                    }
+
+                    String filter = "table_name like '" + pattern + "%'";
                     if (schemaIndex != 0) {
                         sb.append(" or ");
                     }
@@ -1165,9 +1424,11 @@ public class StatsUtils {
         return sb.toString();
     }
 
-    private static String generateQueryPhyTableStatisticsCountSQLForHeatmap(Set<String> schemaNames,
+    private static String generateQueryPhyTableStatisticsCountSQLForHeatmap(String logicalSchema,
+                                                                            Set<String> schemaNames,
                                                                             Set<String> indexTableNames) {
         StringBuilder sb = new StringBuilder();
+        SchemaManager sm = OptimizerContext.getContext(logicalSchema).getLatestSchemaManager();
         int schemaIndex = 0;
         for (String schemaName : schemaNames) {
             if (schemaIndex != 0) {
@@ -1187,7 +1448,15 @@ public class StatsUtils {
                 sb.append(" and (");
                 schemaIndex = 0;
                 for (String tableName : indexTableNames) {
-                    String filter = "table_name like '" + tableName + "%'";
+                    String pattern;
+                    try {
+                        PartitionInfo partitionInfo = sm.getTable(tableName).getPartitionInfo();
+                        pattern = partitionInfo.getTableNamePattern();
+                    } catch (Exception ex) {
+                        pattern = tableName;
+                    }
+
+                    String filter = "table_name like '" + pattern + "%'";
                     if (schemaIndex != 0) {
                         sb.append(" or ");
                     }
@@ -1201,10 +1470,12 @@ public class StatsUtils {
         return sb.toString();
     }
 
-    private static String generateQueryPhyTablesStatsSQLForHeatmap(Set<String> schemaNames, Set<String> indexTableNames,
+    private static String generateQueryPhyTablesStatsSQLForHeatmap(String logicalSchema, Set<String> schemaNames,
+                                                                   Set<String> indexTableNames,
                                                                    Integer maxSingleLogicSchemaCount) {
         StringBuilder sb = new StringBuilder();
         int schemaIndex = 0;
+        SchemaManager sm = OptimizerContext.getContext(logicalSchema).getLatestSchemaManager();
         int limit = maxSingleLogicSchemaCount / schemaNames.size();
         for (String schemaName : schemaNames) {
             if (schemaIndex != 0) {
@@ -1232,7 +1503,15 @@ public class StatsUtils {
                 sb.append(" and (");
                 schemaIndex = 0;
                 for (String tableName : indexTableNames) {
-                    String filter = "t.table_name like '" + tableName + "%'";
+                    String pattern;
+                    try {
+                        PartitionInfo partitionInfo = sm.getTable(tableName).getPartitionInfo();
+                        pattern = partitionInfo.getTableNamePattern();
+                    } catch (Exception ex) {
+                        pattern = tableName;
+                    }
+
+                    String filter = "table_name like '" + pattern + "%'";
                     if (schemaIndex != 0) {
                         sb.append(" or ");
                     }
@@ -1250,10 +1529,12 @@ public class StatsUtils {
         return sb.toString();
     }
 
-    private static String generateQueryPhyStaticsSQLForHeatmap(Set<String> schemaNames, Set<String> indexTableNames,
+    private static String generateQueryPhyStaticsSQLForHeatmap(String logicalSchema, Set<String> schemaNames,
+                                                               Set<String> indexTableNames,
                                                                Integer maxSingleLogicSchemaCount) {
         StringBuilder sb = new StringBuilder();
         int schemaIndex = 0;
+        SchemaManager sm = OptimizerContext.getContext(logicalSchema).getLatestSchemaManager();
         int limit = maxSingleLogicSchemaCount / schemaNames.size();
         for (String schemaName : schemaNames) {
             if (schemaIndex != 0) {
@@ -1280,7 +1561,15 @@ public class StatsUtils {
                 sb.append(" and (");
                 schemaIndex = 0;
                 for (String tableName : indexTableNames) {
-                    String filter = "s.table_name like '" + tableName + "%'";
+                    String pattern;
+                    try {
+                        PartitionInfo partitionInfo = sm.getTable(tableName).getPartitionInfo();
+                        pattern = partitionInfo.getTableNamePattern();
+                    } catch (Exception ex) {
+                        pattern = tableName;
+                    }
+
+                    String filter = "table_name like '" + pattern + "%'";
                     if (schemaIndex != 0) {
                         sb.append(" or ");
                     }
@@ -1301,10 +1590,12 @@ public class StatsUtils {
     /**
      * Build a SQL to query information_schema.table_statistics
      */
-    private static String generateQueryPhyTablesStatisticsSQL(Set<String> schemaNames, Set<String> indexTableNames,
+    private static String generateQueryPhyTablesStatisticsSQL(String logicalSchema, Set<String> schemaNames,
+                                                              Set<String> indexTableNames,
                                                               String tableLike) {
         StringBuilder sb = new StringBuilder();
         int schemaIndex = 0;
+        SchemaManager sm = OptimizerContext.getContext(logicalSchema).getLatestSchemaManager();
         for (String schemaName : schemaNames) {
             // select
             sb.append(schemaIndex == 0 ? "SELECT " : " UNION ALL SELECT ");
@@ -1326,7 +1617,15 @@ public class StatsUtils {
                 sb.append(" and (");
                 schemaIndex = 0;
                 for (String tableName : indexTableNames) {
-                    String filter = "table_name like '" + tableName + "%'";
+                    String pattern;
+                    try {
+                        PartitionInfo partitionInfo = sm.getTable(tableName).getPartitionInfo();
+                        pattern = partitionInfo.getTableNamePattern();
+                    } catch (Exception ex) {
+                        pattern = tableName;
+                    }
+
+                    String filter = "table_name like '" + pattern + "%'";
                     if (schemaIndex != 0) {
                         sb.append(" or ");
                     }

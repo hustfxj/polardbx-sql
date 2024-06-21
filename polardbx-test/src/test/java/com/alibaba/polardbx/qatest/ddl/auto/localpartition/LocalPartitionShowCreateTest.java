@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.qatest.ddl.auto.localpartition;
 
+import com.alibaba.polardbx.qatest.BinlogIgnore;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import org.junit.After;
 import org.junit.Assert;
@@ -23,6 +24,7 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
+@BinlogIgnore(ignoreReason = "drop local partition的动作目前无法透传给下游，导致binlog实验室上下游数据不一致，暂时忽略")
 public class LocalPartitionShowCreateTest extends LocalPartitionBaseTest {
 
     private String primaryTableName;
@@ -65,6 +67,11 @@ public class LocalPartitionShowCreateTest extends LocalPartitionBaseTest {
         validateLocalPartition(tddlConnection, primaryTableName);
 
         String showCreateTableInfo = showCreateTable(tddlConnection, primaryTableName);
+        if (isMySQL80()) {
+            showCreateTableInfo = showCreateTableInfo.replace(" DEFAULT COLLATE = utf8mb4_general_ci", "");
+            // for 8032
+            showCreateTableInfo = showCreateTableInfo.replace("bigint(11)", "bigint(20)");
+        }
         Assert.assertEquals(
             "CREATE TABLE `" + primaryTableName + "` (\n"
                 + "\t`c1` bigint(20) DEFAULT NULL,\n"
@@ -102,6 +109,11 @@ public class LocalPartitionShowCreateTest extends LocalPartitionBaseTest {
         validateLocalPartition(tddlConnection, primaryTableName);
 
         String showCreateTableInfo = showCreateTable(tddlConnection, primaryTableName);
+        if (isMySQL80()) {
+            showCreateTableInfo = showCreateTableInfo.replace(" DEFAULT COLLATE = utf8mb4_general_ci", "");
+            // for 8032
+            showCreateTableInfo = showCreateTableInfo.replace("bigint(11)", "bigint(20)");
+        }
         Assert.assertEquals(
             "CREATE TABLE `" + primaryTableName + "` (\n"
                 + "\t`c1` bigint(20) DEFAULT NULL,\n"
@@ -143,6 +155,11 @@ public class LocalPartitionShowCreateTest extends LocalPartitionBaseTest {
         JdbcUtil.executeSuccess(tddlConnection, sql);
 
         String showCreateTableInfo = showCreateTable(tddlConnection, newName);
+        if (isMySQL80()) {
+            showCreateTableInfo = showCreateTableInfo.replace(" DEFAULT COLLATE = utf8mb4_general_ci", "");
+            // for 8032
+            showCreateTableInfo = showCreateTableInfo.replace("bigint(11)", "bigint(20)");
+        }
         Assert.assertEquals(
             "CREATE TABLE `" + newName + "` (\n"
                 + "\t`c1` bigint(20) DEFAULT NULL,\n"

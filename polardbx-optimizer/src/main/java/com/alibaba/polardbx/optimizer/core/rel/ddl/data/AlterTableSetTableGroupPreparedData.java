@@ -27,12 +27,12 @@ public class AlterTableSetTableGroupPreparedData extends DdlPreparedData {
     private String tableGroupName;
     private String sourceSql;
     private String originalTableGroup;
-    private Long tableVersion;
     private String primaryTableName;
     private String originalJoinGroup;
     private boolean alignPartitionNameFirst = false;
     private boolean repartition = false;
     private boolean force = false;
+    private boolean implicit = false;
     private Map<String, String> partitionNamesMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
     public String getTableGroupName() {
@@ -65,14 +65,6 @@ public class AlterTableSetTableGroupPreparedData extends DdlPreparedData {
 
     public void setSourceSql(String sourceSql) {
         this.sourceSql = sourceSql;
-    }
-
-    public Long getTableVersion() {
-        return tableVersion;
-    }
-
-    public void setTableVersion(Long tableVersion) {
-        this.tableVersion = tableVersion;
     }
 
     public String getPrimaryTableName() {
@@ -109,5 +101,13 @@ public class AlterTableSetTableGroupPreparedData extends DdlPreparedData {
 
     public void setForce(boolean force) {
         this.force = force;
+    }
+
+    public boolean isImplicit() {
+        return implicit;
+    }
+
+    public void setImplicit(boolean implicit) {
+        this.implicit = implicit;
     }
 }

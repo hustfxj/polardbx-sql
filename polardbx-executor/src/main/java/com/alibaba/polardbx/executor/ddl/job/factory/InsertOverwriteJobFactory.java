@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.executor.ddl.job.factory;
 
+import com.alibaba.polardbx.common.ddl.foreignkey.ForeignKeyData;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.executor.ddl.job.factory.gsi.TruncateTableWithGsiJobFactory;
 import com.alibaba.polardbx.executor.ddl.job.factory.util.FactoryUtils;
@@ -37,8 +38,6 @@ import com.google.common.collect.Lists;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
-
-import static org.apache.calcite.sql.SqlIdentifier.surroundWithBacktick;
 
 /**
  * @author lijiu.lzw

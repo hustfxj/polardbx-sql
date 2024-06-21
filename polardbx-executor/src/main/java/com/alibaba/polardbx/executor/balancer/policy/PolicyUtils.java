@@ -59,6 +59,19 @@ public class PolicyUtils {
         }
     }
 
+    public static Map<String, GroupDetailInfoRecord> getGroupDetails(String schema, List<String> storageInsts) {
+        try (Connection conn = MetaDbDataSource.getInstance().getConnection()) {
+            GroupDetailInfoAccessor accessor = new GroupDetailInfoAccessor();
+            accessor.setConnection(conn);
+            List<GroupDetailInfoRecord> records =
+                accessor.getGroupDetailInfoByInstIdAndDbName(InstIdUtil.getInstId(), schema)
+                    .stream().filter(o -> storageInsts.contains(o.storageInstId)).collect(Collectors.toList());
+            return records.stream().collect(Collectors.toMap(GroupDetailInfoRecord::getGroupName, x -> x));
+        } catch (SQLException e) {
+            throw GeneralUtil.nestedException(e);
+        }
+    }
+
     public static List<LocalityDetailInfoRecord> getLocalityDetails(String schema) {
         try (Connection conn = MetaDbDataSource.getInstance().getConnection()) {
             List<TableGroupConfig> tableGroupConfigList = TableGroupUtils.getAllTableGroupInfoByDb(schema);
@@ -145,7 +158,7 @@ public class PolicyUtils {
             TableGroupConfig tableGroupConfig = TableGroupUtils.getTableGroupInfoByGroupName(schema, tableGroup);
             TableInfoManager tableInfoManager = new TableInfoManager();
             List<String> tableNames =
-                tableGroupConfig.getTables().stream().map(table -> table.getTableName()).collect(Collectors.toList());
+                tableGroupConfig.getTables();
             PartitionInfoManager partitionInfoManager = OptimizerContext.getContext(schema).getPartitionInfoManager();
             tableInfoManager.setConnection(conn);
             List<TablesRecord> tableInfoList = tableInfoManager.queryTables(schema);

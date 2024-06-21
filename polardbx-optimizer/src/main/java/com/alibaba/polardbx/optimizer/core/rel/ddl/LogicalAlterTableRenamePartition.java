@@ -17,9 +17,9 @@
 package com.alibaba.polardbx.optimizer.core.rel.ddl;
 
 import com.alibaba.polardbx.common.utils.Pair;
+import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupConfig;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
-import com.alibaba.polardbx.optimizer.config.table.ComplexTaskMetaManager;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.AlterTableGroupRenamePartitionPreparedData;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.AlterTableRenamePartitionPreparedData;
@@ -28,18 +28,13 @@ import com.alibaba.polardbx.optimizer.partition.PartitionInfoUtil;
 import com.alibaba.polardbx.optimizer.tablegroup.AlterTableGroupSnapShotUtils;
 import org.apache.calcite.rel.core.DDL;
 import org.apache.calcite.rel.ddl.AlterTable;
-import org.apache.calcite.rel.ddl.AlterTableGroupRenamePartition;
 import org.apache.calcite.sql.SqlAlterTable;
-import org.apache.calcite.sql.SqlAlterTableGroup;
-import org.apache.calcite.sql.SqlAlterTableGroupRenamePartition;
 import org.apache.calcite.sql.SqlAlterTableMovePartition;
 import org.apache.calcite.sql.SqlAlterTableRenamePartition;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.util.Util;
 
-import java.util.Map;
 import java.util.Objects;
-import java.util.TreeMap;
 
 public class LogicalAlterTableRenamePartition extends BaseDdlOperation {
 
@@ -56,6 +51,16 @@ public class LogicalAlterTableRenamePartition extends BaseDdlOperation {
 
     public static LogicalAlterTableRenamePartition create(DDL ddl) {
         return new LogicalAlterTableRenamePartition(ddl);
+    }
+
+    @Override
+    public boolean isSupportedByFileStorage() {
+        return false;
+    }
+
+    @Override
+    public boolean isSupportedByBindFileStorage() {
+        return true;
     }
 
     public void prepareData(ExecutionContext ec) {
@@ -76,22 +81,41 @@ public class LogicalAlterTableRenamePartition extends BaseDdlOperation {
         TableGroupConfig tableGroupConfig =
             oc.getTableGroupInfoManager().getTableGroupConfigById(curPartitionInfo.getTableGroupId());
         String tableGroupName = tableGroupConfig.getTableGroupRecord().getTg_name();
-        Map<String, String> changePartitions = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
-        for (Pair<String, String> pair : sqlAlterTableRenamePartition.getChangePartitionsPair()) {
-            changePartitions.put(pair.getKey(), pair.getValue());
-        }
-        PartitionInfo newPartInfo =
-            AlterTableGroupSnapShotUtils.getNewPartitionInfoForRenamePartition(curPartitionInfo, changePartitions);
+
         preparedData = new AlterTableRenamePartitionPreparedData();
+
         preparedData.setSchemaName(schemaName);
         preparedData.setChangePartitionsPair(sqlAlterTableRenamePartition.getChangePartitionsPair());
         preparedData.setTableGroupName(tableGroupName);
         preparedData.setTableName(logicalTableName);
+        preparedData.setSubPartitionRename(sqlAlterTableRenamePartition.isSubPartitionsRename());
         preparedData.setSourceSql(((SqlAlterTable) alterTable.getSqlNode()).getSourceSql());
-        int flag = PartitionInfoUtil.COMPARE_EXISTS_PART_LOCATION;
+        preparedData.setOperateOnSubPartition(sqlAlterTableRenamePartition.isSubPartitionsRename());
+        preparedData.setTargetImplicitTableGroupName(sqlAlterTable.getTargetImplicitTableGroupName());
 
-        preparedData.findCandidateTableGroupAndUpdatePrepareDate(tableGroupConfig, newPartInfo, null,
-            null, flag, ec);
+        boolean partitionNameNoChange = preparedData.partitionNameNoChange();
+        boolean tableGroupNoChange = tableGroupName.equalsIgnoreCase(preparedData.getTargetImplicitTableGroupName());
+        preparedData.setRenameNothing(partitionNameNoChange && tableGroupNoChange);
+        if (preparedData.needFindCandidateTableGroup() && !preparedData.isRenameNothing()) {
+            int flag = PartitionInfoUtil.COMPARE_EXISTS_PART_LOCATION;
+
+            PartitionInfo newPartInfo = AlterTableGroupSnapShotUtils
+                .getNewPartitionInfo(
+                    preparedData,
+                    curPartitionInfo,
+                    false,
+                    sqlAlterTableRenamePartition,
+                    preparedData.getOldPartitionNames(),
+                    preparedData.getNewPartitionNames(),
+                    preparedData.getTableGroupName(),
+                    null,
+                    preparedData.getInvisiblePartitionGroups(),
+                    null,
+                    ec);
+
+            preparedData.findCandidateTableGroupAndUpdatePrepareDate(tableGroupConfig, newPartInfo, null,
+                null, flag, ec);
+        }
     }
 
     public AlterTableGroupRenamePartitionPreparedData getPreparedData() {

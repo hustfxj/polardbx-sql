@@ -19,13 +19,12 @@ package com.alibaba.polardbx.optimizer.config.table.statistic;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
+import com.alibaba.polardbx.common.utils.LoggerUtil;
 import com.alibaba.polardbx.common.utils.logger.Logger;
-import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.common.utils.time.core.TimeStorage;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
+import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
 
-import java.sql.Date;
-import java.sql.Time;
-import java.sql.Timestamp;
 import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,7 +33,7 @@ import java.util.List;
 
 public class Histogram {
 
-    private static final Logger logger = LoggerFactory.getLogger("statistics");
+    private static final Logger logger = LoggerUtil.statisticsLogger;
 
     private List<Bucket> buckets = new ArrayList<>();
 
@@ -102,7 +101,7 @@ public class Histogram {
      * @param key the key to find
      * @return the bucket found, null if not found
      */
-    private Bucket findBucket(Object key) {
+    private Bucket findBucket(Object key, boolean needInBucket) {
         if (buckets.isEmpty()) {
             return null;
         }
@@ -120,7 +119,20 @@ public class Histogram {
                 right = mid;
             }
         }
-        return buckets.get(right);
+        Bucket b = buckets.get(right);
+
+        // double check, in case histogram has no continuation values
+        if (needInBucket) {
+            if (dataType.compare(key, b.upper) <= 0 &&
+                dataType.compare(key, b.lower) >= 0) {
+                return b;
+            } else {
+                return null;
+            }
+        } else {
+            return b;
+        }
+
     }
 
     public long rangeCount(Object lower, boolean lowerInclusive, Object upper, boolean upperInclusive) {
@@ -158,7 +170,7 @@ public class Histogram {
                 if (!lowerInclusive || !upperInclusive) {
                     return 0;
                 } else {
-                    Bucket bucket = findBucket(upper);
+                    Bucket bucket = findBucket(upper, true);
                     if (bucket == null) {
                         return 0;
                     } else {
@@ -166,12 +178,15 @@ public class Histogram {
                     }
                 }
             }
-            Bucket lowerBucket = findBucket(lower);
-            if (lowerBucket == null) {
+            Bucket upperBucket = buckets.get(buckets.size() - 1);
+            if (dataType.compare(lower, upperBucket.upper) > 0) {
                 return 0;
             }
-            Bucket upperBucket = findBucket(upper);
-            if (upperBucket == null) {
+            Bucket lowerBucket = buckets.get(0);
+            if (dataType.compare(upper, lowerBucket.lower) < 0) {
+                return 0;
+            }
+            if (dataType.compare(upper, upperBucket.upper) > 0) {
                 return greatEqualCount(lower);
             }
             if (lowerInclusive && upperInclusive) {
@@ -202,7 +217,7 @@ public class Histogram {
     }
 
     private int lessCount(Object u) {
-        Bucket bucket = findBucket(u);
+        Bucket bucket = findBucket(u, false);
         if (bucket == null) {
             if (buckets.isEmpty()) {
                 return 0;
@@ -232,7 +247,7 @@ public class Histogram {
                 }
                 int result = bucket.preSum;
                 if (max > min) {
-                    result += (v - min) * bucket.count / (max - min);
+                    result += (int) ((v - min) / (max - min) * bucket.count);
                     if (v > min) {
                         result -= bucket.count / bucket.ndv;
                         if (result < 0) {
@@ -294,23 +309,18 @@ public class Histogram {
             }
             return new Double(longValue);
         case Types.DATE:
-            if (dataType.convertFrom(key) == null) {
-                return new Double(0);
-            }
-            return Double.valueOf(Date.valueOf(dataType.convertFrom(key).toString()).getTime());
         case Types.TIME:
-            if (dataType.convertFrom(key) == null) {
-                return new Double(0);
-            }
-            return Double.valueOf(Time.valueOf(dataType.convertFrom(key).toString()).getTime());
         case Types.TIMESTAMP:
         case Types.TIME_WITH_TIMEZONE:
         case Types.TIMESTAMP_WITH_TIMEZONE:
         case DataType.DATETIME_SQL_TYPE:
             if (dataType.convertFrom(key) == null) {
+                if (key instanceof Long) {
+                    return ((Long) key).doubleValue();
+                }
                 return new Double(0);
             }
-            return Double.valueOf(Timestamp.valueOf(dataType.convertFrom(key).toString()).getTime());
+            return Double.valueOf(StatisticUtils.packDateTypeToLong(dataType, key));
         case Types.BIT:
         case Types.BLOB:
         case Types.CLOB:
@@ -342,7 +352,7 @@ public class Histogram {
 
     private int lessEqualCount(Object u) {
         int lessCount = lessCount(u);
-        Bucket bucket = findBucket(u);
+        Bucket bucket = findBucket(u, true);
         if (bucket == null) {
             return lessCount;
         } else {
@@ -360,7 +370,7 @@ public class Histogram {
 
     private int greatEqualCount(Object l) {
         int greatCount = greatCount(l);
-        Bucket bucket = findBucket(l);
+        Bucket bucket = findBucket(l, true);
         if (bucket == null) {
             return greatCount;
         } else {
@@ -388,10 +398,8 @@ public class Histogram {
             bucketJson.put("count", bucket.count);
             bucketJson.put("ndv", bucket.ndv);
             bucketJson.put("preSum", bucket.preSum);
-            if (type.equalsIgnoreCase("String")
-                || type.equalsIgnoreCase("Timestamp")
-                || type.equalsIgnoreCase("Time")
-                || type.equalsIgnoreCase("Date")) {
+            if (type.equalsIgnoreCase("String") ||
+                DataTypeUtil.isMysqlTimeType(histogram.dataType)) {
                 bucketJson.put("upper", bucket.upper.toString());
                 bucketJson.put("lower", bucket.lower.toString());
             } else {
@@ -414,8 +422,16 @@ public class Histogram {
             for (int i = 0; i < jsonArray.size(); i++) {
                 JSONObject bucketJson = jsonArray.getJSONObject(i);
                 Bucket bucket = new Histogram.Bucket();
-                bucket.lower = bucketJson.get("lower");
-                bucket.upper = bucketJson.get("upper");
+                if (DataTypeUtil.isMysqlTimeType(datatype)) {
+                    // Does deserialization of a date object need to be compatible with the following two formats
+                    // Long for Mysql DateTime packed time
+                    // String for date format string like: '2023-06-07'
+                    bucket.lower = deserializeTimeObject(datatype, bucketJson.get("lower"));
+                    bucket.upper = deserializeTimeObject(datatype, bucketJson.get("upper"));
+                } else {
+                    bucket.lower = bucketJson.get("lower");
+                    bucket.upper = bucketJson.get("upper");
+                }
                 bucket.count = bucketJson.getIntValue("count");
                 bucket.preSum = bucketJson.getIntValue("preSum");
                 bucket.ndv = bucketJson.getIntValue("ndv");
@@ -425,6 +441,55 @@ public class Histogram {
         } catch (Throwable e) {
             logger.error("deserializeFromJson error ", e);
             return null;
+        }
+    }
+
+    /**
+     * optimize for reading
+     */
+    public String manualReading() {
+        StringBuilder sb = new StringBuilder();
+        String type = StatisticUtils.encodeDataType(getDataType());
+        sb.append(type).append("\n");
+        sb.append("sampleRate:" + sampleRate).append("\n");
+        int count = 0;
+        boolean isDateType = DataTypeUtil.isMysqlTimeType(dataType);
+        for (Histogram.Bucket bucket : buckets) {
+            if (bucket == null || bucket.upper == null || bucket.lower == null) {
+                continue;
+            }
+            String lower = isDateType ?
+                TimeStorage.readTimestamp((Long) bucket.lower).toDatetimeString(0) :
+                bucket.lower.toString();
+            String upper = isDateType ?
+                TimeStorage.readTimestamp((Long) bucket.upper).toDatetimeString(0) :
+                bucket.upper.toString();
+
+            sb.append("bucket" + count++).append(" ")
+                .append("count:" + bucket.count).append(" ")
+                .append("ndv:" + bucket.ndv).append(" ")
+                .append("preSum:" + bucket.preSum).append(" ")
+                .append("lower:" + lower).append(" ")
+                .append("upper:" + upper).append(" ")
+                .append("\n");
+        }
+        return sb.toString();
+    }
+
+    private static Object deserializeTimeObject(DataType datatype, Object obj) {
+        if (obj instanceof Long) {
+            return obj;
+        } else if (obj instanceof String) {
+            String s = (String) obj;
+            // handle long type string
+            try {
+                return Long.parseLong(s);
+            } catch (NumberFormatException nfe) {// ignore
+            }
+            // handle time format string
+            return StatisticUtils.packDateTypeToLong(datatype, obj);
+        } else {
+            return obj;
         }
     }
 

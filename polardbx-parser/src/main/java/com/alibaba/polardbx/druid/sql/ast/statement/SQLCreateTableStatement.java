@@ -24,6 +24,7 @@ import com.alibaba.polardbx.druid.sql.ast.SQLObject;
 import com.alibaba.polardbx.druid.sql.ast.SQLPartitionBy;
 import com.alibaba.polardbx.druid.sql.ast.SQLStatement;
 import com.alibaba.polardbx.druid.sql.ast.SQLStatementImpl;
+import com.alibaba.polardbx.druid.sql.ast.SqlType;
 import com.alibaba.polardbx.druid.sql.ast.expr.SQLCharExpr;
 import com.alibaba.polardbx.druid.sql.ast.expr.SQLIdentifierExpr;
 import com.alibaba.polardbx.druid.sql.ast.expr.SQLMethodInvokeExpr;
@@ -36,6 +37,7 @@ import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlTableInde
 import com.alibaba.polardbx.druid.sql.parser.SQLParserUtils;
 import com.alibaba.polardbx.druid.sql.semantic.SemanticException;
 import com.alibaba.polardbx.druid.sql.visitor.SQLASTVisitor;
+import com.alibaba.polardbx.druid.sql.visitor.VisitorFeature;
 import com.alibaba.polardbx.druid.util.FnvHash;
 import com.alibaba.polardbx.druid.util.ListDG;
 import com.alibaba.polardbx.druid.util.lang.Consumer;
@@ -47,6 +49,8 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+
+import static com.alibaba.polardbx.druid.sql.ast.SqlType.SHOW_CONVERT_TABLE_MODE;
 
 public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLStatement, SQLCreateStatement {
 
@@ -60,6 +64,7 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
     protected SQLSelect select;
     protected SQLExpr comment;
     protected SQLExprTableSource like;
+    protected SQLExprTableSource asTable;
 
     protected Boolean compress;
     protected Boolean logging;
@@ -88,6 +93,7 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
     protected boolean replace = false;
     protected boolean ignore = false;
     protected boolean dimension;
+    protected boolean onlyConvertTableMode = false;
 
     public SQLCreateTableStatement() {
 
@@ -112,6 +118,7 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
         this.acceptChild(v, select);
         this.acceptChild(v, comment);
         this.acceptChild(v, like);
+        this.acceptChild(v, asTable);
 
         this.acceptChild(v, tablespace);
         this.acceptChild(v, partitioning);
@@ -211,6 +218,10 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
 
     public List<SQLTableElement> getTableElementList() {
         return tableElementList;
+    }
+
+    public void setTableElementList(List<SQLTableElement> tableElementList) {
+        this.tableElementList = tableElementList;
     }
 
     public SQLColumnDefinition getColumn(String columnName) {
@@ -317,6 +328,14 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
         this.ifNotExists = ifNotExists;
     }
 
+    public boolean isOnlyConvertTableMode() {
+        return onlyConvertTableMode;
+    }
+
+    public void setOnlyConvertTableMode(boolean onlyConvertTableMode) {
+        this.onlyConvertTableMode = onlyConvertTableMode;
+    }
+
     public SQLExprTableSource getInherits() {
         return inherits;
     }
@@ -343,8 +362,16 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
         return like;
     }
 
+    public SQLExprTableSource getAsTable() {
+        return asTable;
+    }
+
     public void setLike(SQLName like) {
         this.setLike(new SQLExprTableSource(like));
+    }
+
+    public void setAsTable(SQLName asTable) {
+        this.setAsTable(new SQLExprTableSource(asTable));
     }
 
     public void setLike(SQLExprTableSource like) {
@@ -352,6 +379,13 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
             like.setParent(this);
         }
         this.like = like;
+    }
+
+    public void setAsTable(SQLExprTableSource as) {
+        if (as != null) {
+            as.setParent(this);
+        }
+        this.asTable = as;
     }
 
     public Boolean getCompress() {
@@ -879,11 +913,10 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
                     continue;
                 }
                 SQLUniqueConstraint unique = (SQLUniqueConstraint) e;
-                if (unique.getName().nameHashCode64() == indexNameHashCode64) {
+                if (SQLUtils.nameEquals(unique.getName(), x.getIndexName())) {
                     tableElementList.remove(i);
                     return true;
                 }
-
             } else if (e instanceof MySqlTableIndex) {
                 MySqlTableIndex tableIndex = (MySqlTableIndex) e;
                 if (SQLUtils.nameEquals(tableIndex.getName(), x.getIndexName())) {
@@ -1016,7 +1049,7 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
                     continue;
                 }
                 SQLUniqueConstraint unique = (SQLUniqueConstraint) e;
-                if (unique.getName().nameHashCode64() == indexNameHashCode64) {
+                if (compareName(unique, indexNameHashCode64)) {
                     SQLUniqueConstraint constraint = (SQLUniqueConstraint) tableElementList.get(i);
                     constraint.setName(item.getTo());
                     return true;
@@ -1030,6 +1063,14 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
             }
         }
         return false;
+    }
+
+    private boolean compareName(SQLConstraint constraint, long indexNameHashCode64) {
+        SQLName sqlName = constraint.getName();
+        if (sqlName == null) {
+            return false;
+        }
+        return sqlName.nameHashCode64() == indexNameHashCode64;
     }
 
     // SQLAlterTableRenameColumn
@@ -1142,6 +1183,10 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
     private boolean apply(SQLAlterTableDropPrimaryKey item) {
         for (int i = tableElementList.size() - 1; i >= 0; i--) {
             SQLTableElement e = tableElementList.get(i);
+            if (e instanceof SQLColumnDefinition) {
+                SQLColumnDefinition columnDefinition = (SQLColumnDefinition) e;
+                columnDefinition.constraints.removeIf(constraint -> constraint instanceof SQLColumnPrimaryKey);
+            }
             if (e instanceof SQLPrimaryKey) {
                 tableElementList.remove(i);
                 return true;
@@ -1306,7 +1351,9 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
         if (like != null) {
             x.setLike(like.clone());
         }
-
+        if (asTable != null) {
+            x.setAsTable(asTable.clone());
+        }
         x.compress = compress;
         x.logging = logging;
 
@@ -1407,7 +1454,27 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
     }
 
     public String toString() {
-        return SQLUtils.toSQLString(this, dbType);
+        return toSqlStringWithFeature();
+    }
+
+    public String toSqlString(boolean showHashPartitionsByRange, boolean outputMySQLIndent) {
+        List<VisitorFeature> features = new ArrayList<>();
+        if (showHashPartitionsByRange) {
+            features.add(VisitorFeature.OutputHashPartitionsByRange);
+        }
+        if (outputMySQLIndent) {
+            features.add(VisitorFeature.OutputMySQLIndentString);
+        }
+
+        if (!features.isEmpty()) {
+            return toSqlStringWithFeature(features.toArray(new VisitorFeature[] {}));
+        } else {
+            return toSqlStringWithFeature();
+        }
+    }
+
+    public String toSqlStringWithFeature(VisitorFeature... features) {
+        return SQLUtils.toSQLString(this, dbType, null, features);
     }
 
     public boolean isOnCommitPreserveRows() {
@@ -1626,5 +1693,14 @@ public class SQLCreateTableStatement extends SQLStatementImpl implements SQLDDLS
         }
 
         return false;
+    }
+
+    @Override
+    public SqlType getSqlType() {
+        if (this.isOnlyConvertTableMode()) {
+            return SHOW_CONVERT_TABLE_MODE;
+        } else {
+            return SqlType.CREATE;
+        }
     }
 }

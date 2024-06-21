@@ -17,8 +17,8 @@
 package com.alibaba.polardbx.optimizer.partition.pruning;
 
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundVal;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundValueKind;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundVal;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundValueKind;
 import com.alibaba.polardbx.optimizer.partition.datatype.PartitionField;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlCollation;
@@ -69,6 +69,28 @@ public class SearchDatumComparator implements Comparator<SearchDatumInfo> {
         return compareSearchDatum(datum1, datum2);
     }
 
+    public boolean isGreaterThan(SearchDatumInfo datum1, SearchDatumInfo datum2) {
+        return compare(datum1, datum2) == 1;
+    }
+
+    public boolean isEqualTo(SearchDatumInfo datum1, SearchDatumInfo datum2) {
+        return compare(datum1, datum2) == 0;
+    }
+
+    public boolean isLessThan(SearchDatumInfo datum1, SearchDatumInfo datum2) {
+        return compare(datum1, datum2) == -1;
+    }
+
+    public boolean isGreaterThanOrEqualTo(SearchDatumInfo datum1, SearchDatumInfo datum2) {
+        int result = compare(datum1, datum2);
+        return result == 1 || result == 0;
+    }
+
+    public boolean isLessThanOrEqualTo(SearchDatumInfo datum1, SearchDatumInfo datum2) {
+        int result = compare(datum1, datum2);
+        return result == 0 || result == -1;
+    }
+
     protected int compareSearchDatum(SearchDatumInfo boundDatum, SearchDatumInfo queryDatum) {
 
         PartitionBoundVal[] queryDatumVal = queryDatum.datumInfo;
@@ -98,6 +120,17 @@ public class SearchDatumComparator implements Comparator<SearchDatumInfo> {
                     break;
                 }
             } else if (queryValKind == PartitionBoundValueKind.DATUM_MAX_VALUE) {
+                // queryValKind == PartitionBoundValueKind.DATUM_MAX_VALUE
+                if (bndValKind == PartitionBoundValueKind.DATUM_MIN_VALUE) {
+                    return -1;
+                }
+                if (bndValKind == PartitionBoundValueKind.DATUM_NORMAL_VALUE) {
+                    return -1;
+                }
+                if (bndValKind == PartitionBoundValueKind.DATUM_MAX_VALUE) {
+                    retVal = 0;
+                }
+            } else if (queryValKind == PartitionBoundValueKind.DATUM_ANY_VALUE) {
                 // queryValKind == PartitionBoundValueKind.DATUM_MAX_VALUE
                 if (bndValKind == PartitionBoundValueKind.DATUM_MIN_VALUE) {
                     return -1;

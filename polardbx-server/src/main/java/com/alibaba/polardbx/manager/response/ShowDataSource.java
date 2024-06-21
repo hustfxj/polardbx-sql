@@ -17,8 +17,8 @@
 package com.alibaba.polardbx.manager.response;
 
 import com.alibaba.polardbx.CobarServer;
-import com.alibaba.polardbx.ErrorCode;
 import com.alibaba.polardbx.Fields;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.config.SchemaConfig;
 import com.alibaba.polardbx.manager.ManagerConnection;
 import com.alibaba.polardbx.net.buffer.ByteBufferHolder;
@@ -121,7 +121,7 @@ public final class ShowDataSource {
     public static void execute(ManagerConnection c, String name) {
         Map<String, SchemaConfig> schemas = CobarServer.getInstance().getConfig().getSchemas();
         MysqlResultSetPacket packet = new MysqlResultSetPacket();
-        String charset = c.getCharset();
+        String charset = c.getResultSetCharset();
         ByteBufferHolder buffer = c.allocate();
         IPacketOutputProxy proxy = PacketOutputProxyFactory.getInstance().createProxy(c, buffer);
         proxy.packetBegin();

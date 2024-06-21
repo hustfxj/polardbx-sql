@@ -20,14 +20,16 @@ import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.jdbc.RawString;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import org.apache.commons.lang.BooleanUtils;
 import org.apache.commons.lang.StringUtils;
 
+import java.io.BufferedReader;
 import java.io.Closeable;
+import java.io.IOException;
 import java.io.InputStream;
+import java.io.StringReader;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
@@ -36,15 +38,15 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Supplier;
-import java.util.regex.Pattern;
 
 public class GeneralUtil {
 
-    static Pattern pattern = Pattern.compile("\\d+$");
+    private static String lsnErrorMessage = "Variable 'read_lsn' can't be set to the value of";
+    private static String followDelayMessage =
+        "The follow exists delay, please use 'show storage' command to check latency";
 
     public static boolean isEmpty(Map map) {
         return null == map || map.isEmpty();
@@ -246,6 +248,9 @@ public class GeneralUtil {
             return (TddlNestableRuntimeException) e;
         }
 
+        if (e.getMessage() != null && e.getMessage().contains(lsnErrorMessage)) {
+            return new TddlNestableRuntimeException(followDelayMessage);
+        }
         return new TddlNestableRuntimeException(e);
     }
 
@@ -392,46 +397,6 @@ public class GeneralUtil {
     public final static String UNION_ALIAS = "__DRDS_ALIAS_T_";
 
     /**
-     * Use union all to reduce the amount of physical sql.
-     *
-     * @param num number of sub-queries
-     */
-    public static String buildPhysicalQuery(int num, String sqlTemplateStr, String orderBy, String prefix, long limit) {
-        Preconditions.checkArgument(num > 0, "The number of tables must great than 0 when build UNION ALL sql");
-        if (num == 1) {
-            if (StringUtils.isNotEmpty(prefix)) {
-                return prefix + sqlTemplateStr;
-            } else {
-                return sqlTemplateStr;
-            }
-        }
-
-        StringBuilder builder = new StringBuilder();
-        if (prefix != null) {
-            builder.append(prefix);
-        }
-        if (orderBy != null) {
-            builder.append("SELECT * FROM (");
-        }
-
-        builder.append("( ").append(sqlTemplateStr).append(" )");
-        for (int i = 1; i < num; i++) {
-            builder.append(UNION_KW).append("( ").append(sqlTemplateStr).append(") ");
-        }
-
-        // 最终生成的 UNION ALL SQL,需要在最外层添加 OrderBy
-        // 不能添加limit 和 offset, 有聚合函数的情况下会导致结果错误
-        if (orderBy != null) {
-            builder.append(") ").append(UNION_ALIAS).append(" ").append(ORDERBY_KW).append(orderBy);
-        }
-
-        if (limit > 0) {
-            builder.append(LIMIT_KW).append(limit);
-        }
-        return builder.toString();
-    }
-
-    /**
      * Convert string value to boolean value.
      * TRUE/ON/1 will be converted to true.
      * FALSE/OFF/0 will be converted to false.
@@ -462,7 +427,7 @@ public class GeneralUtil {
         if (param == null) {
             return Collections.emptyList();
         }
-        List<ParameterContext> p = new LinkedList<>();
+        List<ParameterContext> p = new ArrayList<>(param.size());
         for (int i = 1; i <= param.size(); i++) {
             if (param.get(i) == null) {
                 p.add(null);
@@ -516,6 +481,47 @@ public class GeneralUtil {
         return r;
     }
 
+    /**
+     * decode statistic trace info, like :
+     * Catalog:tpch_100g,lineitem,l_shipdate,null_1998-09-02
+     * Action:getRangeCount
+     * StatisticValue:693554944
+     * <p>
+     * after decode:
+     * key: Catalog:tpch_100g,lineitem,l_shipdate,null_1998-09-02 Action:getRangeCount
+     * value:693554944
+     *
+     * @param statisticTraceInfo statistic trace info, return by explain cost_trace
+     * @return normalize info for statistic trace info
+     */
+    public static Map<String, String> decode(String statisticTraceInfo) throws IOException {
+        if (StringUtils.isEmpty(statisticTraceInfo)) {
+            return Collections.emptyMap();
+        }
+        Map<String, String> statisticTraceMap = Maps.newHashMap();
+        BufferedReader lineReader = new BufferedReader(new StringReader(statisticTraceInfo));
+        String line;
+        while ((line = lineReader.readLine()) != null) {
+            // find Key
+            line = line.trim();
+            if (line.startsWith("Catalog:")) {
+                String actionLine = lineReader.readLine().trim();
+                if (!actionLine.startsWith("Action:")) {
+                    continue;
+                }
+                line = removeIdxSuffix(line);
+                String key = line + "\n" + actionLine;
+
+                String statisticResultLine = lineReader.readLine().trim();
+                if (statisticResultLine.length() > "StatisticValue:".length()) {
+                    statisticResultLine = statisticResultLine.substring("StatisticValue:".length());
+                }
+                statisticTraceMap.put(key.toLowerCase(), statisticResultLine);
+            }
+        }
+        return statisticTraceMap;
+    }
+
     public static void close(Connection x) {
         if (x == null) {
             return;
@@ -558,6 +564,23 @@ public class GeneralUtil {
             x.close();
         } catch (Exception e) {
             throw nestedException(e);
+        }
+    }
+
+    /**
+     * remove the suffix of gsi name
+     */
+    public static String removeIdxSuffix(String source) {
+        if (source.contains("_$")) {
+            int targetIndex = source.indexOf("_$");
+            int secondIndex = source.indexOf(",", targetIndex);
+            if (secondIndex != -1) {
+                return source.substring(0, targetIndex) + source.substring(secondIndex);
+            } else {
+                return source.substring(0, targetIndex);
+            }
+        } else {
+            return source;
         }
     }
 }

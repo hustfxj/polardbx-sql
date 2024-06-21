@@ -16,22 +16,19 @@
 
 package com.alibaba.polardbx.planner.common;
 
+import com.alibaba.polardbx.common.exception.TddlRuntimeException;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.druid.sql.SQLUtils;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableStatement;
 import com.alibaba.polardbx.druid.util.JdbcConstants;
-import com.google.common.collect.Maps;
-import com.alibaba.polardbx.common.exception.TddlRuntimeException;
-import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
-import com.alibaba.polardbx.optimizer.core.rel.ddl.data.CreateTablePreparedData;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.gsi.CreateGlobalIndexPreparedData;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
-import com.alibaba.polardbx.optimizer.partition.PartitionTableType;
+import com.google.common.collect.Maps;
 import org.apache.calcite.rel.core.DDL;
 import org.apache.calcite.sql.SqlAddIndex;
 import org.apache.calcite.sql.SqlAlterTable;
 import org.apache.calcite.sql.SqlCreateIndex;
-import org.apache.calcite.sql.SqlDdl;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlIndexColumnName;
 import org.apache.calcite.sql.SqlIndexDefinition;
@@ -78,7 +75,9 @@ public class CreatePartitionGlobalIndexBuilder extends CreateGlobalIndexBuilder 
 
         final Set<String> indexColumnSet = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         indexColumnSet.addAll(indexColumnMap.keySet());
-        if (!containsAllShardingColumns(indexColumnSet, indexPartitionInfo)) {
+        // Columnar index do not force using index column as partition column
+        final boolean isColumnar = indexDef.isColumnar();
+        if (!isColumnar && !containsAllShardingColumns(indexColumnSet, indexPartitionInfo)) {
             throw new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_INDEX_AND_SHARDING_COLUMNS_NOT_MATCH);
         }
 
@@ -86,8 +85,9 @@ public class CreatePartitionGlobalIndexBuilder extends CreateGlobalIndexBuilder 
          * check single/broadcast table
          */
         if (null != primaryPartitionInfo) {
-            if (forceAllowGsi == false && (primaryPartitionInfo.isBroadcastTable() || primaryPartitionInfo
-                .isSingleTable())) {
+            if (!forceAllowGsi
+                && !isColumnar
+                && (primaryPartitionInfo.isBroadcastTable() || primaryPartitionInfo.isSingleTable())) {
                 throw new TddlRuntimeException(
                     ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_UNSUPPORTED_PRIMARY_TABLE_DEFINITION,
                     "Does not support create Global Secondary Index on single or broadcast table");
@@ -98,7 +98,8 @@ public class CreatePartitionGlobalIndexBuilder extends CreateGlobalIndexBuilder 
          * copy table structure from main table
          */
         final MySqlCreateTableStatement astCreateIndexTable = (MySqlCreateTableStatement) SQLUtils
-            .parseStatements(indexDef.getPrimaryTableDefinition(), JdbcConstants.MYSQL).get(0).clone();
+            .parseStatementsWithDefaultFeatures(indexDef.getPrimaryTableDefinition(), JdbcConstants.MYSQL).get(0)
+            .clone();
 
         assert primaryPartitionInfo != null;
         final Set<String> shardingColumns = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
@@ -134,14 +135,16 @@ public class CreatePartitionGlobalIndexBuilder extends CreateGlobalIndexBuilder 
 
         final Set<String> indexColumnSet = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
         indexColumnSet.addAll(indexColumnMap.keySet());
-        if (!containsAllShardingColumns(indexColumnSet, indexPartitionInfo)) {
+        // Columnar index do not force using index column as partition column
+        final boolean isColumnar = sqlCreateIndex.createCci();
+        if (!isColumnar && !containsAllShardingColumns(indexColumnSet, indexPartitionInfo)) {
             throw new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_INDEX_AND_SHARDING_COLUMNS_NOT_MATCH);
         }
 
         /**
          * check single/broadcast table
          */
-        if (null != primaryPartitionInfo) {
+        if (null != primaryPartitionInfo && !isColumnar) {
             if (primaryPartitionInfo.isBroadcastTable() || primaryPartitionInfo.isSingleTable()) {
                 throw new TddlRuntimeException(
                     ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_UNSUPPORTED_PRIMARY_TABLE_DEFINITION,
@@ -153,8 +156,9 @@ public class CreatePartitionGlobalIndexBuilder extends CreateGlobalIndexBuilder 
          * copy table structure from main table
          */
         final MySqlCreateTableStatement indexTableStmt =
-            (MySqlCreateTableStatement) SQLUtils.parseStatements(sqlCreateIndex.getPrimaryTableDefinition(),
-                JdbcConstants.MYSQL)
+            (MySqlCreateTableStatement) SQLUtils.parseStatementsWithDefaultFeatures(
+                    sqlCreateIndex.getPrimaryTableDefinition(),
+                    JdbcConstants.MYSQL)
                 .get(0)
                 .clone();
 

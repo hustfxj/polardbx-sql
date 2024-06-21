@@ -17,7 +17,6 @@
 package com.alibaba.polardbx.executor.scaleout.backfill;
 
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
-import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.Pair;
@@ -51,21 +50,29 @@ public class BackfillExecutor {
     }
 
     public int backfill(String schemaName, String tableName, ExecutionContext baseEc,
-                        Map<String, Set<String>> sourcePhyTables, Map<String, String> sourceTargetGroupMap) {
+                        Map<String, Set<String>> sourcePhyTables, Map<String, String> sourceTargetGroupMap,
+                        boolean isChangeSet) {
         final long batchSize = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_BATCH_SIZE);
         final long speedMin = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_SPEED_MIN);
         final long speedLimit = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_SPEED_LIMITATION);
         final long parallelism = baseEc.getParamManager().getLong(ConnectionParams.SCALEOUT_BACKFILL_PARALLELISM);
+        final boolean useBinary = baseEc.getParamManager().getBoolean(ConnectionParams.BACKFILL_USING_BINARY);
 
         if (null == baseEc.getServerVariables()) {
             baseEc.setServerVariables(new HashMap<>());
         }
 
         // Init extractor and loader
-        final Extractor extractor =
-            MoveTableExtractor
-                .create(schemaName, tableName, batchSize, speedMin, speedLimit, parallelism, sourcePhyTables,
+        Extractor extractor;
+        if (isChangeSet) {
+            extractor = ChangeSetExecutor
+                .create(schemaName, tableName, tableName, batchSize, speedMin, speedLimit, parallelism, useBinary,
+                    null, sourcePhyTables, baseEc);
+        } else {
+            extractor = MoveTableExtractor
+                .create(schemaName, tableName, batchSize, speedMin, speedLimit, parallelism, useBinary, sourcePhyTables,
                     baseEc);
+        }
         final Loader loader =
             MoveTableLoader
                 .create(schemaName, tableName, tableName, this.executeFunc, baseEc.isUseHint(), baseEc,
@@ -86,7 +93,9 @@ public class BackfillExecutor {
                         loader.fillIntoIndex(batch, Pair.of(baseEc, extractEcAndIndexPair.getValue()), () -> {
                             try {
                                 // Commit and close extract statement
-                                extractEcAndIndexPair.getKey().getTransaction().commit();
+                                if (!isChangeSet) {
+                                    extractEcAndIndexPair.getKey().getTransaction().commit();
+                                }
                                 return true;
                             } catch (Exception e) {
                                 logger.error("Close extract statement failed!", e);

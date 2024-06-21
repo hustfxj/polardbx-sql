@@ -16,7 +16,9 @@
 
 package com.alibaba.polardbx.optimizer.config.table;
 
+import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
+import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.properties.ParamManager;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
@@ -30,6 +32,7 @@ import com.google.common.base.Preconditions;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.util.StringUtils;
 import org.apache.orc.ColumnStatistics;
 import org.apache.orc.CompressionCodec;
 import org.apache.orc.CompressionKind;
@@ -47,7 +50,10 @@ import org.jetbrains.annotations.NotNull;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -56,8 +62,11 @@ public class OrcMetaUtils {
         new TddlTypeFactoryImpl(TddlRelDataTypeSystemImpl.getInstance());
     public static final String ORC_ROW_INDEX_STRIDE = "orc.row.index.stride";
     public static final String ORC_BLOOM_FILTER_COLUMNS = "orc.bloom.filter.columns";
+    public static final String ORC_DICT_COLUMNS = "orc.dictionary.columns";
     public static final String ORC_BLOOM_FILTER_FPP = "orc.bloom.filter.fpp";
     public static final String ORC_COMPRESS = "orc.compress";
+    public static final String ENABLE_DECIMAL64 = "orc.write.decimal64";
+    public static final String COLUMN_NAME_DELIMITER = StringUtils.COMMA_STR;
     private static final String REDUNDANT_SUFFIX = "__redundant__";
     private static final String REDUNDANT_FORMAT = "%s__redundant__";
 
@@ -69,16 +78,27 @@ public class OrcMetaUtils {
         return columnName != null && columnName.endsWith(REDUNDANT_SUFFIX);
     }
 
+    @NotNull
+    public static PolarDBXOrcSchema buildPolarDBXOrcSchema(TableMeta tableMeta) {
+        return buildPolarDBXOrcSchema(tableMeta, Optional.empty(), tableMeta.isOldFileStorage(),
+            Collections.emptyList());
+    }
+
     /**
      * Build orc schema from source table meta.
      *
      * @param sourceTableMeta source table meta.
+     * @param columnToFieldIdMap the column mapping from name to fieldId, use the map in sourceTableMeta if it's empty
      */
     @NotNull
-    public static PolarDBXOrcSchema buildPolarDBXOrcSchema(TableMeta sourceTableMeta) {
+    public static PolarDBXOrcSchema buildPolarDBXOrcSchema(TableMeta sourceTableMeta,
+                                                           Optional<Map<String, String>> columnToFieldIdMap,
+                                                           boolean oldFileStorage,
+                                                           List<String> dictColumnNames) {
         List<ColumnMeta> allColumns = sourceTableMeta.getAllColumns();
         List<Field> fieldList = sourceTableMeta.getAllColumns().stream().map(columnMeta -> columnMeta.getField())
             .collect(Collectors.toList());
+
         // all string columns from single or composite key
         Set<String> columnsWithSortKey = sourceTableMeta.getIndexes().stream()
             .map(indexMeta -> indexMeta.getKeyColumns())
@@ -86,6 +106,7 @@ public class OrcMetaUtils {
             .filter(columnMeta -> columnMeta.getDataType() instanceof SliceType)
             .map(ColumnMeta::getName)
             .collect(Collectors.toSet());
+
         if (sourceTableMeta.getGsiPublished() != null) {
             Set<String> gsiColumnsWithSortKey = sourceTableMeta.getGsiPublished().values().stream()
                 .map(gsiIndexMetaBean -> gsiIndexMetaBean.indexColumns)
@@ -95,34 +116,34 @@ public class OrcMetaUtils {
                 .collect(Collectors.toSet());
             columnsWithSortKey.addAll(gsiColumnsWithSortKey);
         }
+
         int[] redundantMap = initRedundantMap(allColumns);
         final int redundantColumnId = allColumns.size() + 1;
         List<ColumnMeta> redundantColumnMetas = new ArrayList<>();
+
         int currentRedundantId = redundantColumnId;
         for (int i = 0; i < redundantMap.length; i++) {
             if (columnsWithSortKey.contains(allColumns.get(i).getOriginColumnName())) {
                 redundantMap[i] = currentRedundantId++;
+
                 ColumnMeta columnMeta = allColumns.get(i);
                 String redundantColumnName = redundantColumnOf(columnMeta.getName());
-                ColumnMeta redundantColumnMeta = new ColumnMeta(
-                    columnMeta.getTableName(),
-                    redundantColumnName,
-                    redundantColumnName,
-                    new Field(
-                        columnMeta.getTableName(),
-                        redundantColumnName,
-                        TYPE_FACTORY.createSqlType(SqlTypeName.VARCHAR))
-                );
+
+                ColumnMeta redundantColumnMeta =
+                    buildRedundantColumnMeta(columnMeta.getTableName(), redundantColumnName);
+
                 redundantColumnMetas.add(redundantColumnMeta);
             }
         }
         List<ColumnMeta> columnMetas = sourceTableMeta.getPhysicalColumns();
+
         // No varchar index column, because it's redundant column have bloom filter.
         Set<ColumnMeta> bfColumnMetas = sourceTableMeta.getSecondaryIndexes().stream()
             .map(indexMeta -> indexMeta.getKeyColumns())
             .flatMap(List::stream)
             .filter(columnMeta -> !(columnMeta.getDataType() instanceof SliceType))
             .collect(Collectors.toSet());
+
         if (sourceTableMeta.getGsiPublished() != null) {
             List<ColumnMeta> gsiBfColumnMetas = sourceTableMeta.getGsiPublished().values().stream()
                 .map(gsiIndexMetaBean -> gsiIndexMetaBean.indexColumns)
@@ -134,13 +155,32 @@ public class OrcMetaUtils {
             bfColumnMetas.addAll(gsiBfColumnMetas);
         }
         List<String> orcKeyColumnNames = bfColumnMetas.stream().map(ColumnMeta::getName).collect(Collectors.toList());
-        TypeDescription schema = getTypeDescription(fieldList, redundantMap);
+        TypeDescription schema =
+            getTypeDescription(fieldList, redundantMap, sourceTableMeta, columnToFieldIdMap, oldFileStorage);
         // build bloom filter schema
-        TypeDescription bfSchema = getBfTypeDescription(orcKeyColumnNames, schema, redundantColumnId);
+        TypeDescription bfSchema = getBfTypeDescription(orcKeyColumnNames, schema, redundantColumnId,
+            sourceTableMeta, columnToFieldIdMap, oldFileStorage);
+
+        // force dictionary columns schema
+        TypeDescription dictSchema = getDictTypeDescription(dictColumnNames, schema, redundantColumnId,
+            sourceTableMeta, columnToFieldIdMap, oldFileStorage);
+
         return new PolarDBXOrcSchema(
-            schema, bfSchema,
-            columnMetas, bfColumnMetas.stream().collect(Collectors.toList()), redundantColumnMetas,
+            schema, bfSchema, dictSchema,
+            columnMetas, new ArrayList<>(bfColumnMetas), redundantColumnMetas,
             redundantColumnId, redundantMap
+        );
+    }
+
+    public static ColumnMeta buildRedundantColumnMeta(String tableName, String redundantColumnName) {
+        return new ColumnMeta(
+            tableName,
+            redundantColumnName,
+            redundantColumnName,
+            new Field(
+                tableName,
+                redundantColumnName,
+                TYPE_FACTORY.createSqlType(SqlTypeName.VARCHAR))
         );
     }
 
@@ -154,30 +194,97 @@ public class OrcMetaUtils {
 
     @NotNull
     public static TypeDescription getBfTypeDescription(List<String> keyColumnNames, TypeDescription schema,
-                                                       int redundantId) {
+                                                       int redundantId,
+                                                       TableMeta tableMeta,
+                                                       Optional<Map<String, String>> columnToFieldIdMap,
+                                                       boolean oldFileStorage) {
         TypeDescription bfSchema = TypeDescription.createStruct();
         for (int i = 0; i < keyColumnNames.size(); i++) {
             String colName = keyColumnNames.get(i);
-            TypeDescription child = schema.findSubtype(colName);
-            bfSchema.addField(colName, child.clone());
+            if (oldFileStorage) {
+                TypeDescription child = schema.findSubtype(colName);
+                bfSchema.addField(colName, child.clone());
+                continue;
+            }
+            String filedId = columnToFieldIdMap.isPresent() ?
+                columnToFieldIdMap.get().get(colName) :
+                tableMeta.getColumnFieldId(colName);
+            TypeDescription child = schema.findSubtype(filedId);
+            bfSchema.addField(filedId, child.clone());
         }
+
         // build bf schema for redundant columns
         for (int i = redundantId; i <= schema.getMaximumId(); i++) {
             String colName = schema.getFieldNames().get(i - 1);
             TypeDescription child = schema.findSubtype(i);
             bfSchema.addField(colName, child.clone());
         }
+
         return bfSchema;
+    }
+
+    @NotNull
+    public static TypeDescription getDictTypeDescription(List<String> dictColumnNames, TypeDescription schema,
+                                                         int redundantId,
+                                                         TableMeta tableMeta,
+                                                         Optional<Map<String, String>> columnToFieldIdMap,
+                                                         boolean oldFileStorage) {
+        TypeDescription dictSchema = TypeDescription.createStruct();
+        if (dictColumnNames != null) {
+            for (int i = 0; i < dictColumnNames.size(); i++) {
+                String colName = dictColumnNames.get(i);
+                if (oldFileStorage) {
+                    TypeDescription child = schema.findSubtype(colName);
+                    dictSchema.addField(colName, child.clone());
+                    continue;
+                }
+                String filedId = columnToFieldIdMap.isPresent() ?
+                    columnToFieldIdMap.get().get(colName) :
+                    tableMeta.getColumnFieldId(colName);
+                if (filedId == null) {
+                    throw new TddlNestableRuntimeException("unknown dictionary column name: " + colName);
+                }
+                TypeDescription child = schema.findSubtype(filedId);
+                dictSchema.addField(filedId, child.clone());
+            }
+        }
+
+        // build dict schema for redundant columns
+        for (int i = redundantId; i <= schema.getMaximumId(); i++) {
+            String colName = schema.getFieldNames().get(i - 1);
+            TypeDescription child = schema.findSubtype(i);
+            dictSchema.addField(colName, child.clone());
+        }
+
+        return dictSchema;
     }
 
     @NotNull
     public static Configuration getConfiguration(ExecutionContext executionContext, PolarDBXOrcSchema orcSchema) {
         Configuration conf = new Configuration();
         ParamManager paramManager = executionContext.getParamManager();
+
         List<String> orcKeyColumnNames = orcSchema.getBfSchema().getFieldNames();
-        String orcBloomFilterColumns = String.join(",", orcKeyColumnNames);
+        String orcBloomFilterColumns = String.join(COLUMN_NAME_DELIMITER, orcKeyColumnNames);
+
+        List<String> dictColumnNames = orcSchema.getDictSchema().getFieldNames();
+        String orcDictColumns = String.join(COLUMN_NAME_DELIMITER, dictColumnNames);
+
         conf.setLong(ORC_ROW_INDEX_STRIDE, paramManager.getLong(ConnectionParams.OSS_ORC_INDEX_STRIDE));
+        conf.setBoolean(ENABLE_DECIMAL64, DynamicConfig.getInstance().enableColumnarDecimal64());
         conf.set(ORC_BLOOM_FILTER_COLUMNS, orcBloomFilterColumns);
+        conf.setDouble(ORC_BLOOM_FILTER_FPP, paramManager.getFloat(ConnectionParams.OSS_BLOOM_FILTER_FPP));
+        conf.set(ORC_DICT_COLUMNS, orcDictColumns);
+        conf.set(ORC_COMPRESS, paramManager.getString(ConnectionParams.OSS_ORC_COMPRESSION));
+        return conf;
+    }
+
+    @NotNull
+    public static Configuration getConfiguration(ExecutionContext executionContext) {
+        Configuration conf = new Configuration();
+        ParamManager paramManager = executionContext.getParamManager();
+
+        conf.setLong(ORC_ROW_INDEX_STRIDE, paramManager.getLong(ConnectionParams.OSS_ORC_INDEX_STRIDE));
         conf.setDouble(ORC_BLOOM_FILTER_FPP, paramManager.getFloat(ConnectionParams.OSS_BLOOM_FILTER_FPP));
         conf.set(ORC_COMPRESS, paramManager.getString(ConnectionParams.OSS_ORC_COMPRESSION));
         return conf;
@@ -191,28 +298,46 @@ public class OrcMetaUtils {
      * @return Orc column meta.
      */
     @NotNull
-    public static TypeDescription getTypeDescription(List<Field> fieldList, int[] redundantMap) {
+    public static TypeDescription getTypeDescription(List<Field> fieldList, int[] redundantMap,
+                                                     TableMeta tableMeta,
+                                                     Optional<Map<String, String>> columnToFieldIdMap,
+                                                     boolean oldFileStorage) {
         Preconditions.checkArgument(fieldList.size() == redundantMap.length);
+
         TypeDescription schema = TypeDescription.createStruct();
         fieldList.stream()
             .forEach(col -> {
                 DataType t = col.getDataType();
                 TypeDescription typeDescription = getTypeDescription(t);
-                schema.addField(col.getOriginColumnName(), typeDescription);
+                if (oldFileStorage) {
+                    schema.addField(col.getOriginColumnName(), typeDescription);
+                    return;
+                }
+                String filedId = columnToFieldIdMap.isPresent() ?
+                    columnToFieldIdMap.get().get(col.getOriginColumnName()) :
+                    tableMeta.getColumnFieldId(col.getOriginColumnName());
+                schema.addField(filedId, typeDescription);
             });
+
         // for redundant column
         for (int i = 0; i < redundantMap.length; i++) {
             if (redundantMap[i] == -1) {
                 // no redundant.
                 continue;
             }
+
             // redundant sort key column.
             DataType t = DataTypes.VarcharType;
             TypeDescription typeDescription = getTypeDescription(t);
-            String originalColumn = fieldList.get(i).getOriginColumnName();
-            String redundantColumn = redundantColumnOf(originalColumn);
+
+            String filedId = columnToFieldIdMap.isPresent() ?
+                columnToFieldIdMap.get().get(fieldList.get(i).getOriginColumnName()) :
+                tableMeta.getColumnFieldId(fieldList.get(i).getOriginColumnName());
+            String redundantColumn = redundantColumnOf(filedId);
+
             schema.addField(redundantColumn, typeDescription);
         }
+
         // invoke id allocation
         schema.getId();
         return schema;
@@ -227,6 +352,7 @@ public class OrcMetaUtils {
                 TypeDescription typeDescription = getTypeDescription(t);
                 schema.addField(col.getOriginColumnName(), typeDescription);
             });
+
         // invoke id allocation
         schema.getId();
         return schema;
@@ -249,12 +375,16 @@ public class OrcMetaUtils {
         case MYSQL_TYPE_TIME:
             // for year
         case MYSQL_TYPE_YEAR:
+
             // for bigint
         case MYSQL_TYPE_LONGLONG:
             return TypeDescription.createLong();
         /* =========== Decimal ============ */
         case MYSQL_TYPE_DECIMAL:
         case MYSQL_TYPE_NEWDECIMAL:
+            return TypeDescription.createDecimal()
+                .withScale(dataType.getScale())
+                .withPrecision(dataType.getPrecision());
         case MYSQL_TYPE_ENUM:
             // for enum
         case MYSQL_TYPE_JSON:
@@ -277,8 +407,10 @@ public class OrcMetaUtils {
                 // for int signed
                 return TypeDescription.createInt();
             }
+
         case MYSQL_TYPE_INT24:
             return TypeDescription.createInt();
+
         case MYSQL_TYPE_SHORT:
             if (isUnsigned) {
                 // for smallint unsigned
@@ -287,8 +419,10 @@ public class OrcMetaUtils {
                 // for smallint signed
                 return TypeDescription.createShort();
             }
+
         case MYSQL_TYPE_TINY:
             return TypeDescription.createShort();
+
         case MYSQL_TYPE_BIT:
             if (dataType instanceof BigBitType) {
                 return TypeDescription.createLong();
@@ -303,6 +437,7 @@ public class OrcMetaUtils {
         case MYSQL_TYPE_FLOAT:
             // for float
             return TypeDescription.createFloat();
+
         default:
             return null;
         }
@@ -336,22 +471,26 @@ public class OrcMetaUtils {
         long readSize = fileLen != -1 ? fileLen : buffer.limit();
         OrcProto.FileTail.Builder fileTailBuilder = OrcProto.FileTail.newBuilder();
         fileTailBuilder.setFileLength(readSize);
+
         int psLen = buffer.get((int) (readSize - 1)) & 0xff;
         int psOffset = (int) (readSize - 1 - psLen);
         ensureOrcFooter(buffer, psLen);
         byte[] psBuffer = new byte[psLen];
         System.arraycopy(buffer.array(), psOffset, psBuffer, 0, psLen);
+
         ps = OrcProto.PostScript.parseFrom(psBuffer);
         int footerSize = (int) ps.getFooterLength();
         CompressionKind compressionKind =
             CompressionKind.valueOf(ps.getCompression().name());
         fileTailBuilder.setPostscriptLength(psLen).setPostscript(ps);
+
         InStream.StreamOptions compression = new InStream.StreamOptions();
         try (CompressionCodec codec = OrcCodecPool.getCodec(compressionKind)) {
             if (codec != null) {
                 compression.withCodec(codec)
                     .withBufferSize((int) ps.getCompressionBlockSize());
             }
+
             OrcProto.Footer footer =
                 OrcProto.Footer.parseFrom(
                     InStream.createCodedInputStream(
@@ -374,6 +513,7 @@ public class OrcMetaUtils {
         if (psLen < fullLength || buffer.remaining() < fullLength) {
             throw new FileFormatException("Malformed ORC file. Invalid postscript length " + psLen);
         }
+
         int offset = buffer.arrayOffset() + buffer.position() + buffer.limit() - fullLength;
         byte[] array = buffer.array();
         // now look for the magic string at the end of the postscript.
@@ -385,4 +525,5 @@ public class OrcMetaUtils {
             }
         }
     }
+
 }

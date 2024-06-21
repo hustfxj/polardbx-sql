@@ -37,7 +37,6 @@ import org.apache.calcite.rex.RexDynamicParam;
 import org.apache.calcite.rex.RexFieldAccess;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
-import org.apache.calcite.sql.SqlAsOfOperator;
 import org.apache.calcite.sql.SqlAsOperator;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
@@ -61,7 +60,6 @@ import org.apache.calcite.sql.SqlUpdate;
 import org.apache.calcite.sql.TDDLSqlSelect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
-import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.sql.util.SqlShuttle;
 import org.apache.calcite.sql2rel.SqlToRelConverter.HintBlackboard;
 import org.apache.calcite.util.Util;
@@ -99,7 +97,7 @@ public abstract class ReplaceTableNameWithSomethingVisitor extends SqlShuttle {
 
     protected boolean indexScan = false;
 
-    private final String defaultSchemaName;
+    protected final String defaultSchemaName;
 
     protected final ExecutionContext ec;
 
@@ -321,7 +319,8 @@ public abstract class ReplaceTableNameWithSomethingVisitor extends SqlShuttle {
                 throw new UnsupportedOperationException("Unsupported DDL syntax.");
             }
             return ddl;
-        } else if (kind == SqlKind.RENAME_TABLE) {
+        } else if (kind == SqlKind.RENAME_TABLE || kind == SqlKind.ALTER_TABLE_DISCARD_TABLESPACE
+            || kind == SqlKind.ALTER_TABLE_IMPORT_TABLESPACE) {
             this.sqlKind = kind;
 
             SqlDdl ddl = (SqlDdl) call;

@@ -44,8 +44,11 @@ public class XPlanTemplate implements IXPlan {
     private final List<SqlIdentifier> tableNames;
     private final List<XPlanUtil.ScalarParamInfo> paramInfos;
 
+    private final String indexName;
+
     public XPlanTemplate(PolarxExecPlan.AnyPlan template, List<SqlIdentifier> tableNames,
-                         List<XPlanUtil.ScalarParamInfo> paramInfos) {
+                         List<XPlanUtil.ScalarParamInfo> paramInfos,
+                         String indexName) {
         this.template = template;
         ByteString digest;
         try {
@@ -56,6 +59,7 @@ public class XPlanTemplate implements IXPlan {
         this.digest = digest;
         this.tableNames = tableNames;
         this.paramInfos = paramInfos;
+        this.indexName = indexName;
     }
 
     public PolarxExecPlan.AnyPlan getTemplate() {
@@ -68,6 +72,10 @@ public class XPlanTemplate implements IXPlan {
 
     public List<XPlanUtil.ScalarParamInfo> getParamInfos() {
         return paramInfos;
+    }
+
+    public String getIndexName() {
+        return indexName;
     }
 
     @Override
@@ -102,10 +110,10 @@ public class XPlanTemplate implements IXPlan {
             }
             break;
             case TableName:
-                builder.addParameters(XUtil.genUtf8StringScalar(phyTableNames.get(info.getId())));
+                builder.addParameters(XUtil.genIdentifierScalarStringCompatible(phyTableNames.get(info.getId())));
                 break;
             case SchemaName:
-                builder.addParameters(XUtil.genUtf8StringScalar(dbIndex));
+                builder.addParameters(XUtil.genIdentifierScalarStringCompatible(dbIndex));
                 break;
             }
         }

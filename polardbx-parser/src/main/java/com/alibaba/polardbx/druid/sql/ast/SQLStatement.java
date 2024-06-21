@@ -43,7 +43,7 @@ public interface SQLStatement extends SQLObject, SQLDbTypedObject {
 
     String toParameterizedString();
 
-    default SqlType getSqlType() {
-        return null;
-    }
+    SqlType getSqlType();
+
+    Boolean getAsync();
 }

@@ -16,20 +16,16 @@
 
 package com.alibaba.polardbx.optimizer.core.planner.rule;
 
-import com.alibaba.polardbx.optimizer.OptimizerContext;
-import com.alibaba.polardbx.optimizer.context.ExecutionContext;
-import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
-import com.alibaba.polardbx.optimizer.core.rel.ReplaceCallWithLiteralVisitor;
-import com.alibaba.polardbx.optimizer.utils.CheckModifyLimitation;
-import com.alibaba.polardbx.optimizer.utils.RelUtils;
-import com.alibaba.polardbx.optimizer.utils.RexUtils;
-import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.properties.ParamManager;
 import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.core.TddlOperatorTable;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalView;
+import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
+import com.alibaba.polardbx.optimizer.utils.RelUtils;
+import com.alibaba.polardbx.optimizer.utils.TableTopologyUtil;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptRuleOperand;
@@ -40,9 +36,7 @@ import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.logical.LogicalProject;
 import org.apache.calcite.rel.rules.PushProjector;
 import org.apache.calcite.rex.RexCall;
-import org.apache.calcite.rex.RexDynamicParam;
 import org.apache.calcite.rex.RexInputRef;
-import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.rex.RexOver;
 import org.apache.calcite.rex.RexUtil;
@@ -65,10 +59,55 @@ public class PushProjectRule extends RelOptRule {
         operand(LogicalView.class, none())), "INSTANCE");
 
     @Override
+    public boolean matches(RelOptRuleCall call) {
+        return true;
+    }
+
+    @Override
     public void onMatch(RelOptRuleCall call) {
         Project project = (Project) call.rels[0];
         LogicalView logicalView = (LogicalView) call.rels[1];
         PlannerContext context = call.getPlanner().getContext().unwrap(PlannerContext.class);
+
+        if (logicalView instanceof OSSTableScan) {
+            if (!((OSSTableScan) logicalView).canPushFilterProject()) {
+                return;
+            }
+            // only push column ref
+            PushProjector pushProjector =
+                new PushProjector(
+                    project, call.builder().getRexBuilder().makeLiteral(true), logicalView,
+                    PushProjector.ExprCondition.FALSE, call.builder());
+            RelNode pushProjectorResult = pushProjector.convertProject(null);
+            if (pushProjectorResult == null || !(pushProjectorResult instanceof Project)) {
+                return;
+            }
+            Project topProject = (Project) pushProjectorResult;
+            if (topProject.getInput() instanceof Project) {
+                Project refProject = (Project) topProject.getInput();
+                if (refProject.getInput() instanceof OSSTableScan) {
+                    OSSTableScan ossTableScan = (OSSTableScan) refProject.getInput();
+
+                    LogicalView newOssTableScan = logicalView.copy(ossTableScan.getTraitSet());
+                    // push column ref project
+                    newOssTableScan.push(refProject);
+
+                    LogicalProject logicalProjectStay =
+                        LogicalProject.create(newOssTableScan, topProject.getProjects(), topProject.getRowType());
+
+                    call.transformTo(logicalProjectStay);
+                }
+            } else if (topProject.getInput() instanceof OSSTableScan) {
+                OSSTableScan ossTableScan = (OSSTableScan) topProject.getInput();
+
+                LogicalView newOssTableScan = logicalView.copy(ossTableScan.getTraitSet());
+                // push column ref project
+                newOssTableScan.push(topProject);
+                call.transformTo(newOssTableScan);
+                return;
+            }
+            return;
+        }
 
         if (logicalView instanceof OSSTableScan) {
             if (!((OSSTableScan) logicalView).canPushFilterProject()) {
@@ -119,8 +158,8 @@ public class PushProjectRule extends RelOptRule {
             // then try push part of project down
             List<RexNode> subquerys =
                 project.getProjects().stream().filter(e -> RexUtil.containsCorrelation(e)).collect(Collectors.toList());
-            if (subquerys.size() > 0 && RelUtils
-                .isAllSingleTableInSameSchema(RelOptUtil.findTables(logicalView))) {
+            if (subquerys.size() > 0 && TableTopologyUtil
+                .isAllSingleTableInSamePhysicalDB(RelOptUtil.findTables(logicalView))) {
 
                 // find push part of projects
                 List<RexNode> pushPart = subquerys.stream().filter(e -> couldPush(e)).collect(Collectors.toList());
@@ -158,8 +197,26 @@ public class PushProjectRule extends RelOptRule {
                     LogicalProject.create(newLogicalView, stayPros, project.getRowType());
 
                 call.transformTo(logicalProjectStay);
+            } else {
+                // try to push column ref
+                RelNode pushProjectorResult =
+                    new PushProjector(
+                        project, call.builder().getRexBuilder().makeLiteral(true), logicalView,
+                        PushProjector.ExprCondition.FALSE, call.builder()).convertProject(null);
+                if (!(pushProjectorResult instanceof Project)) {
+                    return;
+                }
+                Project topProject = (Project) pushProjectorResult;
+                if (topProject.getInput() instanceof Project) {
+                    LogicalView newLogicalView = logicalView.copy(project.getTraitSet());
+                    // push column ref project
+                    newLogicalView.push(topProject.getInput());
+
+                    LogicalProject logicalProjectStay =
+                        LogicalProject.create(newLogicalView, topProject.getProjects(), topProject.getRowType());
+                    call.transformTo(logicalProjectStay);
+                }
             }
-            return;
         } else {
             LogicalView newLogicalView = logicalView.copy(project.getTraitSet());
             // 下压project
@@ -179,7 +236,7 @@ public class PushProjectRule extends RelOptRule {
         dynamicFinder.getScalar().stream().map(s -> RelOptUtil.findTables(s.getRel())).forEach(t -> tables.addAll(t));
         dynamicFinder.getCorrelateScalar().stream().map(s -> RelOptUtil.findTables(s.getRel()))
             .forEach(t -> tables.addAll(t));
-        return RelUtils.isAllSingleTableInSameSchema(tables);
+        return TableTopologyUtil.isAllSingleTableInSamePhysicalDB(tables);
     }
 
     protected boolean remainProject(Project project) {
@@ -216,7 +273,7 @@ public class PushProjectRule extends RelOptRule {
             return true;
         }
 
-        if (RexUtils.containsUnPushableFunction(node, postPlanner)) {
+        if (RexUtil.containsUnPushableFunction(node, postPlanner)) {
             return true;
         }
         return false;

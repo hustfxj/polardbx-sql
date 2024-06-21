@@ -25,6 +25,7 @@ import com.alibaba.polardbx.qatest.entity.ColumnEntity;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import com.alibaba.polardbx.qatest.util.PropertiesUtil;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 import org.apache.commons.lang.RandomStringUtils;
 import org.junit.Assert;
@@ -42,6 +43,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.DateFormat;
+import java.text.MessageFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -958,39 +960,45 @@ public class InsertTest extends CrudBasedLockTestCase {
     @Test
     public void insertDuplicateSetTwice() throws Exception {
         // insert init data
-        String sql = String.format("insert into %s(integer_test,pk,varchar_test,float_test) values(?,?,?,?)",
-            baseOneTableName);
+        String sql =
+            String.format("insert into %s(integer_test,pk,varchar_test,float_test,timestamp_test) values(?,?,?,?,?)",
+                baseOneTableName);
         List<Object> param = new ArrayList<Object>();
         param.add(columnDataGenerator.integer_testValue);
         param.add(columnDataGenerator.pkValue);
         param.add(columnDataGenerator.varchar_testValue);
         param.add(columnDataGenerator.float_testValue);
+        param.add(columnDataGenerator.timestamp_testValue);
         executeOnMysqlAndTddl(mysqlConnection, tddlConnection, sql, param, true);
 
-        sql = String.format("insert into %s(integer_test,pk,varchar_test,float_test) values(?,?,?,?)"
-                + "on duplicate key update integer_test=0, integer_test=integer_test+1, float_test=?",
+        sql = String.format("insert into %s(integer_test,pk,varchar_test,float_test,timestamp_test) values(?,?,?,?,?)"
+                + "on duplicate key update integer_test=0, integer_test=integer_test+1, float_test=?, timestamp_test=?",
             baseOneTableName);
         param.clear();
         param.add(columnDataGenerator.integer_testValue);
         param.add(columnDataGenerator.pkValue);
         param.add(columnDataGenerator.varchar_testValue);
         param.add(columnDataGenerator.float_testValue);
+        param.add(columnDataGenerator.timestamp_testValue);
         param.add(columnDataGenerator.float_testValue);
+        param.add(columnDataGenerator.timestamp_testValue);
         executeOnMysqlAndTddl(mysqlConnection, tddlConnection, sql, param, true);
 
         sql = "select * from " + baseOneTableName;
         selectContentSameAssert(sql, null, mysqlConnection, tddlConnection);
 
         // integer_test and varchar_test
-        sql = String.format("insert into %s(integer_test,pk,varchar_test,float_test) values(?,?,?,?)"
+        sql = String.format("insert into %s(integer_test,pk,varchar_test,float_test,timestamp_test) values(?,?,?,?,?)"
             + "on duplicate key update integer_test=0, integer_test=integer_test+1, "
-            + "float_test=?, float_test=values(float_test)", baseOneTableName);
+            + "float_test=?, float_test=values(float_test), timestamp_test=?", baseOneTableName);
         param.clear();
         param.add(columnDataGenerator.integer_testValue);
         param.add(columnDataGenerator.pkValue);
         param.add(columnDataGenerator.varchar_testValue);
         param.add(columnDataGenerator.float_testValue);
+        param.add(columnDataGenerator.timestamp_testValue);
         param.add(columnDataGenerator.float_testValue);
+        param.add(columnDataGenerator.timestamp_testValue);
         executeOnMysqlAndTddl(mysqlConnection, tddlConnection, sql, param, true);
 
         sql = "select * from " + baseOneTableName;
@@ -1275,5 +1283,45 @@ public class InsertTest extends CrudBasedLockTestCase {
             }
             Assert.assertEquals(3, count);
         }
+    }
+
+    @Test
+    public void insertWithView() {
+        final String viewName = "insert_with_view_test_view";
+
+        // Recreate view
+        String sql = "drop view " + viewName;
+        JdbcUtil.executeUpdateSuccessIgnoreErr(tddlConnection, sql, ImmutableSet.of("Unknown view"));
+        JdbcUtil.executeUpdateSuccessIgnoreErr(mysqlConnection, sql, ImmutableSet.of("Unknown table"));
+
+        sql = String.format("create view %s as\n"
+            + "(\n"
+            + "    select integer_test, varchar_test from %s as a where a.pk < 11 \n"
+            + ")\n", viewName, baseOneTableName);
+        executeOnMysqlAndTddl(mysqlConnection, tddlConnection, sql, null);
+
+        // Execute update
+        sql = String.format("insert into %s(pk, bigint_test, varchar_test) "
+            + "select integer_test + 100, integer_test, varchar_test from %s v", baseOneTableName, viewName);
+        executeOnMysqlAndTddl(mysqlConnection, tddlConnection, sql, null);
+
+        // Check update result
+        sql = "SELECT bigint_test, varchar_test FROM " + baseOneTableName;
+        selectContentSameAssert(sql, null, mysqlConnection, tddlConnection, true);
+
+        // Check error message
+        sql = String.format("insert into %s(integer_test, varchar_test) select integer_test, varchar_test from %s a",
+            viewName, baseOneTableName);
+        executeErrorAssert(tddlConnection, sql, null,
+            MessageFormat.format("{0}'' of the {1} is not updatable", viewName, "INSERT"));
+        sql = String.format("insert into %s(integer_test, varchar_test) values(1, 'a')", viewName);
+        executeErrorAssert(tddlConnection, sql, null,
+            MessageFormat.format("{0}'' of the {1} is not updatable", viewName, "INSERT"));
+        sql = String.format("insert ignore into %s(integer_test, varchar_test) values(1, 'a')", viewName);
+        executeErrorAssert(tddlConnection, sql, null,
+            MessageFormat.format("{0}'' of the {1} is not updatable", viewName, "INSERT"));
+        sql = String.format("replace into %s(integer_test, varchar_test) values(1, 'a')", viewName);
+        executeErrorAssert(tddlConnection, sql, null,
+            MessageFormat.format("{0}'' of the {1} is not updatable", viewName, "REPLACE"));
     }
 }

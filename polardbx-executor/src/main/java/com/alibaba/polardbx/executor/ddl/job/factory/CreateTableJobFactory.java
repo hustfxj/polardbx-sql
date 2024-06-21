@@ -16,23 +16,40 @@
 
 package com.alibaba.polardbx.executor.ddl.job.factory;
 
+import com.alibaba.polardbx.common.ddl.foreignkey.ForeignKeyData;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
+import com.alibaba.polardbx.common.utils.GeneralUtil;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateEntitySecurityAttrTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableAddTablesExtMetaTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableAddTablesMetaTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTablePhyDdlTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableShowTableMetaTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.CreateTableValidateTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.InsertIntoTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.StoreTableLocalityTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.TableSyncTask;
 import com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcDdlMarkTask;
+import com.alibaba.polardbx.executor.ddl.newengine.job.DdlExceptionAction;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJobFactory;
+import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
+import com.alibaba.polardbx.executor.ddl.newengine.job.wrapper.ExecutableDdlJob4CreateSelect;
 import com.alibaba.polardbx.executor.ddl.newengine.job.wrapper.ExecutableDdlJob4CreateTable;
 import com.alibaba.polardbx.gms.locality.LocalityDesc;
-import com.alibaba.polardbx.gms.topology.DbInfoManager;
+import com.alibaba.polardbx.gms.lbac.LBACSecurityEntity;
+import com.alibaba.polardbx.gms.lbac.LBACSecurityManager;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
+import com.alibaba.polardbx.optimizer.core.rel.ddl.data.LikeTableInfo;
 import com.google.common.collect.Lists;
+import org.apache.commons.collections.CollectionUtils;
 
+import java.sql.Connection;
+import java.util.List;
+import java.util.ArrayList;
+import java.sql.Connection;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -50,30 +67,72 @@ public class CreateTableJobFactory extends DdlJobFactory {
     protected final String schemaName;
     protected final String logicalTableName;
     protected final ExecutionContext executionContext;
-    protected final Map<String, String> binaryColumnDefaultValues;
+    protected final Map<String, String> specialDefaultValues;
+    protected final Map<String, Long> specialDefaultValueFlags;
+    protected final List<ForeignKeyData> addedForeignKeys;
+    protected final boolean fromTruncateTable;
+    protected String selectSql;
+    protected final Long versionId;
+    protected LikeTableInfo likeTableInfo;
 
     public CreateTableJobFactory(boolean autoPartition,
                                  boolean hasTimestampColumnDefault,
-                                 Map<String, String> binaryColumnDefaultValues,
+                                 Map<String, String> specialDefaultValues,
+                                 Map<String, Long> specialDefaultValueFlags,
+                                 List<ForeignKeyData> addedForeignKeys,
                                  PhysicalPlanData physicalPlanData,
-                                 ExecutionContext executionContext) {
+                                 Long versionId,
+                                 ExecutionContext executionContext,
+                                 LikeTableInfo likeTableInfo) {
+        this(autoPartition,
+            hasTimestampColumnDefault,
+            specialDefaultValues,
+            specialDefaultValueFlags,
+            addedForeignKeys,
+            physicalPlanData,
+            versionId,
+            executionContext,
+            false,
+            likeTableInfo);
+    }
+
+    public CreateTableJobFactory(boolean autoPartition,
+                                 boolean hasTimestampColumnDefault,
+                                 Map<String, String> specialDefaultValues,
+                                 Map<String, Long> specialDefaultValueFlags,
+                                 List<ForeignKeyData> addedForeignKeys,
+                                 PhysicalPlanData physicalPlanData,
+                                 Long versionId,
+                                 ExecutionContext executionContext,
+                                 boolean fromTruncateTable,
+                                 LikeTableInfo likeTableInfo) {
         this.autoPartition = autoPartition;
         this.hasTimestampColumnDefault = hasTimestampColumnDefault;
         this.physicalPlanData = physicalPlanData;
         this.schemaName = physicalPlanData.getSchemaName();
         this.logicalTableName = physicalPlanData.getLogicalTableName();
         this.executionContext = executionContext;
-        this.binaryColumnDefaultValues = binaryColumnDefaultValues;
+        this.specialDefaultValues = specialDefaultValues;
+        this.specialDefaultValueFlags = specialDefaultValueFlags;
+        this.addedForeignKeys = addedForeignKeys;
+        this.fromTruncateTable = fromTruncateTable;
+        this.versionId = versionId;
+        this.likeTableInfo = likeTableInfo;
     }
 
     @Override
     protected void validate() {
     }
 
+    public void setSelectSql(String sql) {
+        selectSql = sql;
+    }
+
     @Override
     protected ExecutableDdlJob doCreate() {
         CreateTableValidateTask validateTask =
-            new CreateTableValidateTask(schemaName, logicalTableName, physicalPlanData.getTablesExtRecord());
+            new CreateTableValidateTask(schemaName, logicalTableName, physicalPlanData.getTablesExtRecord(),
+                likeTableInfo);
 
         CreateTableAddTablesExtMetaTask addExtMetaTask =
             new CreateTableAddTablesExtMetaTask(schemaName, logicalTableName, physicalPlanData.isTemporary(),
@@ -81,29 +140,38 @@ public class CreateTableJobFactory extends DdlJobFactory {
 
         CreateTablePhyDdlTask phyDdlTask = new CreateTablePhyDdlTask(schemaName, logicalTableName, physicalPlanData);
 
-        CdcDdlMarkTask cdcDdlMarkTask = new CdcDdlMarkTask(schemaName, physicalPlanData);
-
+        CdcDdlMarkTask cdcDdlMarkTask = new CdcDdlMarkTask(schemaName, physicalPlanData, !fromTruncateTable,
+            CollectionUtils.isNotEmpty(addedForeignKeys), versionId);
+        cdcDdlMarkTask.setUseOriginalDDl(!fromTruncateTable);
         CreateTableAddTablesMetaTask addTableMetaTask =
             new CreateTableAddTablesMetaTask(schemaName, logicalTableName, physicalPlanData.getDefaultDbIndex(),
                 physicalPlanData.getDefaultPhyTableName(), physicalPlanData.getSequence(),
                 physicalPlanData.getTablesExtRecord(), physicalPlanData.isPartitioned(),
-                physicalPlanData.isIfNotExists(), physicalPlanData.getKind(), hasTimestampColumnDefault,
-                binaryColumnDefaultValues);
+                physicalPlanData.isIfNotExists(), physicalPlanData.getKind(), addedForeignKeys,
+                hasTimestampColumnDefault, specialDefaultValues, specialDefaultValueFlags, null, null);
+
+        CreateEntitySecurityAttrTask cesaTask = createCESATask();
 
         //Renew this one.
         LocalityDesc locality = physicalPlanData.getLocalityDesc();
-        if(locality == null){
+        if (locality == null) {
             locality = new LocalityDesc();
         }
-        StoreTableLocalityTask storeLocalityTask = new StoreTableLocalityTask(schemaName, logicalTableName, locality.toString(), false);
+        StoreTableLocalityTask storeLocalityTask =
+            new StoreTableLocalityTask(schemaName, logicalTableName, locality.toString(), false);
 
-        CreateTableShowTableMetaTask showTableMetaTask = new CreateTableShowTableMetaTask(schemaName, logicalTableName);
+        CreateTableShowTableMetaTask showTableMetaTask =
+            new CreateTableShowTableMetaTask(schemaName, logicalTableName);
 
         TableSyncTask tableSyncTask = new TableSyncTask(schemaName, logicalTableName);
 
         ExecutableDdlJob4CreateTable result = new ExecutableDdlJob4CreateTable();
-            // TODO(moyi) store locality and show table meta should be put in a transaction
-        result.addSequentialTasks(Lists.newArrayList(
+        // TODO(moyi) store locality and show table meta should be put in a transaction
+
+        if (executionContext.getParamManager().getBoolean(ConnectionParams.CREATE_TABLE_SKIP_CDC)) {
+            cdcDdlMarkTask = null;
+        }
+        List<DdlTask> taskList = Lists.newArrayList(
             validateTask,
             addExtMetaTask,
             phyDdlTask,
@@ -111,8 +179,22 @@ public class CreateTableJobFactory extends DdlJobFactory {
             cdcDdlMarkTask,
             showTableMetaTask,
             storeLocalityTask,
-            tableSyncTask
-        ).stream().filter(Objects::nonNull).collect(Collectors.toList()));
+            cesaTask,
+            tableSyncTask);
+
+        if (!GeneralUtil.isEmpty(addedForeignKeys)) {
+            // sync foreign key table meta
+            for (ForeignKeyData addedForeignKey : addedForeignKeys) {
+                if (schemaName.equalsIgnoreCase(addedForeignKey.refSchema) &&
+                    logicalTableName.equalsIgnoreCase(addedForeignKey.refTableName)) {
+                    continue;
+                }
+                taskList.add(new TableSyncTask(addedForeignKey.refSchema, addedForeignKey.refTableName));
+            }
+        }
+
+        result.addSequentialTasks(taskList.stream().filter(Objects::nonNull).collect(Collectors.toList()));
+
         //todo delete me
         result.labelAsHead(validateTask);
         result.labelAsTail(tableSyncTask);
@@ -128,12 +210,58 @@ public class CreateTableJobFactory extends DdlJobFactory {
         result.setCreateTableShowTableMetaTask(showTableMetaTask);
         result.setTableSyncTask(tableSyncTask);
 
+        if (selectSql != null) {
+            InsertIntoTask insertIntoTask = new InsertIntoTask(schemaName, logicalTableName, selectSql, null, 0);
+            affectRows = insertIntoTask.getAffectRows();
+            ExecutableDdlJob insertJob = new ExecutableDdlJob();
+            insertJob.addTask(insertIntoTask);
+            ExecutableDdlJob4CreateSelect ans = new ExecutableDdlJob4CreateSelect();
+            ans.appendJob2(result);
+            ans.appendJob2(insertJob);
+            ans.setInsertTask(insertIntoTask);
+            //insert 只能rollback，无法重试
+            insertIntoTask.setExceptionAction(DdlExceptionAction.ROLLBACK);
+            return ans;
+        }
+
         return result;
+    }
+
+    protected CreateEntitySecurityAttrTask createCESATask() {
+        List<LBACSecurityEntity> esaList = new ArrayList<>();
+        if (physicalPlanData.getTableESA() != null) {
+            LBACSecurityManager.getInstance().validateSecurityEntity(physicalPlanData.getTableESA(),
+                physicalPlanData.getTableESA().getSecurityAttr());
+            esaList.add(physicalPlanData.getTableESA());
+            if (physicalPlanData.getColEsaList() != null) {
+                for (LBACSecurityEntity esa : physicalPlanData.getColEsaList()) {
+                    LBACSecurityManager.getInstance()
+                        .validateSecurityEntity(esa, physicalPlanData.getTableESA().getSecurityAttr());
+                    esaList.add(esa);
+                }
+            }
+        }
+        return esaList.isEmpty() ? null : new CreateEntitySecurityAttrTask(schemaName, logicalTableName, esaList);
     }
 
     @Override
     protected void excludeResources(Set<String> resources) {
         resources.add(concatWithDot(schemaName, logicalTableName));
+        if (likeTableInfo != null) {
+            resources.add(concatWithDot(likeTableInfo.getSchemaName(), likeTableInfo.getTableName()));
+        }
+
+        // exclude foreign key tables
+        if (!GeneralUtil.isEmpty(addedForeignKeys)) {
+            // sync foreign key table meta
+            for (ForeignKeyData addedForeignKey : addedForeignKeys) {
+                if (schemaName.equalsIgnoreCase(addedForeignKey.refSchema) &&
+                    logicalTableName.equalsIgnoreCase(addedForeignKey.refTableName)) {
+                    continue;
+                }
+                resources.add(concatWithDot(addedForeignKey.refSchema, addedForeignKey.refTableName));
+            }
+        }
     }
 
     @Override

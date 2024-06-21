@@ -27,6 +27,7 @@ import java.util.Map;
 public class TablesRecord extends TablesInfoSchemaRecord {
 
     public static final long FLAG_LOGICAL_COLUMN_ORDER = 0x1;
+    public static final long FLAG_REBUILDING_TABLE = 0x2;
 
     public String newTableName;
     public int status;
@@ -68,4 +69,17 @@ public class TablesRecord extends TablesInfoSchemaRecord {
         flag |= FLAG_LOGICAL_COLUMN_ORDER;
     }
 
+    public boolean isRebuildingTable() {
+        return (flag & FLAG_REBUILDING_TABLE) != 0L;
+    }
+
+    public void setRebuildingTable() {
+        flag |= FLAG_REBUILDING_TABLE;
+    }
+
+    public void resetRebuildingTable() {
+        if (isRebuildingTable()) {
+            flag ^= FLAG_REBUILDING_TABLE;
+        }
+    }
 }

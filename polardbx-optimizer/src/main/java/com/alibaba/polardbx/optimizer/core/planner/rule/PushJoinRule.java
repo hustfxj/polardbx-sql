@@ -16,32 +16,23 @@
 
 package com.alibaba.polardbx.optimizer.core.planner.rule;
 
-import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
-import com.alibaba.polardbx.optimizer.partition.PartitionInfoUtil;
-import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
-import com.alibaba.polardbx.optimizer.utils.RelUtils;
-import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.alibaba.polardbx.common.model.sqljep.Comparative;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.properties.ParamManager;
 import com.alibaba.polardbx.common.utils.CaseInsensitive;
 import com.alibaba.polardbx.common.utils.Pair;
-import com.alibaba.polardbx.common.utils.TStringUtil;
-import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalIndexScan;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalView;
+import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoUtil;
-import com.alibaba.polardbx.optimizer.rule.Partitioner;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
 import com.alibaba.polardbx.optimizer.sharding.ConditionExtractor;
 import com.alibaba.polardbx.optimizer.sharding.result.ExtractionResult;
 import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
+import com.alibaba.polardbx.optimizer.utils.TableTopologyUtil;
 import com.alibaba.polardbx.rule.TableRule;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import org.apache.calcite.plan.RelOptPredicateList;
 import org.apache.calcite.plan.RelOptRule;
@@ -53,7 +44,6 @@ import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.JoinRelType;
 import org.apache.calcite.rel.logical.LogicalJoin;
 import org.apache.calcite.rel.metadata.RelMdPredicates;
-import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexInputRef;
@@ -70,6 +60,7 @@ import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 
@@ -90,6 +81,7 @@ public class PushJoinRule extends RelOptRule {
     public boolean matches(RelOptRuleCall call) {
         final LogicalView leftView = (LogicalView) call.rels[1];
         final LogicalView rightView = (LogicalView) call.rels[2];
+
         if (leftView instanceof OSSTableScan || rightView instanceof OSSTableScan) {
             return false;
         }
@@ -139,6 +131,7 @@ public class PushJoinRule extends RelOptRule {
         String rightTable = rightView.getShardingTable();
         final PlannerContext plannerContext = PlannerContext.getPlannerContext(join);
         final Map<String, Object> extraCmds = plannerContext.getExtraCmds();
+        boolean enableGroupParallelism = plannerContext.getExecutionContext().getGroupParallelism() > 1;
 
         SqlKind sqlKind = plannerContext.getSqlKind();
         String pushPolicy = null;
@@ -175,7 +168,9 @@ public class PushJoinRule extends RelOptRule {
 
                 if (!rightPartitionInfo.isBroadcastTable()) {
                     if (leftView.getLockMode() != SqlSelect.LockMode.UNDEF || sqlKind.belongsTo(SqlKind.DML)) {
-                        return false;
+                        if (enableGroupParallelism) {
+                            return false;
+                        }
                     }
                 }
 
@@ -187,7 +182,9 @@ public class PushJoinRule extends RelOptRule {
 
                 if (!leftPartitionInfo.isBroadcastTable()) {
                     if (rightView.getLockMode() != SqlSelect.LockMode.UNDEF || sqlKind.belongsTo(SqlKind.DML)) {
-                        return false;
+                        if (enableGroupParallelism) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -223,7 +220,7 @@ public class PushJoinRule extends RelOptRule {
                 return false;
             }
 
-            if (leftPartitionInfo.isSingleTable() && rightPartitionInfo.isSingleTable()) {
+            if (TableTopologyUtil.supportPushTheSingleAutoTable(leftTable, rightTable, tddlRuleManager)) {
                 return true;
             }
 
@@ -240,17 +237,12 @@ public class PushJoinRule extends RelOptRule {
 
             if (ConnectionParams.ConnectionParamValues.PUSH_POLICY_BROADCAST.equals(pushPolicy)
                 || ConnectionParams.ConnectionParamValues.PUSH_POLICY_FULL.equals(pushPolicy)) {
-                /**
-                 * 一个广播表，判断是否下推
-                 */
-                if (pushOneBroadCast(joinType, leftTable, rightTable, tddlRuleManager)) {
-                    return true;
-                }
 
                 /**
-                 * 两个单表/广播表，下推，需要包含在broadcast规则内
+                 * 基于单表/广播表判断下推
                  */
-                if (pushAllSingle(leftTable, rightTable, tddlRuleManager)) {
+                if (TableTopologyUtil.supportPushSingleOrBroadcastDrdsTable(
+                    leftTable, rightTable, tddlRuleManager, joinType)) {
                     return true;
                 }
 
@@ -287,13 +279,27 @@ public class PushJoinRule extends RelOptRule {
         /**
          * 判断是否能够下推
          */
-        if (!pushable(call, rel, leftView, rightView)) {
-            return;
+        boolean bskip = PlannerContext.getPlannerContext(rel).getParamManager()
+            .getBoolean(ConnectionParams.ENABLE_SIMPLIFY_SHARDING_SQL);
+
+        if (!bskip) {
+            if (!pushable(call, rel, leftView, rightView)) {
+                return;
+            }
         }
 
         // 将条件分为三部分：ON中的条件，作用于左孩子的条件和作用于右孩子的条件
         List<RexNode> leftFilters = new ArrayList<>();
         List<RexNode> rightFilters = new ArrayList<>();
+        boolean ignoreNonPushFuncInJoin = Optional.ofNullable(PlannerContext.getPlannerContext(rel)).map(
+                PlannerContext::getParamManager).map(t -> t.getBoolean(ConnectionParams.IGNORE_UN_PUSHABLE_FUNC_IN_JOIN))
+            .orElse(Boolean.TRUE);
+        if (!ignoreNonPushFuncInJoin) {
+            boolean containsUnPushableFunc = RexUtil.containsUnPushableFunction(joinCondition, false);
+            if (containsUnPushableFunc) {
+                return;
+            }
+        }
         RelOptPredicateList preds = classifyFilters(rel, joinCondition, leftFilters, rightFilters);
         perform(call, leftFilters, rightFilters, preds);
     }
@@ -384,7 +390,10 @@ public class PushJoinRule extends RelOptRule {
 
         if (null != lShardColumnRef) {
             //lShardColumnRef.addAll(getRefByColumnName(leftView, leftTable, lPartitionInfo.getPartitionColumns(), true));
-            lShardColumnRef.addAll(getRefByColumnName(leftView, leftTable, PartitionInfoUtil.getActualPartitionColumns(lPartitionInfo), true));
+            lShardColumnRef.addAll(
+                getRefByColumnName(leftView, leftTable,
+                    PartitionInfoUtil.getAllLevelActualPartColumnsAsList(lPartitionInfo),
+                    true));
         }
 
         if (null != rShardColumnRefForJoin) {
@@ -393,7 +402,9 @@ public class PushJoinRule extends RelOptRule {
 //                getRefByColumnName(rightView, rightTable, rPartitionInfo.getPartitionColumns(), false);
 
             List<Integer> rShardColumnRef =
-                getRefByColumnName(rightView, rightTable, PartitionInfoUtil.getActualPartitionColumns(rPartitionInfo), false);
+                getRefByColumnName(rightView, rightTable,
+                    PartitionInfoUtil.getAllLevelActualPartColumnsAsList(rPartitionInfo),
+                    false);
 
             for (int rColRef : rShardColumnRef) {
                 rShardColumnRefForJoin.add(leftView.getRowType().getFieldCount() + rColRef);
@@ -495,7 +506,7 @@ public class PushJoinRule extends RelOptRule {
                                                boolean last) {
         List<Integer> refs = new ArrayList<>();
         for (String col : columns) {
-            int ref = logicalView.getRefByColumnName(tableName, col, last);
+            int ref = logicalView.getRefByColumnName(tableName, col, last, false);
 
             /**
              * 在LogicalView 中不存在对于分区键的引用,不能下推
@@ -549,133 +560,6 @@ public class PushJoinRule extends RelOptRule {
         call.transformTo(newLeftView);
     }
 
-    protected boolean pushAllSingle(String leftTable, String rightTable, TddlRuleManager or) {
-        final String shardingTable = allSingleTableCanPush(leftTable, rightTable, or);
-
-        if (TStringUtil.isNotBlank(shardingTable)) {
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * 单表和广播表的下推判断
-     */
-    protected String allSingleTableCanPush(String leftTable, String rightTable, TddlRuleManager or) {
-        // 两个单表，可以下推
-        if (or.isTableInSingleDb(leftTable) && or.isTableInSingleDb(rightTable)) {
-            return rightTable;
-        }
-
-        // 两个广播表
-        if (or.isBroadCast(leftTable) && or.isBroadCast(rightTable)) {
-            return rightTable;
-        }
-
-        // 一个广播表，一个单表
-        if (or.isTableInSingleDb(leftTable) && or.isBroadCast(rightTable)) {
-            return leftTable;
-        }
-
-        if (or.isBroadCast(leftTable) && or.isTableInSingleDb(rightTable)) {
-            return rightTable;
-        }
-
-        return null;
-    }
-
-    protected boolean pushOneBroadCast(JoinRelType joinType, String leftTable, String rightTable, TddlRuleManager or) {
-        final String shardingTable = oneBroadCastTableCanPush(joinType, leftTable, rightTable, or);
-        if (TStringUtil.isNotBlank(shardingTable)) {
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * 有一个广播表时，判断其是否可以下推
-     */
-    protected String oneBroadCastTableCanPush(JoinRelType joinType, String leftTable, String rightTable,
-                                              TddlRuleManager or) {
-        /**
-         * inner join, 任意一个是广播表就可以下推
-         */
-        if (joinType == JoinRelType.INNER) {
-            if (or.isBroadCast(leftTable)) {
-                return rightTable;
-            } else if (or.isBroadCast(rightTable)) {
-                return leftTable;
-            }
-        }
-
-        /**
-         * left join，右表是广播表
-         */
-        if (joinType == JoinRelType.LEFT && (or.isBroadCast(rightTable))) {
-            return leftTable;
-        }
-
-        /**
-         * right join, 左表是广播表
-         */
-        if (joinType == JoinRelType.RIGHT && (or.isBroadCast(leftTable))) {
-            return rightTable;
-        }
-
-        if ((joinType == JoinRelType.SEMI || joinType == JoinRelType.ANTI || joinType == JoinRelType.LEFT_SEMI)
-            && or.isBroadCast(rightTable)) {
-            return rightTable;
-        }
-
-        return null;
-    }
-
-    /**
-     * 根据其他条件推导, 并判断是否是分区键上的等值连接
-     */
-    protected boolean inferEqualJoin(RexBuilder builder, RelDataType lDataType, RelDataType rDataType,
-                                     List<RexNode> leftFilters, List<RexNode> rightFilters, List<String> lShardCol,
-                                     List<String> rShardCol) {
-        Preconditions.checkArgument(lShardCol.size() == rShardCol.size());
-
-        List<Comparative> lComps = buildComparative(builder, lDataType, leftFilters, lShardCol);
-        List<Comparative> rComps = buildComparative(builder, rDataType, rightFilters, rShardCol);
-
-        if (lComps == null || rComps == null) {
-            return false;
-        }
-
-        if (lComps.size() != rComps.size()) {
-            return false;
-        }
-
-        for (int i = 0; i < lComps.size(); i++) {
-            if (!lComps.get(i).equals(rComps.get(i))) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private List<Comparative> buildComparative(RexBuilder builder, RelDataType rowType, List<RexNode> filters,
-                                               List<String> cols) {
-        List<Comparative> comps = new ArrayList<>();
-        RexNode newLeftFilter = RexUtil.composeConjunction(builder, filters, true);
-        for (String col : cols) {
-            Partitioner partitioner = OptimizerContext.getContext(null).getPartitioner();
-            Comparative comp = partitioner.getComparative(newLeftFilter, rowType, col, null);
-            if (comp == null) {
-                return null;
-            }
-
-            comps.add(comp);
-        }
-        return comps;
-    }
-
     private boolean checkAllowPushDownForPartitions(LogicalView leftView, LogicalView rightView) {
 
         SqlNodeList lParts = (SqlNodeList) leftView.getPartitions();
@@ -685,7 +569,7 @@ public class PushJoinRule extends RelOptRule {
             return true;
         } else if (lParts == null && rParts != null) {
             return false;
-        }  else if (lParts != null && rParts == null) {
+        } else if (lParts != null && rParts == null) {
             return false;
         }
 

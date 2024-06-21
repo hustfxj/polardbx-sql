@@ -19,30 +19,24 @@ package com.alibaba.polardbx.server.handler;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.server.ServerConnection;
 import com.alibaba.polardbx.server.parser.ServerParseResize;
-import com.alibaba.polardbx.server.response.ResizeStoredFunctionCache;
-import com.alibaba.polardbx.server.response.ResizePlanCache;
 import com.alibaba.polardbx.server.response.ResizeProcedureCache;
+import com.alibaba.polardbx.server.response.ResizeStoredFunctionCache;
 import com.alibaba.polardbx.server.util.LogUtils;
 
 public final class ResizeHandler {
-    public static void handle(ByteString stmt, ServerConnection c, int offset, boolean hasMore) {
+    public static boolean handle(ByteString stmt, ServerConnection c, int offset, boolean hasMore) {
         boolean recordSql = true;
         Throwable sqlEx = null;
         try {
             int rs = ServerParseResize.parse(stmt, offset);
             switch (rs & 0xff) {
-            case ServerParseResize.PLANCACHE:
-                ResizePlanCache.response(stmt, c, rs >>> 8, hasMore);
-                break;
             case ServerParseResize.PROCEDURE_CACHE:
-                ResizeProcedureCache.response(stmt, c, rs >>> 8, hasMore);
-                break;
+                return ResizeProcedureCache.response(stmt, c, rs >>> 8, hasMore);
             case ServerParseResize.FUNCTION_CACHE:
-                ResizeStoredFunctionCache.response(stmt, c, rs >>> 8, hasMore);
-                break;
+                return ResizeStoredFunctionCache.response(stmt, c, rs >>> 8, hasMore);
             default:
-                c.execute(stmt, hasMore);
                 recordSql = false;
+                return c.execute(stmt, hasMore);
             }
         } catch (Throwable ex) {
             sqlEx = ex;

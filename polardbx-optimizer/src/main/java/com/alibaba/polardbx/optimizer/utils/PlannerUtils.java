@@ -27,16 +27,20 @@ import com.alibaba.polardbx.common.model.sqljep.Comparative;
 import com.alibaba.polardbx.common.model.sqljep.ComparativeAND;
 import com.alibaba.polardbx.common.model.sqljep.ComparativeBaseList;
 import com.alibaba.polardbx.common.model.sqljep.ComparativeOR;
+import com.alibaba.polardbx.common.utils.ExecutorMode;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.config.ConfigDataMode;
+import com.alibaba.polardbx.druid.sql.ast.SqlType;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
+import com.alibaba.polardbx.optimizer.config.meta.DrdsRelMetadataProvider;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
+import com.alibaba.polardbx.optimizer.core.rel.LogicalView;
 import com.alibaba.polardbx.optimizer.core.rel.util.DynamicParamInfo;
 import com.alibaba.polardbx.optimizer.core.rel.util.IndexedDynamicParamInfo;
 import com.alibaba.polardbx.optimizer.core.rel.util.RuntimeFilterDynamicParamInfo;
@@ -60,6 +64,7 @@ import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.GroupConcatAggregateCall;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.logical.LogicalAggregate;
+import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeField;
@@ -103,6 +108,9 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static com.alibaba.polardbx.common.jdbc.ITransactionPolicy.TransactionClass.EXPLICIT_TRANSACTION;
+import static com.alibaba.polardbx.common.jdbc.ITransactionPolicy.TransactionClass.SUPPORT_SHARE_READVIEW_TRANSACTION;
+
 /**
  * @author lingce.ldm 2017-11-16 10:20
  */
@@ -112,6 +120,10 @@ public class PlannerUtils {
     public final static int SCALAR_SUBQUERY_PARAM_INDEX = -2;
     public final static int APPLY_SUBQUERY_PARAM_INDEX = -3;
     private final static Logger logger = LoggerFactory.getLogger(PlannerUtils.class);
+
+    public static RelMetadataQuery newMetadataQuery() {
+        return RelMetadataQuery.instance(DrdsRelMetadataProvider.DEFAULT);
+    }
 
     public static Map<String, List<List<String>>> convertTargetDB(List<List<TargetDB>> targetDBs) {
         return convertTargetDB(targetDBs, null, false, null);
@@ -1121,6 +1133,37 @@ public class PlannerUtils {
         return newParam;
     }
 
+    public static Map<Integer, ParameterContext> buildBatchParam(List<String> tableNames,
+                                                                 List<Map<Integer, ParameterContext>> batchParams,
+                                                                 List<Integer> paramIndex) {
+        Map<Integer, ParameterContext> newParam = new HashMap<>();
+        /**
+         * Add tableName
+         */
+        int index = 1;
+
+        for (Map<Integer, ParameterContext> param : batchParams) {
+            int tableIndex = -1;
+            for (int i : paramIndex) {
+                if (i == TABLE_NAME_PARAM_INDEX) {
+                    if (ConfigDataMode.isFastMock()) {
+                        continue;
+                    }
+                    tableIndex += 1;
+                    newParam.put(index, buildParameterContextForTableName(tableNames.get(tableIndex), index));
+                } else if (i == SCALAR_SUBQUERY_PARAM_INDEX) {
+                    // do nothing
+                } else if (i == APPLY_SUBQUERY_PARAM_INDEX) {
+                    // do nothing
+                } else {
+                    newParam.put(index, changeParameterContextIndex(param.get(i + 1), index));
+                }
+                index++;
+            }
+        }
+        return newParam;
+    }
+
     public static Map<Integer, ParameterContext> buildParam(List<String> tableNames,
                                                             List<String> referencedTableNames) {
         Map<Integer, ParameterContext> newParam = new HashMap<>();
@@ -1432,4 +1475,5 @@ public class PlannerUtils {
             return SqlNode.clone(intervalQualifier);
         }
     }
+
 }

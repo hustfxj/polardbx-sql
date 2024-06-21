@@ -21,10 +21,8 @@ import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.logger.Logger;
-import com.alibaba.polardbx.executor.balancer.stats.StatsUtils;
 import com.alibaba.polardbx.executor.ddl.job.task.BaseValidateTask;
 import com.alibaba.polardbx.executor.ddl.job.task.util.TaskName;
-import com.alibaba.polardbx.executor.ddl.job.validator.GsiValidator;
 import com.alibaba.polardbx.executor.ddl.job.validator.TableValidator;
 import com.alibaba.polardbx.gms.tablegroup.PartitionGroupRecord;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupConfig;
@@ -32,10 +30,8 @@ import com.alibaba.polardbx.gms.tablegroup.TableGroupRecord;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupUtils;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.statistics.SQLRecorderLogger;
-import com.google.common.base.Joiner;
 import lombok.Getter;
 
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -49,6 +45,7 @@ public class DrainNodeValidateTask extends BaseValidateTask {
 
     private final static Logger LOG = SQLRecorderLogger.ddlLogger;
     private List<TableGroupConfig> tableGroupConfigs;
+
     @JSONCreator
     public DrainNodeValidateTask(String schemaName, List<TableGroupConfig> tableGroupConfigs) {
         super(schemaName);
@@ -61,15 +58,26 @@ public class DrainNodeValidateTask extends BaseValidateTask {
         Map<String, TableGroupConfig> curTableGroupMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         Map<String, TableGroupConfig> saveTableGroupMap = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
 
-        curTableGroupConfigs.stream().forEach(o->curTableGroupMap.put(o.getTableGroupRecord().tg_name, o));
-        tableGroupConfigs.stream().forEach(o->saveTableGroupMap.put(o.getTableGroupRecord().tg_name, o));
+        curTableGroupConfigs
+            .stream()
+            .filter(tg -> !tg.isColumnarTableGroup())
+            .forEach(o -> curTableGroupMap.put(o.getTableGroupRecord().tg_name, o));
+        tableGroupConfigs
+            .stream()
+            .filter(tg -> !tg.isColumnarTableGroup())
+            .forEach(o -> saveTableGroupMap.put(o.getTableGroupRecord().tg_name, o));
 
         if (curTableGroupMap.size() == saveTableGroupMap.size()) {
-            for(Map.Entry<String, TableGroupConfig> entry:saveTableGroupMap.entrySet()) {
+            for (Map.Entry<String, TableGroupConfig> entry : saveTableGroupMap.entrySet()) {
                 if (!curTableGroupMap.containsKey(entry.getKey())) {
                     throw new TddlRuntimeException(ErrorCode.ERR_TABLEGROUP_META_TOO_OLD,
                         String.format("the metadata of tableGroup[%s] is too old, please retry this command",
                             entry.getKey()));
+                }
+                TableGroupConfig curTableGroupConfig = curTableGroupMap.get(entry.getKey());
+                TableGroupConfig saveTableGroupConfig = entry.getValue();
+                if (curTableGroupConfig.isEmpty() && saveTableGroupConfig.isEmpty()) {
+                    continue;
                 }
                 TableValidator.validateTableGroupChange(curTableGroupMap.get(entry.getKey()), entry.getValue());
                 for (PartitionGroupRecord record : GeneralUtil.emptyIfNull(

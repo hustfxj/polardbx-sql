@@ -17,7 +17,7 @@
 package com.alibaba.polardbx.net.handler;
 
 import com.alibaba.polardbx.Commands;
-import com.alibaba.polardbx.ErrorCode;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.net.FrontendConnection;
 import com.alibaba.polardbx.net.compress.PacketOutputProxyFactory;
 import com.alibaba.polardbx.net.packet.OkPacket;
@@ -32,6 +32,7 @@ import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 public class FrontendCommandHandler implements NIOHandler {
 
     private static final Logger logger = LoggerFactory.getLogger(FrontendCommandHandler.class);
+    private static final Logger cdcLogger = LoggerFactory.getLogger("cdc_log");
 
     protected final FrontendConnection source;
     protected final CommandCount commandCount;
@@ -41,24 +42,15 @@ public class FrontendCommandHandler implements NIOHandler {
         this.commandCount = source.getProcessor().getCommands();
     }
 
+    /**
+     * @param data requests on one connection must be processed sequentially
+     */
     @Override
-    public void handle(byte[] data) {
+    synchronized public void handle(byte[] data) {
         source.buildMDC();
         source.setPacketId((byte) (0 & 0xff));
         source.setLastActiveTime(System.nanoTime());
         source.setSqlBeginTimestamp(System.currentTimeMillis());
-
-        // In cursor mode, only the following requests can be handled:
-        // COM_STMT_FETCH, COM_STMT_CLOSE, begin/commit/rollback/set autocommit
-        if (source.isCursorFetchMode()
-            && data[4] != Commands.COM_STMT_FETCH
-            && data[4] != Commands.COM_STMT_CLOSE
-            && data[4] != Commands.COM_QUERY) {
-            source.writeErrMessage(ErrorCode.ER_NOT_ALLOWED_COMMAND,
-                "Not allow to execute commands except for: "
-                    + "COM_STMT_FETCH, COM_STMT_FETCH, begin, commit, rollback, set autocommit");
-            return;
-        }
 
         switch (data[4]) {
         case Commands.COM_INIT_DB:
@@ -127,6 +119,10 @@ public class FrontendCommandHandler implements NIOHandler {
             PacketOutputProxyFactory.getInstance().createProxy(source).writeArrayAsPacket(OkPacket.OK);
             break;
         case Commands.COM_BINLOG_DUMP:
+            if (cdcLogger.isInfoEnabled()) {
+                cdcLogger.info("receive a binlog dump request.");
+            }
+            source.setIsBinlogDumpConn(true);
             source.binlogDump(data);
             break;
         default:

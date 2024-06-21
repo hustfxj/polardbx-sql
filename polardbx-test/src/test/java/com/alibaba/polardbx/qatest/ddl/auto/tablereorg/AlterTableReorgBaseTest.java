@@ -17,7 +17,7 @@
 package com.alibaba.polardbx.qatest.ddl.auto.tablereorg;
 
 import com.alibaba.polardbx.optimizer.config.table.ComplexTaskMetaManager;
-import com.alibaba.polardbx.optimizer.partition.PartitionStrategy;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionStrategy;
 import com.alibaba.polardbx.qatest.DDLBaseNewDBTestCase;
 import com.alibaba.polardbx.qatest.data.ExecuteTableSelect;
 import com.alibaba.polardbx.qatest.util.ConnectionManager;
@@ -33,6 +33,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -58,11 +59,11 @@ public class AlterTableReorgBaseTest extends DDLBaseNewDBTestCase {
     protected static String originUseDbName;
     protected static String originSqlMode;
     protected static boolean needAutoDropDbAfterTest = true;
-    protected static final boolean printExecutedSqlLog = true;
-    protected static final String tableGroupName = "altertable_tg";
-    protected static final String tableName = "tT1";
+    protected static boolean printExecutedSqlLog = false;
+    protected static String tableGroupName = "altertable_tg";
+    protected static String tableName = "tT1";
 
-    protected static final String pk = "id";
+    protected static String pk = "id";
 
     public static final String PARTITION_BY_BIGINT_KEY =
         " partition by key(id) partitions 3";
@@ -203,7 +204,8 @@ public class AlterTableReorgBaseTest extends DDLBaseNewDBTestCase {
         if (withConcurrentDml) {
             dmlWhilePartitionReorg(partitionRuleInfo, partitionRuleInfo.alterCommand, tableName);
         } else {
-            executePartReorg(partitionRuleInfo.tableStatus, partitionRuleInfo.alterCommand);
+            executePartReorg(partitionRuleInfo.tableStatus, partitionRuleInfo.alterCommand,
+                partitionRuleInfo.usePhysicalTableBackfill);
         }
     }
 
@@ -270,13 +272,18 @@ public class AlterTableReorgBaseTest extends DDLBaseNewDBTestCase {
         }
     }
 
-    private void executePartReorg(ComplexTaskMetaManager.ComplexTaskStatus status, String command) {
+    private void executePartReorg(ComplexTaskMetaManager.ComplexTaskStatus status, String command,
+                                  boolean usePhysicalBackfill) {
         String sqlHint = "";
         if (!status.isPublic()) {
-            sqlHint = String.format("/*+TDDL:CMD_EXTRA(TABLEGROUP_REORG_FINAL_TABLE_STATUS_DEBUG='%s')*/",
+            sqlHint = String.format(
+                "/*+TDDL:CMD_EXTRA(PHYSICAL_BACKFILL_ENABLE=false, TABLEGROUP_REORG_FINAL_TABLE_STATUS_DEBUG='%s')*/",
                 status.name());
+        } else if (usePhysicalBackfill) {
+            sqlHint = "/*+TDDL:CMD_EXTRA(PHYSICAL_BACKFILL_ENABLE=true, PHYSICAL_BACKFILL_SPEED_TEST=false)*/";
         }
-        String ignoreErr = "Please use SHOW DDL";
+        String ignoreErr =
+            "The DDL job has been paused or cancelled. Please use SHOW DDL";
         Set<String> ignoreErrs = new HashSet<>();
         ignoreErrs.add(ignoreErr);
         JdbcUtil.executeUpdateSuccessIgnoreErr(tddlConnection, sqlHint + command,
@@ -552,9 +559,13 @@ public class AlterTableReorgBaseTest extends DDLBaseNewDBTestCase {
     protected int getTraceCount(List<List<String>> trace, String type) {
         int count = 0;
         for (List<String> sqlTrace : trace) {
-            if (sqlTrace.get(11).toLowerCase().indexOf(type) != -1
-                && sqlTrace.get(11).toLowerCase().indexOf("for update") == -1) {
-                count++;
+            if (sqlTrace.get(11).toLowerCase().contains(type)
+                && !sqlTrace.get(11).toLowerCase().contains("for update")) {
+                if (type.equalsIgnoreCase("update") && sqlTrace.get(12).contains("}")) {
+                    count += Arrays.stream(sqlTrace.get(12).split("}")).count() - 1;
+                } else {
+                    count++;
+                }
             }
         }
         return count;
@@ -757,7 +768,7 @@ public class AlterTableReorgBaseTest extends DDLBaseNewDBTestCase {
                     max2, tableName, (sql) -> {
                     executeDml(hintStr + sql, partitionRuleInfo.connection, ignoreError);
                 }))));
-            executePartReorg(partitionRuleInfo.tableStatus, command);
+            executePartReorg(partitionRuleInfo.tableStatus, command, partitionRuleInfo.usePhysicalTableBackfill);
             try {
                 TimeUnit.SECONDS.sleep(2);
             } catch (InterruptedException e) {
@@ -800,6 +811,8 @@ public class AlterTableReorgBaseTest extends DDLBaseNewDBTestCase {
             add("tT3");
             add("tT4");
         }};
+
+        boolean usePhysicalTableBackfill = false;
 
         public PartitionRuleInfo(PartitionStrategy partitionStrategy,
                                  int initDataType, String partitionRule,
@@ -857,6 +870,10 @@ public class AlterTableReorgBaseTest extends DDLBaseNewDBTestCase {
 
         public void setLogicalTableNames(List<String> logicalTableNames) {
             this.logicalTableNames = logicalTableNames;
+        }
+
+        public void setUsePhysicalTableBackfill(boolean usePhysicalTableBackfill) {
+            this.usePhysicalTableBackfill = usePhysicalTableBackfill;
         }
 
         public void prepareData(String tableName, Integer insertRow) {

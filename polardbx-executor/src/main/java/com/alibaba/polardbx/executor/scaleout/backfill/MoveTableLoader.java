@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.executor.scaleout.backfill;
 
+import com.alibaba.polardbx.executor.backfill.Extractor;
 import com.alibaba.polardbx.executor.backfill.Loader;
 import com.alibaba.polardbx.executor.cursor.Cursor;
 import com.alibaba.polardbx.executor.gsi.InsertIndexExecutor;
@@ -79,6 +80,7 @@ public class MoveTableLoader extends com.alibaba.polardbx.executor.backfill.Load
         final SqlNodeList targetColumnList = new SqlNodeList(
             indexTableMeta.getAllColumns()
                 .stream()
+                .filter(columnMeta -> !columnMeta.isGeneratedColumn())
                 .map(columnMeta -> new SqlIdentifier(columnMeta.getName(), SqlParserPos.ZERO))
                 .collect(Collectors.toList()),
             SqlParserPos.ZERO);
@@ -121,7 +123,7 @@ public class MoveTableLoader extends com.alibaba.polardbx.executor.backfill.Load
         final TddlRuleManager tddlRuleManager = optimizerContext.getRuleManager();
         final Set<String> filterColumns = Sets.newTreeSet(String::compareToIgnoreCase);
         final Set<String> primaryKeys = Sets.newTreeSet(String::compareToIgnoreCase);
-        primaryKeys.addAll(GlobalIndexMeta.getPrimaryKeys(primaryTableMeta));
+        primaryKeys.addAll(Extractor.getPrimaryKeys(primaryTableMeta, ec));
         filterColumns.addAll(primaryKeys);
         filterColumns.addAll(tddlRuleManager.getSharedColumns(primaryTable));
         filterColumns.addAll(tddlRuleManager.getSharedColumns(indexTable));

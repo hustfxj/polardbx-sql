@@ -17,33 +17,32 @@
 package com.alibaba.polardbx.server.response;
 
 import com.alibaba.polardbx.CobarServer;
-import com.alibaba.polardbx.executor.ddl.newengine.DdlEngineRequester;
-import com.alibaba.polardbx.executor.pl.RuntimeFunction;
-import com.alibaba.polardbx.executor.pl.RuntimeFunctionManager;
-import com.alibaba.polardbx.gms.privilege.PolarPrivUtil;
-import com.alibaba.polardbx.executor.pl.ProcedureStatus;
-import com.alibaba.polardbx.gms.privilege.PolarPrivUtil;
-import com.alibaba.polardbx.net.FrontendConnection;
-import com.alibaba.polardbx.net.NIOProcessor;
-import com.alibaba.polardbx.server.ServerConnection;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.executor.cursor.ResultCursor;
 import com.alibaba.polardbx.executor.cursor.impl.ArrayResultCursor;
+import com.alibaba.polardbx.executor.ddl.newengine.DdlEngineRequester;
 import com.alibaba.polardbx.executor.mpp.deploy.ServiceProvider;
+import com.alibaba.polardbx.executor.pl.ProcedureStatus;
+import com.alibaba.polardbx.executor.pl.RuntimeFunction;
+import com.alibaba.polardbx.executor.pl.RuntimeFunctionManager;
 import com.alibaba.polardbx.executor.sync.ISyncAction;
+import com.alibaba.polardbx.gms.privilege.PolarPrivUtil;
 import com.alibaba.polardbx.matrix.jdbc.TConnection;
 import com.alibaba.polardbx.net.FrontendConnection;
 import com.alibaba.polardbx.net.NIOProcessor;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
+import com.alibaba.polardbx.server.ServerConnection;
+import com.alibaba.polardbx.server.conn.InnerConnection;
+import com.alibaba.polardbx.server.conn.InnerConnectionManager;
 import com.alibaba.polardbx.server.handler.pl.RuntimeProcedure;
 import com.alibaba.polardbx.server.handler.pl.RuntimeProcedureManager;
-import com.alibaba.polardbx.server.ServerConnection;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * @author mengshi.sunmengshi 2015年5月12日 下午1:28:16
@@ -129,8 +128,10 @@ public class KillSyncAction implements ISyncAction {
         NIOProcessor[] processors = CobarServer.getInstance().getProcessors();
         FrontendConnection fc;
         String traceId = null;
+        boolean found = false;
         for (NIOProcessor p : processors) {
             if ((fc = p.getFrontends().get(id)) != null) {
+                found = true;
                 if (fc instanceof ServerConnection && hasAccess(fc)) {
                     TConnection tc = ((ServerConnection) fc).getTddlConnection();
                     if (tc != null) {
@@ -154,6 +155,31 @@ public class KillSyncAction implements ISyncAction {
                 killFunction(traceId);
                 break;
             }
+        }
+
+        // Inner connection.
+        InnerConnection innerConnection;
+        if (null != (innerConnection = InnerConnectionManager.getActiveConnections().get(id))) {
+            if (hasAccess(innerConnection)) {
+                found = true;
+                count++;
+                TConnection tc = innerConnection.getTConnection();
+                if (tc != null) {
+                    pauseDdlJobIfNecessary(tc);
+                    ExecutionContext executionContext = tc.getExecutionContext();
+                    traceId = executionContext.getTraceId();
+                    if (ServiceProvider.getInstance().getServer() != null
+                        && traceId != null) {
+                        ServiceProvider.getInstance().getServer().getQueryManager()
+                            .cancelQuery(traceId);
+                    }
+                }
+                innerConnection.close();
+            }
+        }
+
+        if (!found) {
+            logger.info(String.format("To kill ConnectionId-%d is not found", id));
         }
 
         ArrayResultCursor result = new ArrayResultCursor("KILL");
@@ -201,6 +227,30 @@ public class KillSyncAction implements ISyncAction {
         }
 
         // None of the above cases, target can not be killed.
+        logger.warn(String.format("User: %s has no privilege kill ConnectionId-%d",
+            user, id));
+        return false;
+    }
+
+    private boolean hasAccess(InnerConnection conn) {
+        // Case 0: Skip access validation, target can be killed.
+        if (skipValidation) {
+            return true;
+        }
+
+        // Case 1: If kill.user == target.user, target can be killed.
+        if (TStringUtil.equals(user, conn.getUser())) {
+            return true;
+        }
+
+        // Case 2: If kill.user == polardbx_root, target can be killed.
+        if (TStringUtil.equals(PolarPrivUtil.POLAR_ROOT, user)) {
+            return true;
+        }
+
+        // None of the above cases, target can not be killed.
+        logger.warn(String.format("User: %s has no privilege kill Inner-ConnectionId-%d",
+            user, id));
         return false;
     }
 
@@ -215,7 +265,7 @@ public class KillSyncAction implements ISyncAction {
         if (jobId == null) {
             return;
         }
-        DdlEngineRequester.pauseJob(jobId);
+        DdlEngineRequester.pauseJob(jobId, conn.getExecutionContext());
     }
 
 }

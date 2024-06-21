@@ -16,8 +16,6 @@
 
 package com.alibaba.polardbx.executor.handler.ddl;
 
-import com.alibaba.polardbx.common.exception.TddlRuntimeException;
-import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.executor.ddl.job.factory.AlterTableRenamePartitionJobFactory;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJob;
 import com.alibaba.polardbx.executor.partitionmanagement.AlterTableGroupUtils;
@@ -74,7 +72,7 @@ public class LogicalAlterTableRenamePartitionHandler extends LogicalCommonDdlHan
 
         AlterTableGroupUtils.alterTableGroupRenamePartitionCheck(sqlAlterTableRenamePartition, tableGroupConfig,
             executionContext);
-        return super.validatePlan(logicalDdlPlan, executionContext);
+        return false;
     }
 
 }

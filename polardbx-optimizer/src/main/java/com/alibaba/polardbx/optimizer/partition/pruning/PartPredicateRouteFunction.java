@@ -19,15 +19,19 @@ package com.alibaba.polardbx.optimizer.partition.pruning;
 import com.alibaba.polardbx.common.exception.NotSupportException;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundVal;
-import com.alibaba.polardbx.optimizer.partition.PartitionBoundValueKind;
+import com.alibaba.polardbx.optimizer.partition.PartitionByDefinition;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundVal;
+import com.alibaba.polardbx.optimizer.partition.boundspec.PartitionBoundValueKind;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
-import com.alibaba.polardbx.optimizer.partition.PartitionStrategy;
+import com.alibaba.polardbx.optimizer.partition.common.PartKeyLevel;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionStrategy;
 import com.alibaba.polardbx.optimizer.partition.datatype.PartitionField;
 import com.alibaba.polardbx.optimizer.partition.datatype.function.Monotonicity;
+import com.alibaba.polardbx.optimizer.partition.datatype.function.PartitionFunctionBuilder;
 import com.alibaba.polardbx.optimizer.partition.datatype.function.PartitionIntFunction;
 import com.alibaba.polardbx.optimizer.partition.exception.InvalidTypeConversionException;
 import com.alibaba.polardbx.optimizer.partition.exception.SubQueryDynamicValueNotReadyException;
@@ -36,8 +40,11 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlOperator;
+import org.jetbrains.annotations.NotNull;
 
+import java.util.ArrayList;
 import java.util.BitSet;
+import java.util.List;
 
 /**
  * Route one simple interval(maybe a multi-column range)
@@ -63,19 +70,9 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
     protected ExprContextProvider contextHolder;
 
     /**
-     * The flag that label if the part routing need do map interval from query space to search space
+     * The partition strategy
      */
-    protected boolean needMapInterval = false;
-
-    /**
-     * The flag that label if need eval the part func value by using the expr value of predicate
-     */
-    protected boolean needEvalPartFunc = false;
-
-    /**
-     * label if the part int func is a not-monotonic func
-     */
-    protected boolean isNonMonotonic = false;
+    protected PartitionStrategy strategy;
 
     /**
      * The search expr from predicate
@@ -92,7 +89,22 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
     protected SearchExprInfo searchExprInfo = null;
 
     /**
-     * The charset of predicate expr of part key 0, just for range/list/hash
+     * The flag that label if the part routing need do interval mapping from query space to search space
+     */
+    protected boolean needMapInterval = false;
+
+    /**
+     * The flag that label if need eval the part func value for the first part key by using the expr value of predicate
+     */
+    protected boolean needEvalPartFunc = false;
+
+    /**
+     * label if the part int func of the first part key is a not-monotonic func
+     */
+    protected boolean isNonMonotonic = false;
+
+    /**
+     * The part func expr of part key 0, just for range/list/hash
      */
     protected SqlOperator partFuncOperator = null;
 
@@ -102,9 +114,9 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
     protected DataType partExprReturnType = null;
 
     /**
-     * The partition strategy
+     * The router info of part func expr of all part keys
      */
-    protected PartitionStrategy strategy;
+    protected PartFuncExprRouterInfo[] partFuncRouterInfoArr;
 
     public PartPredicateRouteFunction(PartitionInfo partInfo,
                                       SqlOperator partFuncOperator,
@@ -122,34 +134,35 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
 
     protected void initRouteFunction() {
         // Get the partCount and subPartCount of subPartition template
-        this.partCount = partInfo.getPartitionBy().getPartitions().size();
-        this.subPartCount = -1;
-        if (this.partInfo.getSubPartitionBy() != null) {
-            this.subPartCount = this.partInfo.getPartitionBy().getPartitions().get(0).getSubPartitions().size();
-        }
+//        this.partCount = partInfo.getPartitionBy().getPartitions().size();
+//        this.subPartCount = -1;
+//        if (this.partInfo.getPartitionBy().getSubPartitionBy() != null) {
+//            this.subPartCount = this.partInfo.getPartitionBy().getPartitions().get(0).getSubPartitions().size();
+//        }
 
         // Router should be cached
+        PartitionByDefinition partByDef = null;
         if (matchLevel == PartKeyLevel.PARTITION_KEY) {
-            this.router = partInfo.getPartitionBy().getRouter();
             this.strategy = partInfo.getPartitionBy().getStrategy();
+            partByDef = partInfo.getPartitionBy();
         } else if (matchLevel == PartKeyLevel.SUBPARTITION_KEY) {
-            throw new NotSupportException("Not support subpartitions");
+            this.strategy = partInfo.getPartitionBy().getSubPartitionBy().getStrategy();
+            partByDef = partInfo.getPartitionBy().getSubPartitionBy();
         }
 
-        // Check if need do interval mapping
-        if (matchLevel == PartKeyLevel.PARTITION_KEY) {
-            SqlNode partExpr = partInfo.getPartitionBy().getPartitionExprList().get(0);
-            if (this.strategy == PartitionStrategy.RANGE || this.strategy == PartitionStrategy.LIST
-                || this.strategy == PartitionStrategy.HASH) {
+        if (this.strategy != PartitionStrategy.CO_HASH) {
+            SqlNode partExpr = partByDef.getPartitionExprList().get(0);
+            if (PartitionFunctionBuilder.checkStrategySupportPartFunc(this.strategy)
+                || this.strategy == PartitionStrategy.DIRECT_HASH) {
                 if (partExpr instanceof SqlCall) {
                     /**
                      * The part columns is wrapped with func, such year(partCol)...
-                     * , so need do map interval
+                     * , so need do interval mapping
                      */
                     this.needEvalPartFunc = true;
-                    RelDataType partExprDt = this.partInfo.getPartitionBy().getPartitionExprTypeList().get(0);
+                    RelDataType partExprDt = partByDef.getPartitionExprTypeList().get(0);
                     this.partExprReturnType = DataTypeUtil.calciteToDrdsType(partExprDt);
-                    Monotonicity monotonicity = this.partInfo.getPartitionBy().getPartIntFuncMonotonicity();
+                    Monotonicity monotonicity = partByDef.getPartIntFuncMonotonicity();
                     this.isNonMonotonic = monotonicity == Monotonicity.NON_MONOTONIC;
                     if (this.cmpKind != ComparisonKind.EQUAL && this.cmpKind != ComparisonKind.NOT_EQUAL) {
                         if (this.strategy == PartitionStrategy.RANGE || this.strategy == PartitionStrategy.LIST) {
@@ -157,18 +170,73 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
                         }
                     }
                 }
+
+                PartFuncExprRouterInfo tmpPartFuncExprRouterInfo = new PartFuncExprRouterInfo();
+                tmpPartFuncExprRouterInfo.setPartKeyIndex(0);
+                if (this.needEvalPartFunc) {
+                    PartitionIntFunction[] partFuncArr = partByDef.getPartFuncArr();
+                    tmpPartFuncExprRouterInfo.setPartFunc(partFuncArr[0]);
+                    tmpPartFuncExprRouterInfo.setNeedEvalPartFunc(this.needEvalPartFunc);
+                    tmpPartFuncExprRouterInfo.setPartExprReturnType(this.partExprReturnType);
+                    tmpPartFuncExprRouterInfo.setPartFuncOperator(this.partFuncOperator);
+
+                } else {
+                    tmpPartFuncExprRouterInfo.setPartFunc(null);
+                    tmpPartFuncExprRouterInfo.setNeedEvalPartFunc(false);
+                    tmpPartFuncExprRouterInfo.setPartExprReturnType(null);
+                    tmpPartFuncExprRouterInfo.setPartFuncOperator(null);
+                }
+                PartFuncExprRouterInfo[] tmpPartFuncRouterInfoArr =
+                    new PartFuncExprRouterInfo[partByDef.getPartitionExprList().size()];
+                tmpPartFuncRouterInfoArr[0] = tmpPartFuncExprRouterInfo;
+                this.partFuncRouterInfoArr = tmpPartFuncRouterInfoArr;
+            } else {
+                List<String> partColList = partByDef.getPartitionColumnNameList();
+                PartFuncExprRouterInfo[] tmpPartFuncRouterInfoArr = new PartFuncExprRouterInfo[partColList.size()];
+                for (int i = 0; i < tmpPartFuncRouterInfoArr.length; i++) {
+                    PartFuncExprRouterInfo tmpPartFuncExprRouterInfo = new PartFuncExprRouterInfo();
+                    tmpPartFuncExprRouterInfo.setPartKeyIndex(i);
+                    tmpPartFuncExprRouterInfo.setPartFunc(null);
+                    tmpPartFuncExprRouterInfo.setNeedEvalPartFunc(false);
+                    tmpPartFuncExprRouterInfo.setPartExprReturnType(null);
+                    tmpPartFuncExprRouterInfo.setPartFuncOperator(null);
+                    tmpPartFuncRouterInfoArr[i] = tmpPartFuncExprRouterInfo;
+                }
+                this.partFuncRouterInfoArr = tmpPartFuncRouterInfoArr;
             }
         } else {
-            throw new TddlRuntimeException(ErrorCode.ERR_EXECUTOR,
-                "Not support do partition pruning with subpartitions");
+            PartitionIntFunction[] partFuncArr = partByDef.getPartFuncArr();
+            PartFuncExprRouterInfo[] tmpPartFuncRouterInfoArr = new PartFuncExprRouterInfo[partFuncArr.length];
+            for (int i = 0; i < partFuncArr.length; i++) {
+                PartitionIntFunction partFunc = partFuncArr[i];
+                PartFuncExprRouterInfo tmpPartFuncExprRouterInfo = new PartFuncExprRouterInfo();
+                tmpPartFuncExprRouterInfo.setPartKeyIndex(i);
+                tmpPartFuncExprRouterInfo.setPartFunc(partFunc);
+                if (partFunc != null) {
+                    /**
+                     * The part columns is wrapped with func, such year(partCol)...
+                     * , so need do interval mapping
+                     */
+                    tmpPartFuncExprRouterInfo.setNeedEvalPartFunc(true);
+                    tmpPartFuncExprRouterInfo.setPartExprReturnType(partFunc.getReturnType());
+                    tmpPartFuncExprRouterInfo.setPartFuncOperator(partFunc.getSqlOperator());
+
+                } else {
+                    tmpPartFuncExprRouterInfo.setNeedEvalPartFunc(false);
+                    tmpPartFuncExprRouterInfo.setPartExprReturnType(null);
+                    tmpPartFuncExprRouterInfo.setPartFuncOperator(null);
+                }
+                tmpPartFuncRouterInfoArr[i] = tmpPartFuncExprRouterInfo;
+            }
+            this.partFuncRouterInfoArr = tmpPartFuncRouterInfoArr;
+            this.isNonMonotonic = true;
+            this.needMapInterval = false;
+
+            PartFuncExprRouterInfo firstPartFuncInfo = tmpPartFuncRouterInfoArr[0];
+            this.needEvalPartFunc = firstPartFuncInfo.isNeedEvalPartFunc();
+            this.partFuncOperator = firstPartFuncInfo.getPartFuncOperator();
+            this.partExprReturnType = firstPartFuncInfo.getPartExprReturnType();
         }
-
-    }
-
-    @Override
-    public BitSet routePartitions(ExecutionContext context, PartPruneStepPruningContext pruningCtx) {
-        BitSet allPartBitSet = PartitionPrunerUtils.buildEmptyPartitionsBitSet(partInfo);
-        return routeAndBuildPartBitSet(context, pruningCtx, allPartBitSet);
     }
 
     protected SearchDatumInfo buildSearchDatumInfoForPredData(ExecutionContext context,
@@ -179,52 +247,133 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
         ComparisonKind cmpKind = this.searchExprInfo.getCmpKind();
         int partColNum = predExprExecArr.length;
         PartitionBoundVal[] searchValArr = new PartitionBoundVal[partColNum];
-        if (partColNum > 1) {
-            SearchExprEvalResult exprEvalResult =
-                PartitionPrunerUtils.evalExprValsAndBuildOneDatum(context, pruningCtx, this.searchExprInfo);
-            cmdKindOutput[0] = exprEvalResult.getComparisonKind();
-            SearchDatumInfo searchDatumInfo = exprEvalResult.getSearchDatumInfo();
-            return searchDatumInfo;
+        PartitionStrategy strategy = this.strategy;
+
+        if (strategy != PartitionStrategy.CO_HASH) {
+            if (partColNum > 1) {
+                SearchExprEvalResult exprEvalResult =
+                    PartitionPrunerUtils.evalExprValsAndBuildOneDatum(context, pruningCtx, this.searchExprInfo);
+                cmdKindOutput[0] = exprEvalResult.getComparisonKind();
+                SearchDatumInfo searchDatumInfo = exprEvalResult.getSearchDatumInfo();
+                return searchDatumInfo;
+            } else {
+                PartClauseExprExec exprExec = predExprExecArr[0];
+                PartFuncExprRouterInfo partFuncRouterInfo = partFuncRouterInfoArr[0];
+                PartitionBoundVal searchVal =
+                    evalExprAndThenEvalPartFunc(context, pruningCtx, cmpKind, exprExec, partFuncRouterInfo,
+                        cmdKindOutput);
+                searchValArr[0] = searchVal;
+                SearchDatumInfo searchDatumInfo = new SearchDatumInfo(searchValArr);
+                return searchDatumInfo;
+            }
         } else {
-            PartClauseExprExec exprExec = predExprExecArr[0];
-            boolean isAlwaysNull = exprExec.isAlwaysNullValue();
-            boolean[] epInfo = PartFuncMonotonicityUtil.buildIntervalEndPointInfo(cmpKind);
-            PartitionBoundValueKind valKind = exprExec.getValueKind();
-
-            // Compute the const expr val for part predicate
-            PartitionField exprValPartField = exprExec.evalPredExprVal(context, pruningCtx, epInfo);
-
-            // Do the interval mapping from predicate query space to partition search space
-            // and put the mapping result into the cmdKindOutput.
-            PartitionField newPartField = doIntervalMapping(exprExec, context, exprValPartField, cmdKindOutput, epInfo);
-
-            // Build the PartitionBoundVal
-            PartitionBoundVal searchVal =
-                PartitionBoundVal.createPartitionBoundVal(newPartField, valKind, isAlwaysNull);
-            searchValArr[0] = searchVal;
+            for (int i = 0; i < partColNum; i++) {
+                PartClauseExprExec exprExec = predExprExecArr[i];
+                PartFuncExprRouterInfo partFuncRouterInfo = partFuncRouterInfoArr[i];
+                PartitionBoundVal searchVal =
+                    evalExprAndThenEvalPartFunc(context, pruningCtx, cmpKind, exprExec, partFuncRouterInfo,
+                        cmdKindOutput);
+                searchValArr[i] = searchVal;
+            }
             SearchDatumInfo searchDatumInfo = new SearchDatumInfo(searchValArr);
             return searchDatumInfo;
         }
+
+//        if (partColNum > 1) {
+//            SearchExprEvalResult exprEvalResult =
+//                PartitionPrunerUtils.evalExprValsAndBuildOneDatum(context, pruningCtx, this.searchExprInfo);
+//            cmdKindOutput[0] = exprEvalResult.getComparisonKind();
+//            SearchDatumInfo searchDatumInfo = exprEvalResult.getSearchDatumInfo();
+//            return searchDatumInfo;
+//        } else {
+//            PartClauseExprExec exprExec = predExprExecArr[0];
+//            PartitionBoundVal searchVal =
+//                evalExprAndThenEvalPartFunc(context, pruningCtx, cmpKind, exprExec, cmdKindOutput);
+//            searchValArr[0] = searchVal;
+//            SearchDatumInfo searchDatumInfo = new SearchDatumInfo(searchValArr);
+//            return searchDatumInfo;
+//        }
+    }
+
+    /**
+     * Eval the const expr of part predicate and then eval the part func expr
+     * by using the eval result of the const expr above
+     */
+    @NotNull
+    private PartitionBoundVal evalExprAndThenEvalPartFunc(ExecutionContext context,
+                                                          PartPruneStepPruningContext pruningCtx,
+                                                          ComparisonKind cmpKind,
+                                                          PartClauseExprExec exprExec,
+                                                          PartFuncExprRouterInfo partFuncRouterInfo,
+                                                          ComparisonKind[] cmdKindOutput) {
+        boolean isAlwaysNull = exprExec.isAlwaysNullValue();
+        boolean[] epInfo = PartFuncMonotonicityUtil.buildIntervalEndPointInfo(cmpKind);
+        PartitionBoundValueKind valKind = exprExec.getValueKind();
+
+        // Compute the const expr val for part predicate
+        PartitionField exprValPartField = exprExec.evalPredExprVal(context, pruningCtx, epInfo);
+
+        PartitionField newPartField = null;
+        if (valKind == PartitionBoundValueKind.DATUM_NORMAL_VALUE) {
+            // Do the interval mapping from predicate query space to partition search space
+            // and put the mapping result into the cmdKindOutput.
+            newPartField =
+                doIntervalMapping(exprExec, partFuncRouterInfo, context, exprValPartField, cmdKindOutput, epInfo);
+        }
+
+        // Build the PartitionBoundVal
+        PartitionBoundVal searchVal =
+            PartitionBoundVal.createPartitionBoundVal(newPartField, valKind, isAlwaysNull);
+
+        return searchVal;
     }
 
     /**
      *
      */
     private PartitionField doIntervalMapping(PartClauseExprExec exprExec,
+                                             PartFuncExprRouterInfo partFuncRouterInfo,
                                              ExecutionContext context,
                                              PartitionField exprValPartField,
                                              ComparisonKind[] cmdKindOutput,
                                              boolean[] endpoints) {
+
+        boolean needEvalPartFunc = partFuncRouterInfo.isNeedEvalPartFunc();
+        DataType partExprReturnType = partFuncRouterInfo.getPartExprReturnType();
         ComparisonKind finalCmpKind = PartFuncMonotonicityUtil.buildComparisonKind(endpoints);
         PartitionField newPartField;
-        if (this.needEvalPartFunc) {
+        if (needEvalPartFunc) {
             PartitionIntFunction partIntFunc = exprExec.getPartIntFunc();
-            PartitionField partFuncVal = PartitionPrunerUtils
-                .evalPartFuncVal(exprValPartField, partIntFunc, context, endpoints,
-                    PartFieldAccessType.QUERY_PRUNING);
-            if (this.needMapInterval && !isNonMonotonic) {
 
-                // leftEndPoint[0]=false => <
+            PartitionField partFuncVal = PartitionPrunerUtils
+                .evalPartFuncVal(exprValPartField, partIntFunc, getStrategy(), context, endpoints,
+                    PartFieldAccessType.QUERY_PRUNING);
+
+            if (this.needMapInterval && !isNonMonotonic && endpoints != null) {
+                /**
+                 * here endpoints must be NOT null,
+                 * if endpoints is null, that means finalCmpKind must be an equal expr
+                 */
+
+                /**
+                 *
+                 * <pre>
+                 *     endpoints[0] means cmpDirection:
+                 *      if endpoints[0]=false,
+                 *          that means constExpr is NOT the leftEndPoint of a range, such as partCol < const or partCol <= const;
+                 *     if endpoints[0]=true,
+                 *          that means constExpr is the leftEndPoint of a range, such as constExpr < partCol or constExpr <= partCol;
+                 *
+                 *     endpoints[1] means if the endpoint is included:
+                 *      if endpoints[1]=false,
+                 *          that means constExpr should NOT be included, such as partCol < const or  partCol > const;
+                 *     if endpoints[1]=true,
+                 *          that means constExpr should be included, such as partCol <= const or  partCol >= const;
+                 * </pre>
+                 *
+                 */
+                // leftEndPoint[0] = false => part </<= const
+                // leftEndPoint[1] = true => part >/>= const
                 /**
                  * <pre>
                  * leftEndPoint=true  <=>  const < col or const <= col, so const is the left end point,
@@ -274,11 +423,22 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
         return newPartField;
     }
 
-    protected BitSet routeAndBuildPartBitSet(ExecutionContext context, PartPruneStepPruningContext pruningCtx,
-                                             BitSet allPartBitSet) {
+    @Override
+    public PartPrunedResult routePartitions(ExecutionContext context, PartPruneStepPruningContext pruningCtx,
+                                            List<Integer> parentPartPosiSet) {
+        return routeAndBuildPartBitSet(context, pruningCtx, parentPartPosiSet);
+    }
+
+    protected PartPrunedResult routeAndBuildPartBitSet(ExecutionContext context, PartPruneStepPruningContext pruningCtx,
+                                                       List<Integer> parentPartPosiSet) {
 
         ComparisonKind[] cmpKindOutput = new ComparisonKind[1];
         SearchDatumInfo finalVal = null;
+        BitSet pruneBitSet = null;
+
+        Integer parentPartPosi =
+            parentPartPosiSet == null || parentPartPosiSet.isEmpty() ? null : parentPartPosiSet.get(0);
+        PartitionRouter router = getRouterByPartInfo(this.matchLevel, parentPartPosi, this.partInfo);
         try {
             // Compute the const expr val for part predicate
             finalVal = buildSearchDatumInfoForPredData(context, pruningCtx, cmpKindOutput);
@@ -290,7 +450,10 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
                  *  the SearchExprInfo should be ignore and
                  *  so generate a full scan bitset
                  */
-                return PartitionPrunerUtils.buildFullScanPartitionsBitSet(this.partInfo);
+
+                pruneBitSet = PartitionPrunerUtils.buildFullScanPartitionsBitSetByPartRouter(router);
+                return PartPrunedResult.buildPartPrunedResult(partInfo, pruneBitSet, this.matchLevel, parentPartPosi,
+                    false);
             } else if (ex instanceof SubQueryDynamicValueNotReadyException) {
                 /**
                  *  when it is failed to compute its SearchDatumInfo because of
@@ -298,7 +461,9 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
                  *  the SearchExprInfo should be ignore and
                  *  so generate a full scan bitset
                  */
-                return PartitionPrunerUtils.buildFullScanPartitionsBitSet(this.partInfo);
+                pruneBitSet = PartitionPrunerUtils.buildFullScanPartitionsBitSetByPartRouter(router);
+                return PartPrunedResult.buildPartPrunedResult(partInfo, pruneBitSet, this.matchLevel, parentPartPosi,
+                    false);
             } else {
                 throw ex;
             }
@@ -308,16 +473,15 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
         PartitionRouter.RouterResult result = router.routePartitions(context, cmpKindOutput[0], finalVal);
 
         // Save the pruned result into bitset
+        BitSet allPartBitSet = PartitionPrunerUtils.buildEmptyPartitionsBitSetByPartRouter(router);
         if (result.strategy != PartitionStrategy.LIST && result.strategy != PartitionStrategy.LIST_COLUMNS) {
             PartitionPrunerUtils
-                .setPartBitSetByStartEnd(allPartBitSet, result.partStartPosi, result.pasrEndPosi, matchLevel, partCount,
-                    subPartCount, true);
+                .setPartBitSetByStartEnd(allPartBitSet, result.partStartPosi, result.pasrEndPosi, true);
         } else {
             PartitionPrunerUtils
-                .setPartBitSetForPartList(allPartBitSet, result.partPosiSet, matchLevel, partCount, subPartCount, true);
+                .setPartBitSetForPartList(allPartBitSet, result.partPosiSet, true);
         }
-
-        return allPartBitSet;
+        return PartPrunedResult.buildPartPrunedResult(partInfo, allPartBitSet, this.matchLevel, parentPartPosi, false);
     }
 
     public ExprContextProvider getContextHolder() {
@@ -336,10 +500,12 @@ public class PartPredicateRouteFunction extends PartRouteFunction {
         return partFuncOperator;
     }
 
+    @Override
     public PartitionStrategy getStrategy() {
         return strategy;
     }
 
+    @Override
     public PartPredicateRouteFunction copy() {
         PartPredicateRouteFunction routeFunction =
             new PartPredicateRouteFunction(this.partInfo, this.partFuncOperator, this.matchLevel,

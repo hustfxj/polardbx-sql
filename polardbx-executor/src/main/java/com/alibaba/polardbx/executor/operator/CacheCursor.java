@@ -16,10 +16,6 @@
 
 package com.alibaba.polardbx.executor.operator;
 
-import com.alibaba.polardbx.optimizer.core.row.ArrayRow;
-import com.alibaba.polardbx.optimizer.spill.QuerySpillSpaceMonitor;
-import com.google.common.collect.Lists;
-import com.google.common.util.concurrent.ListenableFuture;
 import com.alibaba.polardbx.common.exception.MemoryNotEnoughException;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
@@ -38,11 +34,15 @@ import com.alibaba.polardbx.optimizer.config.table.ColumnMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.CursorMeta;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
+import com.alibaba.polardbx.optimizer.core.row.ArrayRow;
 import com.alibaba.polardbx.optimizer.core.row.Row;
 import com.alibaba.polardbx.optimizer.memory.MemoryAllocatorCtx;
 import com.alibaba.polardbx.optimizer.memory.MemoryPool;
 import com.alibaba.polardbx.optimizer.memory.MemoryType;
+import com.alibaba.polardbx.optimizer.spill.QuerySpillSpaceMonitor;
 import com.alibaba.polardbx.optimizer.spill.SpillMonitor;
+import com.google.common.collect.Lists;
+import com.google.common.util.concurrent.ListenableFuture;
 
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -65,7 +65,7 @@ public class CacheCursor implements Cursor {
     protected Spiller spiller;
     protected int chunkLimit;
     private BlockBuilder[] blockBuilders;
-    private Iterator<Chunk> iterator;
+    protected Iterator<Chunk> iterator;
     protected Chunk currentChunk;
     protected int currentPos;
     protected CursorMeta cursorMeta;
@@ -76,6 +76,7 @@ public class CacheCursor implements Cursor {
     private List<Throwable> ex = new ArrayList<>();
     private SpillMonitor spillMonitor;
     private ExecutionContext context;
+    private long rowCount = 0;
 
     public CacheCursor(
         ExecutionContext context, SpillerFactory spillerFactory, Cursor cursor, long estimateRowSize) {
@@ -185,7 +186,9 @@ public class CacheCursor implements Cursor {
 
     public void cacheAllRows() {
         Row currentRow;
+        rowCount = 0;
         while ((currentRow = cursor.next()) != null) {
+            rowCount++;
             try {
                 long rowSize = currentRow.estimateSize();
                 if (rowSize <= 0) {
@@ -293,5 +296,9 @@ public class CacheCursor implements Cursor {
     @Override
     public List<ColumnMeta> getReturnColumns() {
         return cursorMeta.getColumns();
+    }
+
+    public long getRowCount() {
+        return rowCount;
     }
 }

@@ -45,7 +45,6 @@ import org.apache.calcite.sql.SqlExplainFormat;
 import org.apache.calcite.sql.SqlExplainLevel;
 
 import java.text.NumberFormat;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -55,10 +54,10 @@ import java.util.TreeSet;
  */
 public class ShowParametric {
 
-    private static int FIELD_COUNT = 14;
+    private static final int FIELD_COUNT = 14;
     private static final ResultSetHeaderPacket header = PacketUtil.getHeader(FIELD_COUNT);
     private static final FieldPacket[] fields = new FieldPacket[FIELD_COUNT];
-    private static final EOFPacket eof = new EOFPacket();
+    private static final byte packetId = FIELD_COUNT + 1;
 
     static {
         int i = 0;
@@ -106,11 +105,9 @@ public class ShowParametric {
 
         fields[i] = PacketUtil.getField("MIN_ROWS_FEEDBACK", Fields.FIELD_TYPE_DOUBLE);
         fields[i++].packetId = ++packetId;
-
-        eof.packetId = ++packetId;
     }
 
-    public static void response(ServerConnection c) {
+    public static boolean response(ServerConnection c) {
         ByteBufferHolder buffer = c.allocate();
         IPacketOutputProxy proxy = PacketOutputProxyFactory.getInstance().createProxy(c, buffer);
         proxy.packetBegin();
@@ -123,12 +120,15 @@ public class ShowParametric {
             proxy = field.write(proxy);
         }
 
+        byte tmpPacketId = packetId;
         // write eof
-        proxy = eof.write(proxy);
+        if (!c.isEofDeprecated()) {
+            EOFPacket eof = new EOFPacket();
+            eof.packetId = ++tmpPacketId;
+            proxy = eof.write(proxy);
+        }
 
         // write rows
-        byte packetId = eof.packetId;
-
         String schemaName = c.getSchema();
         if (OptimizerContext.getContext(schemaName) != null) {
             Map<String, BaselineInfo> baselineInfoMap = PlanManager.getInstance().getBaselineMap(schemaName);
@@ -139,12 +139,12 @@ public class ShowParametric {
                     }
                     for (Point point : baselineInfo.getPointSet()) {
                         RowDataPacket row = new RowDataPacket(FIELD_COUNT);
-                        row.add(StringUtil.encode(schemaName, c.getCharset()));
-                        row.add(StringUtil.encode(baselineInfo.getId() + "", c.getCharset()));
+                        row.add(StringUtil.encode(schemaName, c.getResultSetCharset()));
+                        row.add(StringUtil.encode(baselineInfo.getId() + "", c.getResultSetCharset()));
                         row.add(StringUtil.encode(baselineInfo.getParameterSql().replaceAll("\n", " ").trim(),
-                            c.getCharset()));
+                            c.getResultSetCharset()));
                         long planId = point.getPlanId();
-                        row.add(StringUtil.encode(planId + "", c.getCharset()));
+                        row.add(StringUtil.encode(planId + "", c.getResultSetCharset()));
                         /**
                          * plan info
                          */
@@ -165,21 +165,23 @@ public class ShowParametric {
                                         SqlExplainFormat.TEXT,
                                         SqlExplainLevel.NO_ATTRIBUTES);
                                 }
-                                row.add(StringUtil.encode(planExplain, c.getCharset()));
-                                row.add(StringUtil.encode(planInfo.isAccepted() ? "TRUE" : "FALSE", c.getCharset()));
+                                row.add(StringUtil.encode(planExplain, c.getResultSetCharset()));
+                                row.add(StringUtil.encode(planInfo.isAccepted() ? "TRUE" : "FALSE",
+                                    c.getResultSetCharset()));
                             }
                         }
                         NumberFormat numberFormat = NumberFormat.getPercentInstance();
-                        row.add(StringUtil.encode(point.getSelectivityMap().toString(), c.getCharset()));
-                        row.add(StringUtil.encode(point.getInflationNarrow() + "", c.getCharset()));
-                        row.add(StringUtil.encode(point.getParams().toString(), c.getCharset()));
-                        row.add(StringUtil.encode(point.getChooseTime() + "", c.getCharset()));
+                        row.add(StringUtil.encode(point.getSelectivityMap().toString(), c.getResultSetCharset()));
+                        row.add(StringUtil.encode(point.getInflationNarrow() + "", c.getResultSetCharset()));
+                        row.add(StringUtil.encode(point.getParams().toString(), c.getResultSetCharset()));
+                        row.add(StringUtil.encode(point.getChooseTime() + "", c.getResultSetCharset()));
                         row.add(StringUtil
-                            .encode(numberFormat.format(point.getLastRecentlyChooseRate()) + "", c.getCharset()));
-                        row.add(StringUtil.encode(point.getRowcountExpected() + "", c.getCharset()));
-                        row.add(StringUtil.encode(point.getMaxRowcountExpected() + "", c.getCharset()));
-                        row.add(StringUtil.encode(point.getMinRowcountExpected() + "", c.getCharset()));
-                        row.packetId = ++packetId;
+                            .encode(numberFormat.format(point.getLastRecentlyChooseRate()) + "",
+                                c.getResultSetCharset()));
+                        row.add(StringUtil.encode(point.getRowcountExpected() + "", c.getResultSetCharset()));
+                        row.add(StringUtil.encode(point.getMaxRowcountExpected() + "", c.getResultSetCharset()));
+                        row.add(StringUtil.encode(point.getMinRowcountExpected() + "", c.getResultSetCharset()));
+                        row.packetId = ++tmpPacketId;
                         proxy = row.write(proxy);
                     }
                 }
@@ -188,11 +190,12 @@ public class ShowParametric {
 
         // write last eof
         EOFPacket lastEof = new EOFPacket();
-        lastEof.packetId = ++packetId;
+        lastEof.packetId = ++tmpPacketId;
         proxy = lastEof.write(proxy);
 
         // post write
         proxy.packetEnd();
+        return true;
     }
 
     public static TreeSet<String> getSchemas(PrivilegeContext pc) {

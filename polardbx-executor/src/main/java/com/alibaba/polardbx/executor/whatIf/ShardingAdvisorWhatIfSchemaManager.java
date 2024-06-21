@@ -39,14 +39,13 @@ import com.alibaba.polardbx.optimizer.parse.FastsqlParser;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoBuilder;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
-import com.alibaba.polardbx.optimizer.partition.PartitionTableType;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionTableType;
 import com.alibaba.polardbx.rule.TableRule;
 import org.apache.calcite.sql.SqlAlterTablePartitionKey;
 import org.apache.calcite.sql.SqlAlterTableRepartition;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlPartitionBy;
-import org.apache.commons.collections.ListUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -77,6 +76,19 @@ public class ShardingAdvisorWhatIfSchemaManager extends WhatIfSchemaManager {
         this.sqls = sqls;
         this.newDB = newDB;
         this.executionContext = executionContext;
+    }
+
+    private static String getIndexName(String tableName, List<String> columns, WhatIfIndexType type) {
+        if (type == WhatIfIndexType.local) {
+            return tableName + CandidateIndex.WHAT_IF_INDEX_INFIX + "_" + String.join("_", columns);
+        }
+        if (type == WhatIfIndexType.gsi) {
+            return tableName + CandidateIndex.WHAT_IF_GSI_INFIX + "_" + String.join("_", columns);
+        }
+        if (type == WhatIfIndexType.auto) {
+            return tableName + CandidateIndex.WHAT_IF_AUTO_INDEX_INFIX + "_" + String.join("_", columns);
+        }
+        return null;
     }
 
     @Override
@@ -122,7 +134,7 @@ public class ShardingAdvisorWhatIfSchemaManager extends WhatIfSchemaManager {
             // partition table
             SqlAlterTableRepartition sqlAlterTableRepartition = (SqlAlterTableRepartition) sqlNode;
             partitionInfo = PartitionInfoBuilder
-                .buildPartitionInfoByPartDefAst(schemaName, tableName, null, null,
+                .buildPartitionInfoByPartDefAst(schemaName, tableName, null, false, null,
                     (SqlPartitionBy) sqlAlterTableRepartition.getSqlPartition(),
                     null,
                     new ArrayList<>(tableMeta.getPrimaryKey()),
@@ -145,7 +157,7 @@ public class ShardingAdvisorWhatIfSchemaManager extends WhatIfSchemaManager {
         } else {
             // broadcast table
             partitionInfo = PartitionInfoBuilder
-                .buildPartitionInfoByPartDefAst(schemaName, tableName, null, null,
+                .buildPartitionInfoByPartDefAst(schemaName, tableName, null, false, null,
                     null, null,
                     new ArrayList<>(tableMeta.getPrimaryKey()),
                     tableMeta.getAllColumns(),
@@ -371,20 +383,7 @@ public class ShardingAdvisorWhatIfSchemaManager extends WhatIfSchemaManager {
                 type));
     }
 
-    private static String getIndexName(String tableName, List<String> columns, WhatIfIndexType type) {
-        if (type == WhatIfIndexType.local) {
-            return tableName + CandidateIndex.WHAT_IF_INDEX_INFIX + "_" + String.join("_", columns);
-        }
-        if (type == WhatIfIndexType.gsi) {
-            return tableName + CandidateIndex.WHAT_IF_GSI_INFIX + "_" + String.join("_", columns);
-        }
-        if (type == WhatIfIndexType.auto) {
-            return tableName + CandidateIndex.WHAT_IF_AUTO_INDEX_INFIX + "_" + String.join("_", columns);
-        }
-        return null;
-    }
-
     private enum WhatIfIndexType {
-        local, gsi, auto;
+        local, gsi, auto
     }
 }

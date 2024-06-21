@@ -2,7 +2,6 @@ package com.alibaba.polardbx.qatest.dml.auto.basecrud;
 
 import com.alibaba.polardbx.common.utils.Assert;
 import com.alibaba.polardbx.qatest.BaseTestCase;
-import com.alibaba.polardbx.qatest.FileStoreIgnore;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import org.junit.After;
 import org.junit.Before;
@@ -12,7 +11,6 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 
-@FileStoreIgnore
 public class ProcedureExceptionHandleTest extends BaseTestCase {
     protected Connection tddlConnection;
 
@@ -20,13 +18,13 @@ public class ProcedureExceptionHandleTest extends BaseTestCase {
     static final String TABLE_NAME1 = "tbl_exception_handle_1";
     static final String TABLE_NAME2 = "tbl_exception_handle_2";
     static final String CREATE_PROCEDURE = "create procedure %s(xx int)\n"
-        + "declare continue handler for 4518 begin create table %s(a int); insert into %s values (xx); end;\n"
+        + "declare continue handler for 4006 begin create table %s(a int); insert into %s values (xx); end;\n"
         + "select 1;\n"
         + "drop table if exists %s;\n"
         + "delete from %s; \n"
         + "set @test = 1;\n"
         + "begin\n"
-        + "declare exit handler for 4518 set @test2 = 2;\n"
+        + "declare exit handler for 4006 set @test2 = 2;\n"
         + "drop table if exists %s;\n"
         + "delete from %s;\n"
         + "set @test2 = 3;\n"

@@ -23,6 +23,7 @@ import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.exception.OptimizerException;
 import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
 import com.google.common.collect.ImmutableList;
+import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.type.RelDataType;
@@ -38,6 +39,7 @@ import java.util.Map;
  */
 public class DirectTableOperation extends BaseTableOperation {
 
+    private List<Map<Integer, ParameterContext>> batchParameters;
     private List<String> logicalTableNames; // log tables
     private List<String> tableNames; // phy tables
 
@@ -56,6 +58,18 @@ public class DirectTableOperation extends BaseTableOperation {
         super(src);
         tableNames = src.tableNames;
         logicalTableNames = src.logicalTableNames;
+    }
+
+    /**
+     * for ut test only
+     */
+    public DirectTableOperation(RelOptCluster cluster, RelTraitSet traitSet) {
+        super(cluster, traitSet);
+    }
+
+    @Override
+    public List<Map<Integer, ParameterContext>> getBatchParameters() {
+        return batchParameters;
     }
 
     @Override
@@ -77,15 +91,19 @@ public class DirectTableOperation extends BaseTableOperation {
     public Pair<String, Map<Integer, ParameterContext>> getDbIndexAndParam(Map<Integer, ParameterContext> param,
                                                                            List<List<String>> phyTableNamesOutput,
                                                                            ExecutionContext executionContext) {
+        if (phyTableNamesOutput != null) {
+            for (String tableName : tableNames) {
+                phyTableNamesOutput.add(ImmutableList.of(tableName));
+            }
+        }
+        if (executionContext.isBatchPrepare()) {
+            this.batchParameters = executionContext.getParams().getBatchParameters();
+            return new Pair<>(dbIndex, null);
+        }
         if (MapUtils.isEmpty(param) && CollectionUtils.isNotEmpty(paramIndex)) {
             throw new OptimizerException("Param list is empty.");
         }
         Pair<String, Map<Integer, ParameterContext>> result = new Pair<>(dbIndex, buildParam(param));
-        if (phyTableNamesOutput != null) {
-            for (int i = 0; i < tableNames.size(); i++) {
-                phyTableNamesOutput.add(ImmutableList.of(tableNames.get(i)));
-            }
-        }
         return result;
     }
 

@@ -16,14 +16,14 @@
 
 package com.alibaba.polardbx.optimizer.core.planner.rule;
 
-import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
-import com.alibaba.polardbx.optimizer.utils.RelUtils;
-import com.google.common.base.Predicate;
-import com.google.common.collect.ImmutableList;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalIndexScan;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalView;
+import com.alibaba.polardbx.optimizer.utils.PlannerUtils;
+import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.rule.TableRule;
+import com.google.common.base.Predicate;
+import com.google.common.collect.ImmutableList;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptTable;
@@ -69,7 +69,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-import static com.alibaba.polardbx.optimizer.utils.PlannerUtils.mergeProject;
 import static org.apache.calcite.rel.rules.JoinProjectTransposeRule.createProjectExprs;
 import static org.apache.calcite.rel.rules.JoinPushThroughJoinRule.split;
 

@@ -19,18 +19,21 @@ package com.alibaba.polardbx.server.util;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.polardbx.common.audit.AuditAction;
 import com.alibaba.polardbx.common.jdbc.ParameterContext;
-import com.alibaba.polardbx.common.properties.ConnectionProperties;
+import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.utils.ExecutorMode;
-import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.common.utils.thread.ServerThreadPool;
+import com.alibaba.polardbx.common.utils.version.Version;
 import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.config.SchemaConfig;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.druid.sql.parser.Lexer;
 import com.alibaba.polardbx.druid.sql.parser.Token;
+import com.alibaba.polardbx.config.SchemaConfig;
+import com.alibaba.polardbx.druid.sql.ast.SqlType;
+import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.gms.privilege.audit.AuditPrivilege;
 import com.alibaba.polardbx.optimizer.ccl.CclManager;
 import com.alibaba.polardbx.optimizer.ccl.common.CclMetric;
@@ -43,6 +46,7 @@ import com.alibaba.polardbx.statistics.SQLRecorderLogger;
 import org.apache.calcite.plan.RelOptCost;
 import org.apache.commons.lang.StringUtils;
 
+import javax.annotation.Nullable;
 import java.util.List;
 
 import static com.alibaba.polardbx.common.utils.logger.support.LogFormat.formatLog;
@@ -70,7 +74,7 @@ public class LogUtils {
 
     public static void recordSql(ServerConnection c, String tag, ByteString sql, long endTimeNano, long affectedRows) {
         recordSql(c, tag, sql, null, null, affectedRows, endTimeNano, null, null, null, WorkloadType.TP, null, null,
-            false);
+            false, null);
     }
 
     public static void recordPreparedSql(ServerConnection c, String stmtId,
@@ -80,16 +84,16 @@ public class LogUtils {
         }
         StringBuilder tagInfo = new StringBuilder();
         tagInfo.append("[prepare] ");
-        tagInfo.append("[stmt:").append(stmtId).append("]");
+        tagInfo.append("[stmt_id:").append(stmtId).append("]");
         recordSql(c, tagInfo.toString(), sql, null, null, affectedRows, endTimeNano, null, null, null, WorkloadType.TP,
-            null, null, true);
+            null, null, false, null);
     }
 
     public static void recordSql(ServerConnection c, String tag, ByteString sqlBytes,
                                  List<Pair<Integer, ParameterContext>> params, String transactionPolicy,
                                  long affectRow, long endTimeNano, QueryMetrics metrics, Integer baselineInfoId,
                                  Integer planInfoId, WorkloadType workloadType, RelOptCost cost, ExecutorMode mode,
-                                 boolean recordSlowDetail) {
+                                 boolean recordSlowDetail, @Nullable SqlType sqlType) {
 
         try {
             if (!recordSql.isInfoEnabled()) {
@@ -100,22 +104,30 @@ public class LogUtils {
                 return;
             }
 
+            SchemaConfig droppedSchema = c.getDroppedSchemaConfigIfExists();
             SchemaConfig schema = c.getSchemaConfig();
-            if (schema == null) {
-                return;
+//            if (schema == null) {
+//                return;
+//            }
+            if (schema != null) {
+                if (schema.getDataSource() == null) {
+                    return;
+                }
+
+                if (schema.getDataSource().getConnectionProperties() == null) {
+                    return;
+                }
+            } else {
+                if (droppedSchema == null) {
+                    return;
+                } else {
+                    /**
+                     * Found a dropped schema, so need the log sql
+                     */
+                }
             }
 
-            if (schema.getDataSource() == null) {
-                return;
-            }
-
-            if (schema.getDataSource().getConnectionProperties() == null) {
-                return;
-            }
-
-            if (!GeneralUtil.getPropertyBoolean(schema.getDataSource().getConnectionProperties(),
-                ConnectionProperties.RECORD_SQL,
-                true)) {
+            if (!DynamicConfig.getInstance().enableRecordSql()) {
                 return;
             }
 
@@ -137,7 +149,8 @@ public class LogUtils {
             // microseconds
             long duration = (endTimeNano - startTime) / 1000;
 
-            StringBuilder sqlInfo = new StringBuilder();
+            StringBuilder sqlInfo = new StringBuilder(300 + sqlBytes.length());
+            sqlInfo.append(" [TDDL] ");
             if (tag != null && !tag.isEmpty()) {
                 sqlInfo.append(tag).append(" ");
             }
@@ -157,29 +170,29 @@ public class LogUtils {
                 sql = sqlBytes.toString();
             }
 
-            Token token = getToken(sqlBytes);
-            if (isDDL(token)) {
+            if (SqlType.isDDL(sqlType)) {
                 recordDdl.info(
                     SQLRecorderLogger.ddlLogFormat.format(new Object[] {sql, duration, affectRow, c.getTraceId()}));
-                polarAuditDb(c, sql, token);
+                polarAuditDb(c, sql, sqlType);
             }
 
             sqlInfo.append("[V3] ");
 
-            String formatSql = formatLog(sql);
+            String formatSql = sqlBytes.isMultiLine() ? formatLog(sql) : sql;
             sqlInfo.append("[len=").append(formatSql.length()).append("] ");
             sqlInfo.append(formatSql);
 
-            JSONArray jsonArray = new JSONArray();
             if (params != null && params.size() > 0) {
+                JSONArray jsonArray = new JSONArray();
                 for (Pair<Integer, ParameterContext> pair : params) {
                     jsonArray.add(pair.getValue().getValue());
                 }
+                String jsonArrayString = jsonArray.toJSONString();
+                sqlInfo.append(" [len=").append(jsonArrayString.length()).append("] ");
+                sqlInfo.append(jsonArrayString);
+            } else {
+                sqlInfo.append(" [len=2] []");
             }
-
-            String jsonArrayString = jsonArray.toJSONString();
-            sqlInfo.append(" [len=").append(jsonArrayString.length()).append("] ");
-            sqlInfo.append(jsonArrayString);
 
             /*
              * Records the metrics information. e.g. ... #
@@ -194,7 +207,7 @@ public class LogUtils {
                 .getTriggerService().isWorking();
 
             CclSqlMetric cclSqlMetric = null;
-            if (cclTrigger) {
+            if (cclTrigger && schema != null) {
                 cclSqlMetric = new CclSqlMetric();
                 cclSqlMetric.setSchemaName(schema.getName());
                 cclSqlMetric.setOriginalSql(sqlBytes.toString());
@@ -226,6 +239,8 @@ public class LogUtils {
                         printMetric(sqlInfo, QueryMetricsAttribute.EXEC_SQL_TIMECOST, statMetrics.execSqlTc);
                         printMetric(sqlInfo, QueryMetricsAttribute.FETCH_RS_TIMECOST, statMetrics.fetchRsTc);
                         printMetric(sqlInfo, QueryMetricsAttribute.PHYSICAL_CONN_TIMECOST, statMetrics.phyConnTc);
+                        printMetric(sqlInfo, QueryMetricsAttribute.COLUMNAR_SNAPSHOT_TIMECOST,
+                            statMetrics.columnarSnapshotTc);
                         printMetric(sqlInfo, QueryMetricsAttribute.SPILL_COUNT, statMetrics.spillCnt);
                         printMetric(sqlInfo, QueryMetricsAttribute.MEM_BLOCKED, statMetrics.memBlockedFlag);
 
@@ -242,6 +257,13 @@ public class LogUtils {
                     if (cclTrigger) {
                         cclSqlMetric.setTemplateId(metrics.sqlTemplateId);
                     }
+                }
+                if (metrics.errorCode != -1) {
+                    sqlInfo.append(QueryMetricsAttribute.ERROR_CODE).append(metrics.errorCode);
+                }
+                if (!StringUtils.isEmpty(metrics.xplanIndex)) {
+                    sqlInfo.append(QueryMetricsAttribute.USING_XPLAN).append(metrics.xplanIndex);
+                    sqlInfo.append(QueryMetricsAttribute.XPLAN_ROWS).append(metrics.examinedRowCount);
                 }
                 sqlInfo.append(QueryMetricsAttribute.SQL_TIMESTAMP).append(sqlBeginTs);
                 sqlInfo.append(QueryMetricsAttribute.MEMORY_REJECT).append(metrics.rejectByMemoryLimit ? "1" : "0");
@@ -298,12 +320,18 @@ public class LogUtils {
             }
 
             if (metrics != null) {
+                if (metrics.useColumnar) {
+                    sqlInfo.append(QueryMetricsAttribute.USING_COLUMNAR).append(1);
+                }
                 sqlInfo.append(QueryMetricsAttribute.USING_RETURNING).append(metrics.optimizedWithReturning ? 1 : 0);
             }
 
             sqlInfo.append("] # ").append(c.getTraceId());
+            sqlInfo.append(", tddl version: ").append(Version.getVersion());
+
             String sqlLogContent = sqlInfo.toString();
             SQLRecorderLogger.sqlLogger.info(sqlLogContent);
+
             //log slow detail
             if (recordSlowDetail) {
                 SQLRecorderLogger.slowDetailLogger.info(sqlLogContent);
@@ -322,76 +350,8 @@ public class LogUtils {
         sqlInfo.append(metricKey).append(metricVal);
     }
 
-    /**
-     * SqlParserUtils.getSQLType doesn't include DROP SqlTypeParser.typeOf can't
-     * parse an incomplete statement. SqlTypeParser.typeOf parses all the
-     * statement, which is unnecessary.
-     */
-    private static Token getToken(ByteString sql) {
-        try {
-            Lexer lexer = new Lexer(sql);
-
-            do {
-                // skip whitespaces
-                lexer.nextToken();
-
-                if (lexer.token() == Token.COMMENT || lexer.token() == Token.LINE_COMMENT
-                    || lexer.token() == Token.MULTI_LINE_COMMENT) {
-
-                } else if (lexer.token() == Token.SLASH) {
-
-                    int i = lexer.pos();
-                    if (lexer.charAt(i) == '!') {
-                        for (i++; ; i++) {
-                            char ch = lexer.charAt(i);
-                            if (ch == 26) {
-                                return null; // error
-                            } else if (ch == '*' && lexer.charAt(i + 1) == '/') {
-                                lexer.reset(i + 2);
-                                break;
-                            }
-                        }
-                    } else {
-                        return null; // error
-                    }
-                } else {
-                    break;
-                }
-
-            } while (true);
-
-            switch (lexer.token()) {
-            case CREATE:
-            case DROP:
-            case TRUNCATE:
-            case PURGE:
-            case ALTER:
-                return lexer.token();
-            }
-        } catch (Throwable e) {
-
-        }
-
-        return null;
-    }
-
-    public static boolean isDDL(Token token) {
-        if (token == null) {
-            return false;
-        }
-        switch (token) {
-        case CREATE:
-        case DROP:
-        case TRUNCATE:
-        case PURGE:
-        case ALTER:
-            return true;
-        }
-        return false;
-    }
-
     private static String encodeType(boolean hasTempTable, boolean hasUnpushedJoin, boolean hasScanWholeTable) {
-        StringBuilder stringBuilder = new StringBuilder();
+        StringBuilder stringBuilder = new StringBuilder(3);
         stringBuilder.append(hasTempTable ? "1" : "0");
         stringBuilder.append(hasUnpushedJoin ? "1" : "0");
         stringBuilder.append(hasScanWholeTable ? "1" : "0");
@@ -417,8 +377,16 @@ public class LogUtils {
 
         public RuntimeStatistics runTimeStat;
 
+        public boolean useColumnar;
         // The sql template Id
         public String sqlTemplateId;
+
+        // error code
+        public int errorCode = -1;
+
+        public String xplanIndex = null;
+
+        public long examinedRowCount = 0L;
 
         //metric for ccl
         public CclMetric cclMetric;
@@ -431,6 +399,7 @@ public class LogUtils {
 
         public static final String SQL_RT = "rt=";
         public static final String AFFECT_ROWS = ",rows=";
+        public static final String ERROR_CODE = ",err=";
         public static final String STAT_TYPE = ",type=";
         public static final String SQL_TIMESTAMP = ",ts=";
         public static final String BASELINE_ID = ",bid=";
@@ -449,6 +418,7 @@ public class LogUtils {
         public static final String EXEC_SQL_TIMECOST = ",pstc=";
         public static final String FETCH_RS_TIMECOST = ",prstc=";
         public static final String PHYSICAL_CONN_TIMECOST = ",pctc=";
+        public static final String COLUMNAR_SNAPSHOT_TIMECOST = ",cstc=";
         public static final String SQL_TEMPLATE_ID = ",tid=";
         public static final String MEMORY_REJECT = ",mr=";
         public static final String WORKLOAD_TYPE = ",wt=";
@@ -463,7 +433,10 @@ public class LogUtils {
         public static final String CCL_WAIT_TIME = ",cclwt=";
         public static final String CCL_STATUS = ",cclst=";
         public static final String CCL_HC = ",cclhc=";
+        public static final String USING_COLUMNAR = ",colr=";
         public static final String USING_RETURNING = ",ur=";
+        public static final String USING_XPLAN = ",xplan=";
+        public static final String XPLAN_ROWS = ",xrows=";
     }
 
     public static void resetMaxSqlLen(int newLen) {
@@ -474,11 +447,14 @@ public class LogUtils {
         LogUtils.enableSqlProfileLog = enableSqlProfileLog;
     }
 
-    public static void polarAuditDb(ServerConnection c, String auditInfo, Token token) {
-        if (token == null) {
+    public static void polarAuditDb(ServerConnection c, String auditInfo, SqlType sqlType) {
+        if (!ConfigDataMode.isPolarDbX()) {
             return;
         }
-        AuditAction auditAction = AuditAction.value(token.name);
+        if (sqlType == null) {
+            return;
+        }
+        AuditAction auditAction = AuditAction.value(sqlType.name());
         if (auditAction == null) {
             return;
         }

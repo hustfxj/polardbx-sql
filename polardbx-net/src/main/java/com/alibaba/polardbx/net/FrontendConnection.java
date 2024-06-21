@@ -16,13 +16,12 @@
 
 package com.alibaba.polardbx.net;
 
-import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONObject;
 import com.alibaba.polardbx.Capabilities;
-import com.alibaba.polardbx.ErrorCode;
 import com.alibaba.polardbx.Versions;
 import com.alibaba.polardbx.common.audit.AuditAction;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
+import com.alibaba.polardbx.common.exception.code.ErrorCode;
+import com.alibaba.polardbx.common.properties.DynamicConfig;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.common.utils.logger.MDC;
@@ -46,13 +45,6 @@ import com.alibaba.polardbx.net.util.CharsetUtil;
 import com.alibaba.polardbx.net.util.MySQLMessage;
 import com.alibaba.polardbx.net.util.RandomUtil;
 import com.alibaba.polardbx.net.util.TimeUtil;
-import com.alibaba.polardbx.rpc.CdcRpcClient;
-import com.alibaba.polardbx.rpc.CdcRpcClient.CdcRpcStreamingProxy;
-import com.alibaba.polardbx.rpc.cdc.DumpRequest;
-import com.alibaba.polardbx.rpc.cdc.DumpStream;
-import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
-import io.grpc.stub.StreamObserver;
 
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
@@ -61,9 +53,6 @@ import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.Charset;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 
 /**
@@ -80,8 +69,10 @@ public abstract class FrontendConnection extends AbstractConnection {
     protected int port;
     protected int localPort;
     protected long idleTimeout;
-    protected String charset;
-    protected int charsetIndex;
+    protected String resultSetCharset;
+    protected int resultSetCharsetIndex;
+    protected String connectionCharset;
+    protected int connectionCharsetIndex;
     protected byte[] seed;
     protected String user;
     protected String schema;
@@ -112,25 +103,13 @@ public abstract class FrontendConnection extends AbstractConnection {
     private int bigPackLength;
 
     protected Future executingFuture;
+    protected volatile boolean isBinlogDumpConn = false;
     protected com.alibaba.polardbx.common.exception.code.ErrorCode futureCancelErrorCode;
 
     private PolarAccountInfo matchPolarUserInfo = null;
 
     protected volatile boolean rescheduled;
-
-    /**
-     * True means in cursor-fetch mode.
-     */
-    private boolean cursorFetchMode = false;
-
-    public void setCursorFetchMode(boolean cursorFetchMode) {
-        this.cursorFetchMode = cursorFetchMode;
-    }
-
-    public boolean isCursorFetchMode() {
-        return cursorFetchMode;
-    }
-
+    private final boolean isLoopAddress;
     /**
      * 一个Mysql 数据包上限,mysql 版本4.0.8 以上
      */
@@ -164,6 +143,7 @@ public abstract class FrontendConnection extends AbstractConnection {
         super(channel);
         Socket socket = channel.socket();
         this.host = socket.getInetAddress().getHostAddress();
+        this.isLoopAddress = socket.getInetAddress().isLoopbackAddress();
         this.port = socket.getPort();
         this.localPort = socket.getLocalPort();
         this.handler = createFrontendAuthenticator(this);
@@ -254,6 +234,10 @@ public abstract class FrontendConnection extends AbstractConnection {
         this.isAuthenticated = isAuthenticated;
     }
 
+    public boolean isLoopAddress() {
+        return isLoopAddress;
+    }
+
     public boolean isTrustLogin() {
         return trustLogin;
     }
@@ -290,8 +274,8 @@ public abstract class FrontendConnection extends AbstractConnection {
         return seed;
     }
 
-    public int getCharsetIndex() {
-        return charsetIndex;
+    public int getResultSetCharsetIndex() {
+        return resultSetCharsetIndex;
     }
 
     public long getClientFlags() {
@@ -304,6 +288,10 @@ public abstract class FrontendConnection extends AbstractConnection {
         // 根据clientFlags的upper 2 bytes 的值来设置clientMultiStatements的值
         clientMultiStatements = ((this.clientFlags >>> 16) & 0x01) != 0;
         compressProto = (this.clientFlags & Capabilities.CLIENT_COMPRESS) != 0;
+    }
+
+    public boolean isEofDeprecated() {
+        return (clientFlags & Capabilities.CLIENT_DEPRECATE_EOF) > 0;
     }
 
     public boolean isManaged() {
@@ -322,27 +310,82 @@ public abstract class FrontendConnection extends AbstractConnection {
         this.isAllowManagerLogin = isAllowManagerLogin;
     }
 
+    public String getResultSetCharset() {
+        return resultSetCharset;
+    }
+
+    public String getConnectionCharset() {
+        return connectionCharset;
+    }
+
+    public synchronized void setIsBinlogDumpConn(boolean b) {
+        this.isBinlogDumpConn = b;
+    }
+
     public boolean setCharsetIndex(int ci) {
         String charset = CharsetUtil.getCharset(ci);
         if (charset != null) {
-            this.charset = charset;
-            this.charsetIndex = ci;
-
+            this.resultSetCharset = charset;
+            this.resultSetCharsetIndex = ci;
+            this.connectionCharset = charset;
+            this.connectionCharsetIndex = ci;
             return true;
         } else {
             return false;
         }
     }
 
-    public String getCharset() {
-        return charset;
+    public boolean setResultSetCharsetIndex(int ci) {
+        String charset = CharsetUtil.getCharset(ci);
+        if (charset != null) {
+            this.resultSetCharset = charset;
+            this.resultSetCharsetIndex = ci;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public boolean setConnectionCharsetIndex(int ci) {
+        String charset = CharsetUtil.getCharset(ci);
+        if (charset != null) {
+            this.connectionCharset = charset;
+            this.connectionCharsetIndex = ci;
+            return true;
+        } else {
+            return false;
+        }
     }
 
     public boolean setCharset(String charset) {
         int ci = CharsetUtil.getIndex(charset);
         if (ci > 0) {
-            this.charset = charset;
-            this.charsetIndex = ci;
+            this.resultSetCharset = charset;
+            this.resultSetCharsetIndex = ci;
+            this.connectionCharset = charset;
+            this.connectionCharsetIndex = ci;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public boolean setResultSetCharset(String charset) {
+        int ci = CharsetUtil.getIndex(charset);
+        if (ci > 0) {
+            this.resultSetCharset = charset;
+            this.resultSetCharsetIndex = ci;
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public boolean setConnectionCharset(String charset) {
+        int ci = CharsetUtil.getIndex(charset);
+        if (ci > 0) {
+            this.connectionCharset = charset;
+            this.connectionCharsetIndex = ci;
             return true;
         } else {
             return false;
@@ -365,8 +408,8 @@ public abstract class FrontendConnection extends AbstractConnection {
         this.matchPolarUserInfo = matchPolarUserInfo;
     }
 
-    public void writeErrMessage(int errno, String msg) {
-        writeErrMessage(this.getNewPacketId(), errno, null, msg);
+    public void writeErrMessage(ErrorCode errorCode, String msg) {
+        writeErrMessage(this.getNewPacketId(), errorCode.getCode(), null, msg);
     }
 
     public void writeErrMessage(int errno, String sqlState, String msg) {
@@ -377,8 +420,8 @@ public abstract class FrontendConnection extends AbstractConnection {
         ErrorPacket err = new ErrorPacket();
         err.packetId = id;
         err.errno = errno;
-        err.sqlState = encodeString(sqlState, charset);
-        err.message = encodeString(msg, charset);
+        err.sqlState = encodeString(sqlState, resultSetCharset);
+        err.message = encodeString(msg, resultSetCharset);
         err.write(PacketOutputProxyFactory.getInstance().createProxy(this));
     }
 
@@ -431,7 +474,7 @@ public abstract class FrontendConnection extends AbstractConnection {
         MySQLMessage mm = new MySQLMessage(data);
         mm.position(5);
 
-        String javaCharset = CharsetUtil.getJavaCharset(charset);
+        String javaCharset = CharsetUtil.getJavaCharset(connectionCharset);
         Charset cs = null;
         if (Charset.isSupported(javaCharset)) {
             try {
@@ -441,7 +484,7 @@ public abstract class FrontendConnection extends AbstractConnection {
             }
         }
         if (cs == null) {
-            writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset '" + charset + "'");
+            writeErrMessage(ErrorCode.ER_UNKNOWN_CHARACTER_SET, "Unknown charset '" + connectionCharset + "'");
             return;
         }
         if (mm.position() == mm.length()) {
@@ -573,7 +616,7 @@ public abstract class FrontendConnection extends AbstractConnection {
             if (sslHandler != null) {
                 hs.serverCapabilities |= Capabilities.CLIENT_SSL;
             }
-            hs.serverCharsetIndex = (byte) (charsetIndex & 0xff);
+            hs.serverCharsetIndex = (byte) (resultSetCharsetIndex & 0xff);
             hs.serverStatus = 2;
             hs.restOfScrambleBuff = rand2;
             hs.write(PacketOutputProxyFactory.getInstance().createProxy(this));
@@ -651,11 +694,19 @@ public abstract class FrontendConnection extends AbstractConnection {
             // Ensure futureCancelErrorCode is reset
             this.futureCancelErrorCode = null;
             this.executingFuture = processor.getHandler().submit(this.schema, null, processor.getIndex(), () -> {
+                // 如果当前connection中上一个请求是binlog dump请求，则不要等待以及处理请求，因为binlog dump请求无意外情况不会结束
+                // 如果等待，会造成线程泄漏
                 if (previousFuture != null) {
-                    try {
-                        previousFuture.get();
-                    } catch (Throwable ex) {
-                        logger.warn("error during waiting for previous command", ex);
+                    if (isBinlogDumpConn) {
+                        logger.warn("command type:" + finalData[4]
+                            + ", previous future is binlog dump, will not handle this request!");
+                        return;
+                    } else {
+                        try {
+                            previousFuture.get();
+                        } catch (Throwable ex) {
+                            logger.warn("error during waiting for previous command", ex);
+                        }
                     }
                 }
                 if (rescheduled) {
@@ -671,7 +722,7 @@ public abstract class FrontendConnection extends AbstractConnection {
         }
     }
 
-    public abstract LoadDataHandler prepareLoadInfile(String sql);
+    public abstract boolean prepareLoadInfile(String sql);
 
     public abstract void binlogDump(byte[] data);
 
@@ -699,6 +750,9 @@ public abstract class FrontendConnection extends AbstractConnection {
         flag |= Capabilities.CLIENT_MULTI_RESULTS;
         // flag |= Capabilities.CLIENT_PS_MULTI_RESULTS;
         flag |= Capabilities.CLIENT_PLUGIN_AUTH;
+        if (DynamicConfig.getInstance().enableDeprecateEof()) {
+            flag |= Capabilities.CLIENT_DEPRECATE_EOF;
+        }
         return flag;
     }
 
@@ -844,4 +898,5 @@ public abstract class FrontendConnection extends AbstractConnection {
     public void setInstanceId(String instanceId) {
         this.instanceId = instanceId;
     }
+
 }

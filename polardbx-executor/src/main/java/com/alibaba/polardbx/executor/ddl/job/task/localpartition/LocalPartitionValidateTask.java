@@ -21,6 +21,7 @@ import com.alibaba.polardbx.common.model.Group;
 import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.executor.ddl.job.task.BaseValidateTask;
 import com.alibaba.polardbx.executor.ddl.job.task.util.TaskName;
+import com.alibaba.polardbx.executor.ddl.job.validator.TableValidator;
 import com.alibaba.polardbx.executor.partitionmanagement.LocalPartitionManager;
 import com.alibaba.polardbx.executor.spi.IRepository;
 import com.alibaba.polardbx.gms.metadb.table.IndexStatus;
@@ -28,10 +29,11 @@ import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.config.table.GlobalIndexMeta;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
-import com.alibaba.polardbx.optimizer.partition.LocalPartitionDefinitionInfo;
+import com.alibaba.polardbx.optimizer.partition.common.LocalPartitionDefinitionInfo;
 import com.alibaba.polardbx.repo.mysql.checktable.TableDescription;
 import com.alibaba.polardbx.repo.mysql.spi.MyRepository;
 import lombok.Getter;
+import org.apache.calcite.sql.SqlKind;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -51,8 +53,9 @@ public class LocalPartitionValidateTask extends BaseValidateTask {
     public void executeImpl(ExecutionContext executionContext) {
         final TableMeta primaryTableMeta =
             OptimizerContext.getContext(schemaName).getLatestSchemaManager().getTable(logicalTableName);
+        TableValidator.validateTableWithCCI(schemaName, logicalTableName, executionContext, SqlKind.LOCAL_PARTITION);
         final LocalPartitionDefinitionInfo definitionInfo = primaryTableMeta.getLocalPartitionDefinitionInfo();
-        if(definitionInfo == null){
+        if (definitionInfo == null) {
             throw new TddlNestableRuntimeException(String.format(
                 "table %s.%s is not a local partition table", schemaName, logicalTableName));
         }
@@ -75,15 +78,15 @@ public class LocalPartitionValidateTask extends BaseValidateTask {
         tablesToCheck.add(primaryTableMeta);
         List<TableMeta> gsiMetaList =
             GlobalIndexMeta.getIndex(logicalTableName, schemaName, IndexStatus.ALL, null);
-        if(!GlobalIndexMeta.isAllGsiPublished(gsiMetaList, executionContext)){
+        if (!GlobalIndexMeta.isAllGsiPublished(gsiMetaList, executionContext)) {
             throw new TddlNestableRuntimeException("Found Non-Public Global Secondary Index");
         }
 
-        for(TableMeta gsiMeta: gsiMetaList){
+        for (TableMeta gsiMeta : gsiMetaList) {
             tablesToCheck.add(gsiMeta);
         }
 
-        for(TableMeta meta: tablesToCheck){
+        for (TableMeta meta : tablesToCheck) {
             //1. 去DN拉取所有的local partition信息. 校验local partition对齐
             List<TableDescription> tableDescriptionList =
                 LocalPartitionManager.getLocalPartitionInfoList(
@@ -93,7 +96,7 @@ public class LocalPartitionValidateTask extends BaseValidateTask {
                     false
                 );
             boolean consistency = LocalPartitionManager.checkLocalPartitionConsistency(expect, tableDescriptionList);
-            if(!consistency){
+            if (!consistency) {
                 throw new TddlNestableRuntimeException(
                     String.format(
                         "Found inconsistent local partitions, "

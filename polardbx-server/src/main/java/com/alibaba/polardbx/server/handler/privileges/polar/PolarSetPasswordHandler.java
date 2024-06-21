@@ -17,6 +17,7 @@
 package com.alibaba.polardbx.server.handler.privileges.polar;
 
 import com.alibaba.polardbx.CobarServer;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLIdentifierExpr;
 import com.alibaba.polardbx.druid.sql.parser.SQLParserFeature;
 import com.alibaba.polardbx.server.ServerConnection;
 import com.alibaba.polardbx.druid.sql.ast.expr.SQLCharExpr;
@@ -37,6 +38,7 @@ import com.alibaba.polardbx.gms.privilege.PolarAccountInfo;
 import com.alibaba.polardbx.gms.privilege.PolarPrivManager;
 import com.alibaba.polardbx.gms.privilege.audit.AuditPrivilege;
 import com.alibaba.polardbx.optimizer.parse.FastsqlUtils;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.commons.lang.StringUtils;
 
 import java.sql.SQLSyntaxErrorException;
@@ -74,7 +76,17 @@ public class PolarSetPasswordHandler extends AbstractPrivilegeCommandHandler {
             SQLSetStatement statement =
                 (SQLSetStatement) FastsqlUtils.parseSql(sql, SQLParserFeature.IgnoreNameQuotes).get(0);
             SQLAssignItem assignItem = statement.getItems().get(0);
-            MySqlUserName userName = (MySqlUserName) assignItem.getTarget();
+            MySqlUserName userName = null;
+            if (assignItem.getTarget() != null) {
+                if (assignItem.getTarget() instanceof MySqlUserName) {
+                    userName = (MySqlUserName) assignItem.getTarget();
+                } else if (assignItem.getTarget() instanceof SQLIdentifierExpr) {
+                    userName = MySqlUserName.fromIdentifier((SQLIdentifierExpr) assignItem.getTarget());
+                } else {
+                    throw new SQLSyntaxErrorException("failed to parse username: " + assignItem.getTarget().toString());
+                }
+            }
+
             String password = "";
 
             if (assignItem.getValue() instanceof SQLCharExpr) {
@@ -126,6 +138,9 @@ public class PolarSetPasswordHandler extends AbstractPrivilegeCommandHandler {
         return password.startsWith(quoter) && password.endsWith(quoter);
     }
 
+    /**
+     * 新密码一律采用 AuthPlugin#POLARDBX_NATIVE_PASSWORD 的方式
+     */
     @Override
     protected void doHandle() {
         ByteString sql = getSql();
@@ -141,5 +156,10 @@ public class PolarSetPasswordHandler extends AbstractPrivilegeCommandHandler {
                 .map(PolarAccountInfo::getIdentifier)
                 .collect(Collectors.joining()),
             AuditAction.SET_PASSWORD);
+    }
+
+    @Override
+    protected SqlKind getSqlKind() {
+        return SqlKind.SET_PASSWORD;
     }
 }

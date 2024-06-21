@@ -23,6 +23,7 @@ import com.alibaba.polardbx.common.jdbc.ParameterContext;
 import com.alibaba.polardbx.common.jdbc.Parameters;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.properties.ConnectionProperties;
+import com.alibaba.polardbx.common.properties.MetricLevel;
 import com.alibaba.polardbx.common.properties.PropUtil;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.Pair;
@@ -88,9 +89,11 @@ public class LogicalLoadDataHandler extends LogicalInsertHandler {
 
     @Override
     public Cursor handle(RelNode logicalPlan, ExecutionContext executionContext) {
-
-        this.null_mode = PropUtil.LOAD_NULL_MODE.valueOf(executionContext.getParamManager()
-            .getString(ConnectionParams.LOAD_DATA_HANDLE_EMPTY_CHAR));
+        LoadDataContext loadDataContext = executionContext.getLoadDataContext();
+        String nullMode = loadDataContext == null ?
+            executionContext.getParamManager().getString(ConnectionParams.LOAD_DATA_HANDLE_EMPTY_CHAR) :
+            loadDataContext.getParamManager().getString(ConnectionParams.LOAD_DATA_HANDLE_EMPTY_CHAR);
+        this.null_mode = PropUtil.LOAD_NULL_MODE.valueOf(nullMode);
         HandlerParams handlerParams = new HandlerParams();
 
         LogicalInsert logicalInsert = (LogicalInsert) logicalPlan;
@@ -150,10 +153,10 @@ public class LogicalLoadDataHandler extends LogicalInsertHandler {
         String schemaName = executionContext.getSchemaName();
         boolean hasIndex = GlobalIndexMeta.hasIndex(
             logicalInsert.getLogicalTableName(), schemaName, executionContext);
-        boolean ignoreIsSimpleInsert = executionContext.getParamManager().getBoolean(
+        boolean ignoreIsSimpleInsert = loadDataContext.getParamManager().getBoolean(
             ConnectionParams.LOAD_DATA_IGNORE_IS_SIMPLE_INSERT);
         final boolean gsiConcurrentWrite =
-            executionContext.getParamManager().getBoolean(ConnectionParams.GSI_CONCURRENT_WRITE_OPTIMIZE);
+            loadDataContext.getParamManager().getBoolean(ConnectionParams.GSI_CONCURRENT_WRITE_OPTIMIZE);
         PhyTableOperationUtil.enableIntraGroupParallelism(schemaName, executionContext);
         final TddlRuleManager or = OptimizerContext.getContext(schemaName).getRuleManager();
         final boolean isBroadcast = or.isBroadCast(logicalInsert.getLogicalTableName());
@@ -165,7 +168,7 @@ public class LogicalLoadDataHandler extends LogicalInsertHandler {
                     logicalInsert.isSimpleInsert(ignoreIsSimpleInsert &&
                         null != logicalInsert.getPrimaryInsertWriter())))) {
             boolean useBatchMode =
-                executionContext.getParamManager().getBoolean(ConnectionParams.LOAD_DATA_USE_BATCH_MODE);
+                loadDataContext.getParamManager().getBoolean(ConnectionParams.LOAD_DATA_USE_BATCH_MODE);
             if (inSingleDb) {
                 useBatchMode = false;
             }
@@ -251,7 +254,7 @@ public class LogicalLoadDataHandler extends LogicalInsertHandler {
             } catch (Throwable t) {
                 // Can't commit
                 executionContext.getTransaction()
-                    .setCrucialError(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_CONTINUE_AFTER_WRITE_FAIL);
+                    .setCrucialError(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_CONTINUE_AFTER_WRITE_FAIL, t.getMessage());
                 throw GeneralUtil.nestedException(t);
             }
         }
@@ -259,14 +262,18 @@ public class LogicalLoadDataHandler extends LogicalInsertHandler {
 
     public Pair<List<ShardConsumer>, List<AdaptiveLoadDataCursor>> concurrentCursors(
         ExecutionContext executionContext, LogicalInsert logicalInsert) {
-        executionContext.getExtraCmds().put(ConnectionProperties.MPP_METRIC_LEVEL, 0);
+        executionContext.getExtraCmds().put(ConnectionProperties.MPP_METRIC_LEVEL, MetricLevel.DEFAULT.metricLevel);
         String schemaName = logicalInsert.getSchemaName();
         if (StringUtils.isEmpty(schemaName)) {
             schemaName = executionContext.getSchemaName();
         }
 
         boolean useTrans = executionContext.getTransaction() instanceof IDistributedTransaction;
-        int realParallism = executionContext.getParamManager().getInt(ConnectionParams.PARALLELISM);
+        LoadDataContext loadDataContext = executionContext.getLoadDataContext();
+        int realParallism = loadDataContext == null ?
+            executionContext.getParamManager().getInt(ConnectionParams.PARALLELISM) :
+            loadDataContext.getParamManager().getInt(ConnectionParams.PARALLELISM);
+
         final TddlRuleManager or = OptimizerContext.getContext(schemaName).getRuleManager();
         boolean isSingleTable = or.isTableInSingleDb(logicalInsert.getLogicalTableName());
         final Set<String> dbNames;
@@ -403,6 +410,7 @@ public class LogicalLoadDataHandler extends LogicalInsertHandler {
                     currentCusor = ExecutorContext.getContext(
                         executionContext.getSchemaName()).getTopologyExecutor().execByExecPlanNode(
                         (PhyTableOperation) object, executionContext);
+
                     int num =
                         ExecUtils.getAffectRowsByCursor(currentCusor);
                     affectNum += num;

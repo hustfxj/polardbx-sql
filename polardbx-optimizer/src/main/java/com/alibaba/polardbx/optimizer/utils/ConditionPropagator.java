@@ -16,15 +16,6 @@
 
 package com.alibaba.polardbx.optimizer.utils;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.BitSet;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
 import com.alibaba.polardbx.optimizer.core.TddlRelDataTypeSystemImpl;
 import com.alibaba.polardbx.optimizer.core.TddlTypeFactoryImpl;
 import org.apache.calcite.rex.RexBuilder;
@@ -34,6 +25,15 @@ import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 public class ConditionPropagator {
     /**
@@ -103,6 +103,7 @@ public class ConditionPropagator {
         Set<String> distinctConditionDigestSet = new HashSet<>();
         List<RexNode> allDistinctConditions = new ArrayList<>();
         for (RexNode condition : duplicateCondition) {
+
             if (distinctConditionDigestSet.add(condition.toString())) {
                 allDistinctConditions.add(condition);
             }
@@ -156,6 +157,45 @@ public class ConditionPropagator {
             }
         }
         return equalitySet;
+    }
+
+    /**
+     * Get merged and distinct equivalent set of predicates.
+     *
+     * @param andFilters e.g. =($2, $0) =($5, $1) =($1, $3) =($2, $4)
+     * @return {0, 2, 4} and {1, 3, 5}
+     */
+    public static List<BitSet> buildMergedEquitySet(List<RexNode> andFilters) {
+        List<BitSet> equalitySets = new ArrayList<>();
+        for (RexNode filter : andFilters) {
+            if (SqlKind.EQUALS.equals(filter.getKind()) && filter instanceof RexCall) {
+                RexCall filterCall = (RexCall) filter;
+                RexNode leftRexNode = filterCall.getOperands().get(0);
+                RexNode rightRexNode = filterCall.getOperands().get(1);
+                if (leftRexNode instanceof RexInputRef && rightRexNode instanceof RexInputRef) {
+
+                    final int leftIndex = ((RexInputRef) leftRexNode).getIndex();
+                    final int rightIndex = ((RexInputRef) rightRexNode).getIndex();
+                    boolean found = false;
+                    for (int i = 0; i < equalitySets.size(); i++) {
+                        BitSet equalitySet = equalitySets.get(i);
+                        if (equalitySet.get(leftIndex) || equalitySet.get(rightIndex)) {
+                            equalitySet.set(leftIndex);
+                            equalitySet.set(rightIndex);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        BitSet equalitySet = new BitSet();
+                        equalitySet.set(leftIndex);
+                        equalitySet.set(rightIndex);
+                        equalitySets.add(equalitySet);
+                    }
+                }
+            }
+        }
+        return equalitySets;
     }
 
     /**

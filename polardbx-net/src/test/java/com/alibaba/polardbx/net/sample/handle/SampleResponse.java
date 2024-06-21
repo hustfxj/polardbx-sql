@@ -61,13 +61,15 @@ public class SampleResponse {
         }
 
         // eof
-        EOFPacket eof = new EOFPacket();
-        eof.packetId = ++packetId;
-        proxy = eof.write(proxy);
+        if (!c.isEofDeprecated()) {
+            EOFPacket eof = new EOFPacket();
+            eof.packetId = ++packetId;
+            proxy = eof.write(proxy);
+        }
 
         // rows
         RowDataPacket row = new RowDataPacket(header.fieldCount);
-        row.add(encode("HelloWorld!", c.getCharset()));
+        row.add(encode("HelloWorld!", c.getResultSetCharset()));
         row.packetId = ++packetId;
         proxy = row.write(proxy);
 

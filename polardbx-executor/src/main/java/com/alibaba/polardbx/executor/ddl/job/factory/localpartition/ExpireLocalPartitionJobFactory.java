@@ -32,13 +32,19 @@ import com.alibaba.polardbx.druid.sql.ast.statement.SQLExprTableSource;
 import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.executor.ddl.job.factory.util.FactoryUtils;
 import com.alibaba.polardbx.executor.ddl.job.builder.DirectPhysicalSqlPlanBuilder;
+import com.alibaba.polardbx.executor.ddl.job.task.BaseSyncTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.TableSyncTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.ArchiveOSSTableDataMppTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.ArchiveOSSTableDataTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.ArchiveOSSTableDataWithPauseTask;
-import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.CheckOSSArchiveUtil;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.FileValidationMppTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.FileValidationTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.OSSTaskUtils;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.UpdateFileCommitTsTask;
+import com.alibaba.polardbx.executor.ddl.job.task.gsi.ValidateTableVersionTask;
 import com.alibaba.polardbx.executor.ddl.job.task.localpartition.LocalPartitionPhyDdlTask;
 import com.alibaba.polardbx.executor.ddl.job.task.localpartition.LocalPartitionValidateTask;
+import com.alibaba.polardbx.executor.ddl.job.task.shared.EmptyTask;
 import com.alibaba.polardbx.executor.ddl.job.validator.TableValidator;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJobFactory;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
@@ -49,12 +55,13 @@ import com.alibaba.polardbx.executor.spi.IRepository;
 import com.alibaba.polardbx.executor.utils.failpoint.FailPoint;
 import com.alibaba.polardbx.gms.util.LockUtil;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
+import com.alibaba.polardbx.optimizer.archive.CheckOSSArchiveUtil;
 import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager;
 import com.alibaba.polardbx.optimizer.config.table.SchemaManager;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.ReorganizeLocalPartitionPreparedData;
-import com.alibaba.polardbx.optimizer.partition.LocalPartitionDefinitionInfo;
+import com.alibaba.polardbx.optimizer.partition.common.LocalPartitionDefinitionInfo;
 import com.alibaba.polardbx.repo.mysql.checktable.LocalPartitionDescription;
 import com.alibaba.polardbx.repo.mysql.checktable.TableDescription;
 import com.alibaba.polardbx.repo.mysql.spi.MyRepository;
@@ -66,6 +73,7 @@ import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.commons.collections.CollectionUtils;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -178,9 +186,17 @@ public class ExpireLocalPartitionJobFactory extends DdlJobFactory {
         Map<String, GsiMetaManager.GsiIndexMetaBean> publishedGsi = primaryTableMeta.getGsiPublished();
         ExecutableDdlJob executableDdlJob = new ExecutableDdlJob();
         List<DdlTask> taskList = new ArrayList<>();
+        Map<String, Long> versionMap = new HashMap<>();
+        versionMap.put(primaryTableName, primaryTableMeta.getVersion());
+        ValidateTableVersionTask validateTableVersionTask = new ValidateTableVersionTask(schemaName, versionMap);
+        executableDdlJob.addTask(validateTableVersionTask);
+
         LocalPartitionValidateTask localPartitionValidateTask =
             new LocalPartitionValidateTask(schemaName, primaryTableName);
-        taskList.add(localPartitionValidateTask);
+        executableDdlJob.addTask(localPartitionValidateTask);
+        executableDdlJob.addTaskRelationship(validateTableVersionTask, localPartitionValidateTask);
+
+        DdlTask headTask = localPartitionValidateTask;
 
         // check if archive table exist
         final String archiveTableName = definitionInfo.getArchiveTableName();
@@ -199,39 +215,74 @@ public class ExpireLocalPartitionJobFactory extends DdlJobFactory {
             // build back-fill tasks for all expired partitions
             Engine targetTableEngine = archiveTableMeta.getEngine();
             List<Long> archiveOSSTableDataTaskIdList = new ArrayList<>();
-            allPartitionsToExpire.forEach(physicalPartitionName -> {
-                ArchiveOSSTableDataTask archiveOSSTableDataTask;
-                if (!executionContext.getParamManager().getBoolean(ConnectionParams.ENABLE_EXPIRE_FILE_STORAGE_PAUSE)) {
-                    archiveOSSTableDataTask = new ArchiveOSSTableDataTask(
-                        archiveTableSchema, archiveTableName,
-                        schemaName, primaryTableName,
-                        physicalPartitionName, targetTableEngine
-                    );
-                } else {
-                    archiveOSSTableDataTask = new ArchiveOSSTableDataWithPauseTask(
-                        archiveTableSchema, archiveTableName,
-                        schemaName, primaryTableName,
-                        physicalPartitionName, targetTableEngine
-                    );
-                }
-                archiveOSSTableDataTask.setTaskId(ID_GENERATOR.nextId());
-                taskList.add(archiveOSSTableDataTask);
-                archiveOSSTableDataTaskIdList.add(archiveOSSTableDataTask.getTaskId());
+            if (executionContext.getParamManager().getBoolean(ConnectionParams.ENABLE_MPP_FILE_STORE_BACKFILL)) {
+                // enable mpp backfill in physical table level
+                for (String physicalPartitionName : allPartitionsToExpire) {
+                    EmptyTask emptyTask = new EmptyTask(schemaName);
+                    executableDdlJob.addTask(emptyTask);
 
-                FileValidationTask fileValidationTask = new FileValidationTask(
-                    archiveTableSchema, archiveTableName,
-                    schemaName, primaryTableName,
-                    physicalPartitionName
-                );
-                taskList.add(fileValidationTask);
-            });
+                    int totalNum = OSSTaskUtils.getMppParallelism(executionContext, primaryTableMeta);
+                    for (int serialNum = 0; serialNum < totalNum; serialNum++) {
+                        ArchiveOSSTableDataMppTask archiveOSSTableDataMPPTask = new ArchiveOSSTableDataMppTask(
+                            archiveTableSchema, archiveTableName,
+                            schemaName, primaryTableName,
+                            physicalPartitionName, targetTableEngine,
+                            totalNum, serialNum);
+                        archiveOSSTableDataMPPTask.setTaskId(ID_GENERATOR.nextId());
+
+                        FileValidationMppTask fileValidationMppTask = new FileValidationMppTask(
+                            archiveTableSchema, archiveTableName,
+                            schemaName, primaryTableName,
+                            physicalPartitionName, totalNum, serialNum
+                        );
+                        executableDdlJob.addTask(archiveOSSTableDataMPPTask);
+                        executableDdlJob.addTask(fileValidationMppTask);
+                        executableDdlJob.addTaskRelationship(headTask, archiveOSSTableDataMPPTask);
+                        executableDdlJob.addTaskRelationship(archiveOSSTableDataMPPTask, fileValidationMppTask);
+                        executableDdlJob.addTaskRelationship(fileValidationMppTask, emptyTask);
+                        archiveOSSTableDataTaskIdList.add(archiveOSSTableDataMPPTask.getTaskId());
+                    }
+                    headTask = emptyTask;
+                }
+                executableDdlJob.setMaxParallelism(OSSTaskUtils.getArchiveParallelism(executionContext));
+            } else {
+                allPartitionsToExpire.forEach(physicalPartitionName -> {
+                    ArchiveOSSTableDataTask archiveOSSTableDataTask;
+                    if (!executionContext.getParamManager()
+                        .getBoolean(ConnectionParams.ENABLE_EXPIRE_FILE_STORAGE_PAUSE)) {
+                        archiveOSSTableDataTask = new ArchiveOSSTableDataTask(
+                            archiveTableSchema, archiveTableName,
+                            schemaName, primaryTableName,
+                            physicalPartitionName, targetTableEngine
+                        );
+                    } else {
+                        archiveOSSTableDataTask = new ArchiveOSSTableDataWithPauseTask(
+                            archiveTableSchema, archiveTableName,
+                            schemaName, primaryTableName,
+                            physicalPartitionName, targetTableEngine
+                        );
+                    }
+                    archiveOSSTableDataTask.setTaskId(ID_GENERATOR.nextId());
+                    taskList.add(archiveOSSTableDataTask);
+                    archiveOSSTableDataTaskIdList.add(archiveOSSTableDataTask.getTaskId());
+
+                    FileValidationTask fileValidationTask = new FileValidationTask(
+                        archiveTableSchema, archiveTableName,
+                        schemaName, primaryTableName,
+                        physicalPartitionName
+                    );
+                    taskList.add(fileValidationTask);
+                });
+            }
 
             // build timestamp update task
             UpdateFileCommitTsTask updateFileCommitTsTask =
-                new UpdateFileCommitTsTask(targetTableEngine.name(), archiveTableSchema, archiveTableName, archiveOSSTableDataTaskIdList);
+                new UpdateFileCommitTsTask(targetTableEngine.name(), archiveTableSchema, archiveTableName,
+                    archiveOSSTableDataTaskIdList);
             taskList.add(updateFileCommitTsTask);
+            BaseSyncTask tableSyncTask = new TableSyncTask(archiveTableSchema, archiveTableName);
+            taskList.add(tableSyncTask);
         }
-
 
         taskList.add(genPhyDdlTask(schemaName, primaryTableName, phySql));
         if (publishedGsi != null) {
@@ -239,7 +290,7 @@ public class ExpireLocalPartitionJobFactory extends DdlJobFactory {
                 taskList.add(genPhyDdlTask(schemaName, gsiName, phySql));
             });
         }
-        executableDdlJob.addSequentialTasks(taskList);
+        executableDdlJob.addSequentialTasksAfter(headTask, taskList);
         return executableDdlJob;
     }
 

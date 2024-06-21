@@ -20,14 +20,13 @@ import com.alibaba.polardbx.common.model.lifecycle.AbstractLifecycle;
 import com.alibaba.polardbx.executor.mdl.context.MdlContextStamped;
 import com.alibaba.polardbx.executor.mdl.context.PreemptiveMdlContextStamped;
 import com.alibaba.polardbx.executor.mdl.manager.MdlManagerStamped;
+import com.alibaba.polardbx.executor.mpp.metadata.NotNull;
 import com.google.common.base.Preconditions;
 
-import com.alibaba.polardbx.executor.mpp.metadata.NotNull;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
 
 /**
  * @author chenmo.cm
@@ -81,8 +80,18 @@ public abstract class MdlManager extends AbstractLifecycle {
         return contextMap.computeIfAbsent(connId.toString(), MdlContextStamped::new);
     }
 
+    public static MdlContext addContext(@NotNull Long connId, String schemaName, long initWait, long interval,
+                                        TimeUnit timeUnit) {
+        Preconditions.checkArgument(initWait > 0);
+        Preconditions.checkArgument(interval > 0);
+        Preconditions.checkArgument(timeUnit != null);
+        return contextMap.computeIfAbsent(
+            connId.toString(),
+            s -> new PreemptiveMdlContextStamped(schemaName, connId, initWait, interval, timeUnit));
+    }
+
     public static MdlContext addContext(@NotNull String schemaName, boolean preemptive) {
-        if(preemptive){
+        if (preemptive) {
             return contextMap.computeIfAbsent(
                 schemaName,
                 s -> new PreemptiveMdlContextStamped(schemaName, 15, 15, TimeUnit.SECONDS)

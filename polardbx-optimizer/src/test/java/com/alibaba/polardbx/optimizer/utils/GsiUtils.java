@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.optimizer.utils;
 
+import com.alibaba.polardbx.gms.metadb.table.IndexVisibility;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
@@ -39,6 +40,7 @@ import org.apache.calcite.sql.SqlCreateTable;
 import org.apache.calcite.sql.SqlIndexColumnName;
 import org.apache.calcite.sql.SqlIndexDefinition;
 import org.apache.calcite.sql.SqlIndexOption;
+import org.apache.calcite.sql.SqlNode;
 import org.apache.commons.lang3.StringUtils;
 
 import java.util.ArrayList;
@@ -548,7 +550,8 @@ public class GsiUtils {
             indexTableName,
             indexStatus.getValue(),
             version,
-            0);
+            0,
+            IndexVisibility.VISIBLE.getValue());
     }
 
     private static GsiMetaManager.IndexRecord indexCoveringRecord(String catalog, String schema, String tableName,
@@ -585,7 +588,8 @@ public class GsiUtils {
             indexTableName,
             indexStatus.getValue(),
             version,
-            0L);
+            0L,
+            IndexVisibility.VISIBLE.getValue());
     }
 
     private static GsiMetaManager.IndexRecord indexColumnRecord(String catalog, String schema, String tableName,
@@ -623,7 +627,8 @@ public class GsiUtils {
             indexTableName,
             indexStatus.getValue(),
             version,
-            clusteredIndex ? IndexesRecord.FLAG_CLUSTERED : 0L);
+            clusteredIndex ? IndexesRecord.FLAG_CLUSTERED : 0L,
+            IndexVisibility.VISIBLE.getValue());
     }
 
     private static GsiMetaManager.IndexRecord indexColumnRecord(String catalog, String schema, String tableName,
@@ -660,6 +665,18 @@ public class GsiUtils {
             indexTableName,
             indexStatus.getValue(),
             version,
-            0L);
+            0L,
+            IndexVisibility.VISIBLE.getValue());
+    }
+
+    public static boolean isAddCci(SqlNode sqlNode, SqlAlterTable sqlAlterTable) {
+        boolean result = false;
+        if (sqlNode instanceof SqlCreateIndex) {
+            result = ((SqlCreateIndex) sqlNode).createCci();
+        } else if (sqlNode instanceof SqlAlterTable || sqlNode instanceof SqlCreateTable) {
+            final SqlAddIndex addIndex = (SqlAddIndex) sqlAlterTable.getAlters().get(0);
+            result = addIndex.isColumnarIndex();
+        }
+        return result;
     }
 }

@@ -16,16 +16,15 @@
 
 package com.alibaba.polardbx.optimizer.core.planner.rule;
 
-import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
-import com.alibaba.polardbx.optimizer.utils.RelUtils;
-import com.alibaba.polardbx.optimizer.utils.RexUtils;
-import com.google.common.collect.Lists;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalView;
 import com.alibaba.polardbx.optimizer.core.rel.MergeSort;
+import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
+import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.optimizer.view.VirtualView;
+import com.google.common.collect.Lists;
 import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
@@ -91,6 +90,16 @@ public class PushFilterRule extends RelOptRule {
     }
 
     @Override
+    public boolean matches(RelOptRuleCall call) {
+        // todo
+//        final LogicalView logicalView = call.rel(1);
+//        if (logicalView instanceof OSSTableScan) {
+//            return false;
+//        }
+        return true;
+    }
+
+    @Override
     public void onMatch(RelOptRuleCall call) {
         Filter filter = call.rel(0);
         LogicalView logicalView = call.rel(1);
@@ -134,7 +143,11 @@ public class PushFilterRule extends RelOptRule {
     }
 
     public static boolean doNotPush(RexNode condition, LogicalView logicalView) {
-        if (RexUtils.containsUnPushableFunction(condition, false)) {
+        if (RexUtil.containsUnPushableFunction(condition, false)) {
+            return true;
+        }
+        if (logicalView instanceof OSSTableScan
+            && !((OSSTableScan) logicalView).canPushFilterProject()) {
             return true;
         }
         if (logicalView instanceof OSSTableScan

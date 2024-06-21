@@ -17,8 +17,6 @@
 package com.alibaba.polardbx.executor.ddl.job.factory;
 
 import com.alibaba.polardbx.druid.sql.SQLUtils;
-import com.alibaba.polardbx.druid.sql.ast.SQLName;
-import com.alibaba.polardbx.druid.sql.ast.expr.SQLPropertyExpr;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJobFactory;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
@@ -61,6 +59,6 @@ public abstract class AbstractProcedureJobFactory extends DdlJobFactory {
     abstract List<DdlTask> createTasksForOneJob();
 
     protected boolean procedureExists(String procedureSchema, String procedureName) {
-        return ProcedureManager.getInstance().search(procedureSchema, SQLUtils.normalize(procedureName)) != null;
+        return !ProcedureManager.getInstance().notFound(procedureSchema, SQLUtils.normalize(procedureName));
     }
 }

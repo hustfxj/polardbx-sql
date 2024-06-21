@@ -18,12 +18,15 @@ package com.alibaba.polardbx.cdc;
 
 import com.alibaba.fastjson.JSONObject;
 import com.alibaba.polardbx.cdc.entity.LogicMeta;
+import com.alibaba.polardbx.common.cdc.TableMode;
+import com.alibaba.polardbx.common.cdc.TablesExtInfo;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.executor.common.ExecutorContext;
 import com.alibaba.polardbx.executor.spi.IGroupExecutor;
+import com.alibaba.polardbx.gms.metadb.table.TableStatus;
 import com.alibaba.polardbx.gms.metadb.table.TablesAccessor;
 import com.alibaba.polardbx.gms.metadb.table.TablesExtAccessor;
 import com.alibaba.polardbx.gms.metadb.table.TablesExtRecord;
@@ -39,7 +42,7 @@ import com.alibaba.polardbx.gms.topology.GroupDetailInfoAccessor;
 import com.alibaba.polardbx.gms.util.InstIdUtil;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.alibaba.polardbx.group.jdbc.TGroupDataSource;
-import com.alibaba.polardbx.optimizer.partition.PartitionTableType;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionTableType;
 import com.alibaba.polardbx.rule.model.TargetDB;
 import com.alibaba.polardbx.server.conn.InnerConnection;
 import com.google.common.collect.Lists;
@@ -107,19 +110,30 @@ public class MetaBuilder {
     }
 
     static LogicMeta.LogicTableMeta buildLogicTableMeta(TableMode tableMode, String schemaName, String tableName,
-                                                        List<TargetDB> targetDbList)
+                                                        List<TargetDB> targetDbList,
+                                                        Pair<String, TablesExtInfo> tableMetaRecords)
         throws SQLException {
         Map<String, String> group2PhyDbMapping = buildGroup2PhyDbMapping(schemaName);
         Map<String, String> group2StorageInstMapping = buildGroup2StorageInstMapping(schemaName);
-        return buildLogicTableMetaInternal(schemaName, tableMode, tableName, targetDbList,
-            buildOneTablesInfo(tableMode, schemaName, tableName),
-            group2PhyDbMapping,
-            group2StorageInstMapping);
+        if (tableMetaRecords != null) {
+            TablesRecord record = new TablesRecord();
+            record.tableCollation = tableMetaRecords.getKey();
+            return buildLogicTableMetaInternal(schemaName, tableMode, tableName, targetDbList,
+                new Pair<>(record, tableMetaRecords.getValue()),
+                group2PhyDbMapping,
+                group2StorageInstMapping);
+        } else {
+            return buildLogicTableMetaInternal(schemaName, tableMode, tableName, targetDbList,
+                buildOneTablesInfo(tableMode, schemaName, tableName),
+                group2PhyDbMapping,
+                group2StorageInstMapping);
+        }
     }
 
     static String getPhyCreateSql(String logicSchema, LogicMeta.LogicTableMeta tableMeta) {
-        String groupName = tableMeta.getPhySchemas().get(0).getGroup();
-        String phyTableName = tableMeta.getPhySchemas().get(0).getPhyTables().get(0);
+        Pair<String, String> pair = getGroupNameAndPhyTableName(tableMeta);
+        String groupName = pair.getKey();
+        String phyTableName = pair.getValue();
         try (Connection conn = getPhyConnection(logicSchema, groupName);
             PreparedStatement ps = conn.prepareStatement("SHOW CREATE TABLE `" + escape(phyTableName) + "`");
             ResultSet rs = ps.executeQuery()) {
@@ -133,6 +147,20 @@ public class MetaBuilder {
             throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, "fetch the DDL of " + phyTableName
                 + " on " + groupName + " failed. Caused by: " + e.getMessage(), e);
         }
+    }
+
+    private static Pair<String, String> getGroupNameAndPhyTableName(LogicMeta.LogicTableMeta tableMeta) {
+        if (tableMeta.getPhySchemas() == null || tableMeta.getPhySchemas().isEmpty()) {
+            throw new TddlNestableRuntimeException(
+                "can`t find physical schema with logic table " + JSONObject.toJSONString(tableMeta));
+        }
+        for (LogicMeta.PhySchema phySchema : tableMeta.getPhySchemas()) {
+            if (phySchema.getPhyTables() != null && !phySchema.getPhyTables().isEmpty()) {
+                return Pair.of(phySchema.getGroup(), phySchema.getPhyTables().get(0));
+            }
+        }
+        throw new TddlNestableRuntimeException(
+            "can`t find physical table with logic table " + JSONObject.toJSONString(tableMeta));
     }
 
     static void checkLogicTableMeta(String logicSchema, LogicMeta.LogicTableMeta tableMeta) {
@@ -315,6 +343,7 @@ public class MetaBuilder {
             TablesAccessor tablesAccessor = new TablesAccessor();
             tablesAccessor.setConnection(metaDbConn);
             Map<String, TablesRecord> tablesMap = tablesAccessor.query(schema).stream()
+                .filter(t -> t.status != TableStatus.ABSENT.getValue())
                 .peek(t -> t.tableName = t.tableName.toLowerCase())//转小写
                 .collect(Collectors.toMap(i -> i.tableName, j -> j));
 
@@ -328,6 +357,9 @@ public class MetaBuilder {
 
                 final Map<String, Pair<TablesRecord, TablesExtInfo>> result = new HashMap<>();
                 tablesMap.keySet().forEach(k -> {
+                    if (!partitionRecords.containsKey(k)) {
+                        throw new RuntimeException(String.format("partition info is not found for %s:%s", schema, k));
+                    }
                     result.put(k, new Pair<>(tablesMap.get(k),
                         new TablesExtInfo(TableMode.PARTITION, partitionRecords.get(k).get(0).tblType)));
                 });

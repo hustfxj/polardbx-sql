@@ -18,19 +18,19 @@ package com.alibaba.polardbx.executor.ddl.job.factory;
 
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLCreateFunctionStatement;
-import com.alibaba.polardbx.druid.sql.ast.statement.SQLDropFunctionStatement;
 import com.alibaba.polardbx.druid.sql.ast.statement.SqlDataAccess;
-import com.alibaba.polardbx.druid.sql.parser.SQLParserFeature;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.pl.udf.DropFunctionOnAllDnTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.pl.udf.DropFunctionDropMetaTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.pl.udf.DropFunctionOnAllDnTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.pl.udf.DropFunctionSyncTask;
+import com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcDropFunctionMarkTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
 import com.alibaba.polardbx.executor.pl.StoredFunctionManager;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.LogicalDropFunction;
-import com.alibaba.polardbx.optimizer.parse.FastsqlUtils;
 import com.google.common.collect.Lists;
 import org.apache.calcite.sql.SqlDropFunction;
 
@@ -41,16 +41,20 @@ public class DropFunctionJobFactory extends AbstractFunctionJobFactory {
 
     private final LogicalDropFunction dropFunction;
 
-    public DropFunctionJobFactory(LogicalDropFunction dropFunction, String schema) {
+    private final boolean forceDrop;
+
+    public DropFunctionJobFactory(LogicalDropFunction dropFunction, String schema, boolean forceDrop) {
         super(schema);
         this.dropFunction = dropFunction;
+        this.forceDrop = forceDrop;
     }
 
     @Override
     protected void validate() {
         SqlDropFunction sqlDropFunction = dropFunction.getSqlDropFunction();
         String udfName = sqlDropFunction.getFunctionName();
-        if (!sqlDropFunction.isIfExists() && StoredFunctionManager.getInstance().search(udfName) == null) {
+        if (!forceDrop && !sqlDropFunction.isIfExists() && !StoredFunctionManager.getInstance()
+            .containsFunction(udfName)) {
             throw new TddlRuntimeException(ErrorCode.ERR_UDF_NOT_FOUND,
                 String.format("function: %s not exist", udfName));
         }
@@ -59,23 +63,30 @@ public class DropFunctionJobFactory extends AbstractFunctionJobFactory {
     @Override
     List<DdlTask> createTasksForOneJob() {
         String functionName = dropFunction.getSqlDropFunction().getFunctionName();
+        if (!forceDrop && !StoredFunctionManager.getInstance().containsFunction(functionName)) {
+            return new ArrayList<>();
+        }
         SQLCreateFunctionStatement statement = StoredFunctionManager.getInstance().search(functionName);
+
+        // double check, function not exists
         if (statement == null) {
             return new ArrayList<>();
         }
 
         DdlTask dropMetaTask = new DropFunctionDropMetaTask(schema, null, functionName);
         DdlTask syncTask = new DropFunctionSyncTask(schema, functionName);
+        CdcDropFunctionMarkTask cdcDropFunctionMarkTask = new CdcDropFunctionMarkTask(schema, functionName);
         if (statement.getSqlDataAccess() == SqlDataAccess.NO_SQL) {
             DdlTask dropFuncOnAllDbTask = new DropFunctionOnAllDnTask(schema, functionName);
-            return Lists.newArrayList(dropFuncOnAllDbTask, dropMetaTask, syncTask);
+            return Lists.newArrayList(dropFuncOnAllDbTask, dropMetaTask, cdcDropFunctionMarkTask, syncTask);
         } else {
-            return Lists.newArrayList(dropMetaTask, syncTask);
+            return Lists.newArrayList(dropMetaTask, cdcDropFunctionMarkTask, syncTask);
         }
     }
 
     public static ExecutableDdlJob dropFunction(LogicalDropFunction dropFunction, ExecutionContext ec) {
 
-        return new DropFunctionJobFactory(dropFunction, ec.getSchemaName()).create();
+        return new DropFunctionJobFactory(dropFunction, ec.getSchemaName(), ec.getParamManager().getBoolean(
+            ConnectionParams.FORCE_DROP_SQL_UDF)).create();
     }
 }

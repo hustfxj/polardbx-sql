@@ -17,8 +17,7 @@
 package com.alibaba.polardbx.executor.handler.ddl;
 
 import com.alibaba.polardbx.common.Engine;
-import com.alibaba.polardbx.common.cdc.CdcManagerHelper;
-import com.alibaba.polardbx.common.cdc.DdlVisibility;
+import com.alibaba.polardbx.common.ddl.foreignkey.ForeignKeyData;
 import com.alibaba.polardbx.common.ddl.newengine.DdlConstants;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
@@ -34,20 +33,22 @@ import com.alibaba.polardbx.executor.ddl.job.factory.DropPartitionTableJobFactor
 import com.alibaba.polardbx.executor.ddl.job.factory.DropPartitionTableWithGsiJobFactory;
 import com.alibaba.polardbx.executor.ddl.job.factory.DropTableJobFactory;
 import com.alibaba.polardbx.executor.ddl.job.factory.DropTableWithGsiJobFactory;
+import com.alibaba.polardbx.executor.ddl.job.factory.PureCdcDdlMark4DropTableJobFactory;
 import com.alibaba.polardbx.executor.ddl.job.factory.RecycleOssTableJobFactory;
 import com.alibaba.polardbx.executor.ddl.job.factory.RenameTableJobFactory;
-import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.CheckOSSArchiveUtil;
 import com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcTruncateWithRecycleMarkTask;
 import com.alibaba.polardbx.executor.ddl.job.task.gsi.ValidateTableVersionTask;
 import com.alibaba.polardbx.executor.ddl.job.validator.TableValidator;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJob;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
-import com.alibaba.polardbx.executor.ddl.newengine.job.TransientDdlJob;
 import com.alibaba.polardbx.executor.ddl.newengine.utils.DdlHelper;
 import com.alibaba.polardbx.executor.spi.IRepository;
+import com.alibaba.polardbx.executor.utils.DdlUtils;
+import com.alibaba.polardbx.gms.metadb.limit.LimitValidator;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
-import com.alibaba.polardbx.optimizer.context.DdlContext;
+import com.alibaba.polardbx.optimizer.archive.CheckOSSArchiveUtil;
+import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.BaseDdlOperation;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.LogicalDropTable;
@@ -58,15 +59,12 @@ import com.alibaba.polardbx.optimizer.core.rel.ddl.data.gsi.DropTableWithGsiPrep
 import org.apache.calcite.rel.ddl.RenameTable;
 import org.apache.calcite.sql.SqlDropTable;
 import org.apache.calcite.sql.SqlIdentifier;
-import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlRenameTable;
 import org.apache.calcite.sql.parser.SqlParserPos;
 
 import java.util.HashMap;
 import java.util.Map;
-
-import static com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcMarkUtil.buildExtendParameter;
 
 public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
 
@@ -77,16 +75,37 @@ public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
     @Override
     protected DdlJob buildDdlJob(BaseDdlOperation logicalDdlPlan, ExecutionContext executionContext) {
         LogicalDropTable logicalDropTable = (LogicalDropTable) logicalDdlPlan;
-        if (executionContext.getParamManager().getBoolean(ConnectionParams.PURGE_FILE_STORAGE_TABLE) && logicalDropTable.isPurge()) {
-            LogicalRenameTableHandler.makeTableVisible(logicalDropTable.getSchemaName(), logicalDropTable.getTableName(), executionContext);
+
+        boolean importTable = executionContext.getParamManager().getBoolean(ConnectionParams.IMPORT_TABLE);
+        if (importTable) {
+            logicalDropTable.setImportTable(true);
+        }
+
+        if (executionContext.getParamManager().getBoolean(ConnectionParams.PURGE_FILE_STORAGE_TABLE)
+            && logicalDropTable.isPurge()) {
+            LogicalRenameTableHandler.makeTableVisible(logicalDropTable.getSchemaName(),
+                logicalDropTable.getTableName(), executionContext);
         }
         logicalDropTable.prepareData();
 
         if (logicalDropTable.ifExists()) {
             if (!TableValidator.checkIfTableExists(logicalDdlPlan.getSchemaName(), logicalDropTable.getTableName())) {
-                return new TransientDdlJob();
+                LimitValidator.validateTableNameLength(logicalDdlPlan.getSchemaName());
+                LimitValidator.validateTableNameLength(logicalDropTable.getTableName());
+
+                // Prompt "show warning" only.
+                DdlHelper.storeFailedMessage(logicalDdlPlan.getSchemaName(), DdlConstants.ERROR_UNKNOWN_TABLE,
+                    "Unknown table '" + logicalDdlPlan.getSchemaName()
+                        + "." + logicalDropTable.getTableName() + "'", executionContext);
+                executionContext.getDdlContext().setUsingWarning(true);
+
+                return new PureCdcDdlMark4DropTableJobFactory(logicalDdlPlan.getSchemaName(),
+                    logicalDropTable.getTableName()).create();
             }
         }
+
+        final Long versionId = DdlUtils.generateVersionId(executionContext);
+        logicalDropTable.setDdlVersionId(versionId);
 
         boolean isNewPartDb = DbInfoManager.getInstance().isNewPartitionDb(logicalDropTable.getSchemaName());
 
@@ -106,9 +125,11 @@ public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
             if (logicalDropTable.isWithGsi()) {
                 return buildDropPartitionTableWithGsiJob(logicalDropTable, executionContext);
             } else {
-                Engine engine = OptimizerContext.getContext(logicalDropTable.getSchemaName()).getLatestSchemaManager().getTable(logicalDropTable.getTableName()).getEngine();
+                Engine engine = OptimizerContext.getContext(logicalDropTable.getSchemaName()).getLatestSchemaManager()
+                    .getTable(logicalDropTable.getTableName()).getEngine();
                 if (Engine.isFileStore(engine)) {
-                    if (executionContext.getParamManager().getBoolean(ConnectionParams.PURGE_FILE_STORAGE_TABLE) && logicalDropTable.isPurge()) {
+                    if (executionContext.getParamManager().getBoolean(ConnectionParams.PURGE_FILE_STORAGE_TABLE)
+                        && logicalDropTable.isPurge()) {
                         return buildDropPartitionTableJob(logicalDropTable, executionContext);
                     } else {
                         // don't drop table for oss table in recycle bin
@@ -137,26 +158,45 @@ public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
         final String schemaName = logicalDdlPlan.getSchemaName();
         final String logicalTableName = logicalDdlPlan.getTableName();
 
+        boolean isImportTable = executionContext.getParamManager().getBoolean(ConnectionParams.IMPORT_TABLE);
+
         TableValidator.validateTableName(logicalTableName);
 
         final boolean tableExists = TableValidator.checkIfTableExists(schemaName, logicalTableName);
         if (!tableExists && sqlDropTable.isIfExists()) {
-            DdlContext ddlContext = executionContext.getDdlContext();
-            CdcManagerHelper.getInstance().notifyDdlNew(schemaName, logicalTableName, SqlKind.DROP_TABLE.name(),
-                ddlContext.getDdlStmt(), ddlContext.getDdlType(), null, null,
-                DdlVisibility.Public, buildExtendParameter(executionContext));
-
-            // Prompt "show warning" only.
-            DdlHelper.storeFailedMessage(schemaName, DdlConstants.ERROR_UNKNOWN_TABLE,
-                "Unknown table '" + schemaName + "." + logicalTableName + "'", executionContext);
-            executionContext.getDdlContext().setUsingWarning(true);
+            // do nothing
+        } else if (isImportTable) {
+            //do nothing
         } else if (!tableExists) {
             throw new TddlRuntimeException(ErrorCode.ERR_UNKNOWN_TABLE, schemaName, logicalTableName);
         }
+
+        // can't drop table where referencing by other tables
+        final boolean checkForeignKey =
+            executionContext.foreignKeyChecks();
+        if (checkForeignKey && tableExists) {
+            try {
+                final TableMeta tableMeta =
+                    OptimizerContext.getContext(schemaName).getLatestSchemaManager().getTable(logicalTableName);
+                for (Map.Entry<String, ForeignKeyData> e : tableMeta.getReferencedForeignKeys().entrySet()) {
+                    String referencedSchemaName = e.getValue().schema;
+                    String referencedTableName = e.getValue().tableName;
+                    if (referencedTableName.equalsIgnoreCase(logicalTableName)) {
+                        continue;
+                    }
+                    String constraint = tableMeta.getReferencedForeignKeys().get(e.getKey()).constraint;
+                    throw new TddlRuntimeException(ErrorCode.ERR_DROP_TABLE_FK_CONSTRAINT, logicalTableName, constraint,
+                        referencedSchemaName, referencedTableName);
+                }
+            } catch (Exception ex) {
+                throw ex;
+            }
+        }
+
         return false;
     }
 
-    private DdlJob buildDropTableJob(LogicalDropTable logicalDropTable, ExecutionContext executionContext) {
+    protected DdlJob buildDropTableJob(LogicalDropTable logicalDropTable, ExecutionContext executionContext) {
         DropTablePreparedData dropTablePreparedData = logicalDropTable.getDropTablePreparedData();
 
         DdlPhyPlanBuilder dropTableBuilder =
@@ -206,11 +246,14 @@ public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
             RenameTableBuilder.create(logicalRenameTable.relDdl, renameTablePreparedData, executionContext).build();
 
         PhysicalPlanData physicalPlanData = renameTableBuilder.genPhysicalPlanData();
+        physicalPlanData.setRenamePhyTable(renameTablePreparedData.isNeedRenamePhyTable());
+        Long versionId = DdlUtils.generateVersionId(executionContext);
 
-        return new RenameTableJobFactory(physicalPlanData, executionContext).create();
+        return new RenameTableJobFactory(physicalPlanData, executionContext, versionId).create();
     }
 
-    private DdlJob buildRecycleFileStorageTableJob(LogicalDropTable logicalDropTable, ExecutionContext executionContext) {
+    private DdlJob buildRecycleFileStorageTableJob(LogicalDropTable logicalDropTable,
+                                                   ExecutionContext executionContext) {
         RecycleBin recycleBin = RecycleBinManager.instance.getByAppName(executionContext.getAppName());
         String fileStorageBinName = recycleBin.genFileStorageBinName();
 
@@ -230,13 +273,15 @@ public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
         return renameTableJob;
     }
 
-    public static DdlJob buildOssRecycleTableJob(LogicalRenameTable logicalRenameTable, ExecutionContext executionContext) {
+    public static DdlJob buildOssRecycleTableJob(LogicalRenameTable logicalRenameTable,
+                                                 ExecutionContext executionContext) {
         RenameTablePreparedData renameTablePreparedData = logicalRenameTable.getRenameTablePreparedData();
         DdlPhyPlanBuilder renameTableBuilder =
             RenameTableBuilder.create(logicalRenameTable.relDdl,
                 renameTablePreparedData,
                 executionContext).build();
         PhysicalPlanData physicalPlanData = renameTableBuilder.genPhysicalPlanData();
+        physicalPlanData.setRenamePhyTable(renameTablePreparedData.isNeedRenamePhyTable());
 
         Map<String, Long> tableVersions = new HashMap<>();
 
@@ -252,7 +297,7 @@ public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
         return result;
     }
 
-    private DdlJob buildDropPartitionTableJob(LogicalDropTable logicalDropTable, ExecutionContext executionContext) {
+    protected DdlJob buildDropPartitionTableJob(LogicalDropTable logicalDropTable, ExecutionContext executionContext) {
         DropTablePreparedData dropTablePreparedData = logicalDropTable.getDropTablePreparedData();
 
         DropTableBuilder dropTableBuilder =
@@ -265,7 +310,8 @@ public class LogicalDropTableHandler extends LogicalCommonDdlHandler {
         ValidateTableVersionTask validateTableVersionTask =
             new ValidateTableVersionTask(dropTablePreparedData.getSchemaName(), tableVersions);
 
-        ExecutableDdlJob result = new DropPartitionTableJobFactory(physicalPlanData, executionContext).create();
+        ExecutableDdlJob result =
+            new DropPartitionTableJobFactory(physicalPlanData, executionContext, dropTablePreparedData).create();
         result.addTask(validateTableVersionTask);
         result.addTaskRelationship(validateTableVersionTask, result.getHead());
 

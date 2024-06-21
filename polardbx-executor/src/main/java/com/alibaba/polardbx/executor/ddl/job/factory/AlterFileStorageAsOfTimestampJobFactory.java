@@ -26,11 +26,13 @@ import com.alibaba.polardbx.executor.ddl.job.task.basic.TableSyncTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.DeleteOssFilesTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.DropOssFilesTask;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.FileStorageBackupTask;
+import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.OSSTaskUtils;
 import com.alibaba.polardbx.gms.engine.FileStorageMetaStore;
 import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.UpdateFileRemoveTsTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJobFactory;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
+import com.alibaba.polardbx.gms.engine.FileStorageMetaStore;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
 import com.alibaba.polardbx.gms.metadb.table.FilesRecord;
 import com.alibaba.polardbx.gms.metadb.table.TableInfoManager;
@@ -45,13 +47,15 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TimeZone;
+import java.util.stream.Collectors;
+
 import java.util.stream.Collectors;
 
 import static com.alibaba.polardbx.optimizer.utils.ITimestampOracle.BITS_LOGICAL_TIME;
 
 /**
  * @author chenzilin
- * @date 2022/2/14 17:47
  */
 public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
 
@@ -61,8 +65,8 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
     private AlterFileStoragePreparedData alterFileStoragePreparedData;
 
     public AlterFileStorageAsOfTimestampJobFactory(
-            AlterFileStoragePreparedData alterFileStoragePreparedData,
-            ExecutionContext executionContext) {
+        AlterFileStoragePreparedData alterFileStoragePreparedData,
+        ExecutionContext executionContext) {
         this.executionContext = executionContext;
         this.alterFileStoragePreparedData = alterFileStoragePreparedData;
     }
@@ -75,11 +79,15 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
     @Override
     protected ExecutableDdlJob doCreate() {
         Engine engine = Engine.of(alterFileStoragePreparedData.getFileStorageName());
-        Timestamp timestamp = Timestamp.valueOf(alterFileStoragePreparedData.getTimestamp());
-        long ts = timestamp.getTime() << BITS_LOGICAL_TIME;
-        if (ts < 0) {
-            throw new IllegalArgumentException("timestamp should greater than 1970-01-01 00:00:01");
+        TimeZone fromTimeZone;
+        if (executionContext.getTimeZone() != null) {
+            fromTimeZone = executionContext.getTimeZone().getTimeZone();
+        } else {
+            fromTimeZone = TimeZone.getDefault();
         }
+
+        long ts =
+            OSSTaskUtils.getTsFromTimestampWithTimeZone(alterFileStoragePreparedData.getTimestamp(), fromTimeZone);
 
         List<FilesRecord> toDeleteFileRecordList = new ArrayList<>();
         List<FilesRecord> toUpdateFileRecordList = new ArrayList<>();
@@ -91,6 +99,7 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
             FileStorageMetaStore fileStorageMetaStore = new FileStorageMetaStore(engine);
             fileStorageMetaStore.setConnection(conn);
 
+            // TODO(siyun): prevent columnar file being purged
             List<FileStorageMetaStore.OssFileMeta> fileMetaList = fileStorageMetaStore.queryFromFileStorage();
 
             for (FileStorageMetaStore.OssFileMeta ossFileMeta : fileMetaList) {
@@ -115,7 +124,8 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
             logger.info("alter filestorage as of timestamp " + alterFileStoragePreparedData.getTimestamp());
             logger.info(String.format("to delete %s files with commit_ts > %s : ", toDeleteFileMeta.size(), ts));
             logger.info(toDeleteFileMeta.stream().map(x -> x.getDataPath()).collect(Collectors.joining("\n")));
-            logger.info(String.format("to update %s files with commit_ts <= %s <= remove_ts : ", toUpdateFileMeta.size(), ts));
+            logger.info(
+                String.format("to update %s files with commit_ts <= %s <= remove_ts : ", toUpdateFileMeta.size(), ts));
             logger.info(toUpdateFileMeta.stream().map(x -> x.getDataPath()).collect(Collectors.joining("\n")));
 
             TableInfoManager tableInfoManager = new TableInfoManager();
@@ -163,11 +173,13 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
 
             for (int i = 0; i < toUpdateFileRecordList.size(); i++) {
                 FilesRecord filesRecord = toUpdateFileRecordList.get(i);
-                if (schemaName.equals(filesRecord.getLogicalSchemaName()) && logicalTableName.equals(filesRecord.getLogicalTableName())) {
+                if (schemaName.equals(filesRecord.getLogicalSchemaName()) && logicalTableName.equals(
+                    filesRecord.getLogicalTableName())) {
                     currentFilesRecordList.add(filesRecord);
                 } else {
                     UpdateFileRemoveTsTask updateFileRemoveTsTask = new UpdateFileRemoveTsTask(engine.name(),
-                            schemaName, logicalTableName, currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toList()), null);
+                        schemaName, logicalTableName,
+                        currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toList()), null);
                     taskList.add(updateFileRemoveTsTask);
                     schemaName = filesRecord.getLogicalSchemaName();
                     logicalTableName = filesRecord.getLogicalTableName();
@@ -178,7 +190,8 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
 
                 if (!currentFilesRecordList.isEmpty()) {
                     UpdateFileRemoveTsTask updateFileRemoveTsTask = new UpdateFileRemoveTsTask(engine.name(),
-                            schemaName, logicalTableName, currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toList()), null);
+                        schemaName, logicalTableName,
+                        currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toList()), null);
                     taskList.add(updateFileRemoveTsTask);
                 }
             }
@@ -192,10 +205,13 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
 
             for (int i = 0; i < toDeleteFileRecordList.size(); i++) {
                 FilesRecord filesRecord = toDeleteFileRecordList.get(i);
-                if (schemaName.equals(filesRecord.getLogicalSchemaName()) && logicalTableName.equals(filesRecord.getLogicalTableName())) {
+                if (schemaName.equals(filesRecord.getLogicalSchemaName()) && logicalTableName.equals(
+                    filesRecord.getLogicalTableName())) {
                     currentFilesRecordList.add(filesRecord);
                 } else {
-                    DropOssFilesTask dropOssFilesTask = new DropOssFilesTask(engine.name(), schemaName, logicalTableName, currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
+                    DropOssFilesTask dropOssFilesTask =
+                        new DropOssFilesTask(engine.name(), schemaName, logicalTableName,
+                            currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
                     taskList.add(dropOssFilesTask);
                     schemaName = filesRecord.getLogicalSchemaName();
                     logicalTableName = filesRecord.getLogicalTableName();
@@ -206,13 +222,15 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
             }
 
             if (!currentFilesRecordList.isEmpty()) {
-                DropOssFilesTask dropOssFilesTask = new DropOssFilesTask(engine.name(), schemaName, logicalTableName, currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
+                DropOssFilesTask dropOssFilesTask = new DropOssFilesTask(engine.name(), schemaName, logicalTableName,
+                    currentFilesRecordList.stream().map(x -> x.getFileName()).collect(Collectors.toSet()));
                 taskList.add(dropOssFilesTask);
             }
         }
 
         if (!toDeleteFileMeta.isEmpty()) {
-            taskList.add(new DeleteOssFilesTask(engine.name(), DefaultDbSchema.NAME, toDeleteFileMeta.stream().map(x -> x.getDataPath()).collect(Collectors.toSet())));
+            taskList.add(new DeleteOssFilesTask(engine.name(), DefaultDbSchema.NAME,
+                toDeleteFileMeta.stream().map(x -> x.getDataPath()).collect(Collectors.toSet())));
         }
 
         for (Pair<String, String> pair : schemaTablePair) {
@@ -229,7 +247,6 @@ public class AlterFileStorageAsOfTimestampJobFactory extends DdlJobFactory {
         executableDdlJob.addSequentialTasks(taskList);
         return executableDdlJob;
     }
-
 
     @Override
     protected void excludeResources(Set<String> resources) {

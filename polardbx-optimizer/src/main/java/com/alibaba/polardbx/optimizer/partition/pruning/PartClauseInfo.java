@@ -16,7 +16,8 @@
 
 package com.alibaba.polardbx.optimizer.partition.pruning;
 
-import com.alibaba.polardbx.optimizer.partition.PartitionStrategy;
+import com.alibaba.polardbx.optimizer.partition.common.PartKeyLevel;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionStrategy;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlKind;
@@ -96,6 +97,11 @@ public class PartClauseInfo {
     protected boolean isDynamicConstOnly = false;
 
     protected boolean isSubQueryInExpr = false;
+
+    /**
+     * Label if const expr is a virtual expr that col= anyValues
+     */
+    protected boolean isAnyValueEqCond = false;
 
     protected PartClauseInfo() {
     }
@@ -184,12 +190,16 @@ public class PartClauseInfo {
      * Get the digest that desc the predicate expr of PartClauseInfo
      */
     protected String getDigest() {
+        return getDigest(false);
+    }
+
+    protected String getDigest(boolean isIgnoreOp) {
         StringBuilder sb = new StringBuilder("");
-        sb.append(opKind.sql);
+        sb.append(!isIgnoreOp ? opKind.sql : "op");
         sb.append("(");
         sb.append(input.toString());
         sb.append(",");
-        sb.append(isNull ? "null" : constExpr.toString());
+        sb.append(isAnyValueEqCond ? "any" : isNull ? "null" : constExpr.toString());
         sb.append(")");
         return sb.toString();
     }
@@ -237,5 +247,13 @@ public class PartClauseInfo {
 
     public void setSubQueryInExpr(boolean subQueryInExpr) {
         isSubQueryInExpr = subQueryInExpr;
+    }
+
+    public boolean isAnyValueEqCond() {
+        return isAnyValueEqCond;
+    }
+
+    public void setAnyValueEqCond(boolean anyValueEqCond) {
+        isAnyValueEqCond = anyValueEqCond;
     }
 }

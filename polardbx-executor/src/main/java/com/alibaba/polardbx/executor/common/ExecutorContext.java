@@ -16,7 +16,9 @@
 
 package com.alibaba.polardbx.executor.common;
 
+import com.alibaba.polardbx.common.IInnerConnectionManager;
 import com.alibaba.polardbx.config.ConfigDataMode;
+import com.alibaba.polardbx.executor.gms.ColumnarManager;
 import com.alibaba.polardbx.executor.gsi.GsiManager;
 import com.alibaba.polardbx.executor.repo.RepositoryHolder;
 import com.alibaba.polardbx.executor.spi.ITopologyExecutor;
@@ -29,6 +31,7 @@ import com.alibaba.polardbx.optimizer.utils.OptimizerHelper;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
  * @author mengshi.sunmengshi 2013-12-4 下午6:16:32
@@ -44,6 +47,8 @@ public class ExecutorContext {
     private StorageInfoManager storageInfoManager = null;
     private GsiManager gsiManager = null;
     private NodeStatusManager nodeStatusManager;
+    private Consumer<ColumnarManager> reloadColumnarManager;
+    private IInnerConnectionManager innerConnectionManager;
 
     private static Map<String, ExecutorContext> executorContextMap = new ConcurrentHashMap<String, ExecutorContext>();
 
@@ -140,15 +145,25 @@ public class ExecutorContext {
         this.gsiManager = gsiManager;
     }
 
-    public NodeStatusManager getNodeStatusManager() {
-        return nodeStatusManager;
-    }
-
-    public void setNodeStatusManager(NodeStatusManager nodeStatusManager) {
-        this.nodeStatusManager = nodeStatusManager;
-    }
-
     public final static Map<String, ExecutorContext> getExecutorContextMap() {
         return executorContextMap;
+    }
+
+    public void reloadColumnarManager() {
+        if (null != reloadColumnarManager) {
+            reloadColumnarManager.accept(ColumnarManager.getInstance());
+        }
+    }
+
+    public void setReloadColumnarManager(Consumer<ColumnarManager> reloadColumnarManager) {
+        this.reloadColumnarManager = reloadColumnarManager;
+    }
+
+    public IInnerConnectionManager getInnerConnectionManager() {
+        return innerConnectionManager;
+    }
+
+    public void setInnerConnectionManager(IInnerConnectionManager innerConnectionManager) {
+        this.innerConnectionManager = innerConnectionManager;
     }
 }

@@ -66,13 +66,25 @@ public class FastsqlParser {
     }
 
     public SqlNodeList parse(final ByteString sql, ExecutionContext executionContext) throws SqlParserException {
-        boolean testMode = executionContext == null ? false : executionContext.isTestMode();
-        return parse(sql, null, new ContextParameters(testMode), executionContext);
+        return parse(sql, executionContext, false);
+    }
+
+    public SqlNodeList parse(final ByteString sql, ExecutionContext executionContext, boolean internalQuery)
+        throws SqlParserException {
+        boolean testMode = executionContext != null && executionContext.isTestMode();
+        ContextParameters contextParameters = new ContextParameters(testMode);
+        contextParameters.setInternalQuery(internalQuery);
+        return parse(sql, null, contextParameters, executionContext);
     }
 
     public SqlNodeList parse(final String sql, ExecutionContext executionContext)
         throws SqlParserException {
         return parse(ByteString.from(sql), executionContext);
+    }
+
+    public SqlNodeList parse(final String sql, ExecutionContext executionContext, boolean internalQuery)
+        throws SqlParserException {
+        return parse(ByteString.from(sql), executionContext, internalQuery);
     }
 
     @VisibleForTesting
@@ -173,8 +185,14 @@ public class FastsqlParser {
                 }
                 converted = convertStatementToSqlNode(statement, params, contextParameters, ec);
                 if (statement instanceof MySqlHintStatement && converted instanceof SqlNodeList) {
+                    if (statement.getAsync() != null) {
+                        ((SqlNodeList) converted).getList().forEach(o -> o.setAsync(statement.getAsync()));
+                    }
                     sqlNodes.addAll(((SqlNodeList) converted).getList());
                 } else {
+                    if (statement.getAsync() != null) {
+                        converted.setAsync(statement.getAsync());
+                    }
                     sqlNodes.add(converted);
                 }
             }

@@ -16,18 +16,18 @@
 
 package com.alibaba.polardbx.optimizer.core.planner.rule;
 
-import com.alibaba.polardbx.optimizer.core.planner.rule.util.CBOUtil;
-import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
-import com.google.common.collect.ImmutableList;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.optimizer.PlannerContext;
 import com.alibaba.polardbx.optimizer.core.DrdsConvention;
 import com.alibaba.polardbx.optimizer.core.TddlRelDataTypeSystemImpl;
 import com.alibaba.polardbx.optimizer.core.TddlTypeFactoryImpl;
+import com.alibaba.polardbx.optimizer.core.planner.rule.util.CBOUtil;
 import com.alibaba.polardbx.optimizer.core.rel.LogicalView;
+import com.alibaba.polardbx.optimizer.core.rel.OSSTableScan;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
 import com.alibaba.polardbx.rule.TableRule;
+import com.google.common.collect.ImmutableList;
 import org.apache.calcite.plan.RelOptRule;
 import org.apache.calcite.plan.RelOptRuleCall;
 import org.apache.calcite.plan.RelOptRuleOperand;
@@ -45,7 +45,10 @@ import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlAggFunction;
 import org.apache.calcite.sql.fun.SqlCheckSumMergeFunction;
+import org.apache.calcite.sql.fun.SqlCheckSumV2MergeFunction;
 import org.apache.calcite.sql.fun.SqlCountAggFunction;
+import org.apache.calcite.sql.fun.SqlFinalHyperloglogFunction;
+import org.apache.calcite.sql.fun.SqlPartialHyperloglogFunction;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.fun.SqlSumAggFunction;
 import org.apache.calcite.sql.fun.SqlSumEmptyIsZeroAggFunction;
@@ -68,8 +71,18 @@ public class CBOPushAggRule extends RelOptRule {
 
     @Override
     public boolean matches(RelOptRuleCall call) {
-        final LogicalView logicalView = (LogicalView)call.rels[1];
-        if (logicalView instanceof OSSTableScan && !((OSSTableScan)logicalView).canPushAgg()) {
+        final LogicalView logicalView = (LogicalView) call.rels[1];
+        if (logicalView instanceof OSSTableScan) {
+            if (PlannerContext.getPlannerContext(call).getParamManager()
+                .getBoolean(ConnectionParams.ENABLE_COLUMNAR_SCAN_EXEC)) {
+                // columnar scan exec does not support agg push down
+                return false;
+            }
+            if (!((OSSTableScan) logicalView).canPushAgg()) {
+                return false;
+            }
+        }
+        if (CBOUtil.containUnpushableAgg((LogicalAggregate) call.rels[0])) {
             return false;
         }
         return PlannerContext.getPlannerContext(call).getParamManager()
@@ -80,13 +93,20 @@ public class CBOPushAggRule extends RelOptRule {
     public void onMatch(RelOptRuleCall call) {
         final LogicalAggregate logicalAggregate = (LogicalAggregate) call.rels[0];
         final LogicalView logicalView = (LogicalView) call.rels[1];
-        if(logicalView instanceof OSSTableScan) {
-            if (!CBOUtil.canPushAggToOss(logicalAggregate, (OSSTableScan)logicalView)) {
+        if (logicalView instanceof OSSTableScan) {
+            if (!CBOUtil.canPushAggToOss(logicalAggregate, (OSSTableScan) logicalView)) {
+                return;
+            }
+            if (PlannerContext.getPlannerContext(call).getParamManager()
+                .getBoolean(ConnectionParams.ENABLE_OSS_BUFFER_POOL)) {
                 return;
             }
         }
         if (logicalView.isSingleGroup()) {
             if (CBOUtil.isCheckSum(logicalAggregate) && !(logicalView instanceof OSSTableScan)) {
+                return;
+            }
+            if (CBOUtil.isCheckSumV2(logicalAggregate) && !(logicalView instanceof OSSTableScan)) {
                 return;
             }
             LogicalAggregate newLogicalAggregate = logicalAggregate.copy(
@@ -106,6 +126,14 @@ public class CBOPushAggRule extends RelOptRule {
         assert logicalAggregate != null && logicalView != null;
         if (logicalAggregate.getAggOptimizationContext().isAggPushed()) {
             return null;
+        }
+        // agg(distinct) -> agg + group by, don't push agg to dn if agg has multi-columns
+        if (logicalAggregate.getAggOptimizationContext().isFromDistinctAgg()) {
+            for (AggregateCall call : logicalAggregate.getAggCallList()) {
+                if ((!call.isDistinct()) && call.getArgList().size() > 1) {
+                    return null;
+                }
+            }
         }
         TddlRuleManager tddlRuleManager =
             PlannerContext.getPlannerContext(logicalAggregate).getExecutionContext()
@@ -151,7 +179,6 @@ public class CBOPushAggRule extends RelOptRule {
             .create(newLogicalView.getPushedRelNode(), partialAggGroupSet, logicalAggregate.getGroupSets(),
                 partialAggCalls);
         newLogicalView.push(partialAgg);
-
         LogicalAggregate globalAgg = logicalAggregate.copy(logicalAggregate.getTraitSet(), newLogicalView,
             logicalAggregate.indicator,
             globalAggGroupSet,
@@ -178,8 +205,8 @@ public class CBOPushAggRule extends RelOptRule {
                                       List<String> shardColumns) {
         int matchNum = 0;
         for (String shardName : shardColumns) {
-            int shardRef = logicalView.getRefByColumnName(logicalView.getShardingTable(), shardName, false);
-            if (shardRef != -1 && logicalAggregate.getGroupSet().asList().indexOf(shardRef) != -1) {
+            int shardRef = logicalView.getRefByColumnName(logicalView.getShardingTable(), shardName, false, true);
+            if (shardRef != -1 && logicalAggregate.getGroupSet().asList().contains(shardRef)) {
                 matchNum++;
             }
         }
@@ -349,6 +376,32 @@ public class CBOPushAggRule extends RelOptRule {
 
                 partialAggCalls.add(aggCall);
                 break;
+            case HYPER_LOGLOG:
+                SqlPartialHyperloglogFunction partialHllFunction = new SqlPartialHyperloglogFunction();
+                AggregateCall partialHllAggregateCall = AggregateCall.create(partialHllFunction,
+                    aggCall.isDistinct(),
+                    aggCall.isApproximate(),
+                    aggCall.getArgList(),
+                    aggCall.filterArg,
+                    tddlTypeFactory.createSqlType(SqlTypeName.VARBINARY),
+                    "partial_hll");
+
+                SqlFinalHyperloglogFunction finalHllFunction = new SqlFinalHyperloglogFunction();
+                AggregateCall finalHllAggregateCall = AggregateCall.create(finalHllFunction,
+                    aggCall.isDistinct(),
+                    aggCall.isApproximate(),
+                    ImmutableList.of(aggGroupSetCardinality + partialAggCalls.size()),
+                    aggCall.filterArg,
+                    aggCall.getType(),
+                    "final_hll");
+
+                globalAggCalls.add(finalHllAggregateCall);
+
+                childExps.add(new RexInputRef(aggGroupSetCardinality + partialAggCalls.size(),
+                    tddlTypeFactory.createSqlType(SqlTypeName.VARBINARY)));
+
+                partialAggCalls.add(partialHllAggregateCall);
+                break;
             case CHECK_SUM:
                 if (!canSplitOrcHash) {
                     return null;
@@ -364,6 +417,26 @@ public class CBOPushAggRule extends RelOptRule {
                     aggCall.getName());
 
                 globalAggCalls.add(crcHashAggregateCall);
+
+                childExps.add(new RexInputRef(aggGroupSetCardinality + partialAggCalls.size(), aggCall.getType()));
+
+                partialAggCalls.add(aggCall);
+                break;
+            case CHECK_SUM_V2:
+                if (!canSplitOrcHash) {
+                    return null;
+                }
+                SqlCheckSumV2MergeFunction func = new SqlCheckSumV2MergeFunction();
+
+                AggregateCall call = AggregateCall.create(func,
+                    aggCall.isDistinct(),
+                    aggCall.isApproximate(),
+                    ImmutableList.of(aggGroupSetCardinality + partialAggCalls.size()),
+                    aggCall.filterArg,
+                    aggCall.getType(),
+                    aggCall.getName());
+
+                globalAggCalls.add(call);
 
                 childExps.add(new RexInputRef(aggGroupSetCardinality + partialAggCalls.size(), aggCall.getType()));
 

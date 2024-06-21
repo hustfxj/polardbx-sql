@@ -20,7 +20,7 @@ import com.alibaba.polardbx.common.eventlogger.EventLogger;
 import com.alibaba.polardbx.common.eventlogger.EventType;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
-import com.alibaba.polardbx.common.jdbc.IConnection;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
@@ -33,19 +33,26 @@ import com.alibaba.polardbx.executor.utils.transaction.GroupConnPair;
 import com.alibaba.polardbx.executor.utils.transaction.LocalTransaction;
 import com.alibaba.polardbx.executor.utils.transaction.TrxLock;
 import com.alibaba.polardbx.executor.utils.transaction.TrxLookupSet;
+import com.alibaba.polardbx.gms.config.impl.InstConfUtil;
+import com.alibaba.polardbx.gms.sync.SyncScope;
+import com.alibaba.polardbx.gms.topology.DbTopologyManager;
 import com.alibaba.polardbx.group.jdbc.TGroupDataSource;
+import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.transaction.TransactionLogger;
 import com.alibaba.polardbx.transaction.sync.FetchTransForDeadlockDetectionSyncAction;
 import com.alibaba.polardbx.transaction.utils.DiGraph;
 import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Triple;
 
+import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -201,7 +208,7 @@ public class DeadlockDetectionTask implements Runnable {
         boolean isMySQL80 = ExecUtils.isMysql80Version();
         String deadLocksSql = isMySQL80 ? SQL_QUERY_DEADLOCKS_80 : SQL_QUERY_DEADLOCKS;
 
-        try (final IConnection conn = dataSource.getConnection();
+        try (final Connection conn = createPhysicalConnectionForLeaderStorage(dataSource);
             final Statement stmt = conn.createStatement();
             final ResultSet rs = stmt.executeQuery(deadLocksSql)) {
 
@@ -286,7 +293,8 @@ public class DeadlockDetectionTask implements Runnable {
         }
     }
 
-    private void extractWaitingTrx(ResultSet rs, LocalTransaction waitingLocalTrx, boolean isMySQL80) throws SQLException {
+    private void extractWaitingTrx(ResultSet rs, LocalTransaction waitingLocalTrx, boolean isMySQL80)
+        throws SQLException {
         if (!waitingLocalTrx.isUpdated()) {
             waitingLocalTrx.setState(rs.getString("waiting_state"));
             final String physicalSql = rs.getString("waiting_physical_sql");
@@ -339,7 +347,8 @@ public class DeadlockDetectionTask implements Runnable {
     private TrxLookupSet fetchTransInfo() {
         final TrxLookupSet lookupSet = new TrxLookupSet();
         final List<List<Map<String, Object>>> results =
-            SyncManagerHelper.sync(new FetchTransForDeadlockDetectionSyncAction(null), DEFAULT_DB_NAME);
+            SyncManagerHelper.sync(new FetchTransForDeadlockDetectionSyncAction(null), DEFAULT_DB_NAME,
+                SyncScope.CURRENT_ONLY);
         for (final List<Map<String, Object>> result : results) {
             if (result == null) {
                 continue;
@@ -370,17 +379,21 @@ public class DeadlockDetectionTask implements Runnable {
         } catch (Exception e) {
             throw new TddlRuntimeException(ErrorCode.ERR_CONFIG, e, e.getMessage());
         }
-        SyncManagerHelper.sync(killSyncAction, DEFAULT_DB_NAME);
+        SyncManagerHelper.sync(killSyncAction, DEFAULT_DB_NAME, SyncScope.CURRENT_ONLY);
     }
 
     @Override
     public void run() {
-
         if (!hasLeadership()) {
             TransactionLogger.debug("Skip deadlock detection task since I am not the leader "
                 + "or there are no active schemas.");
             return;
         }
+
+        if (ExecUtils.isMysql80Version() && !InstConfUtil.getBool(ConnectionParams.ENABLE_DEADLOCK_DETECTION_80)) {
+            return;
+        }
+
         TransactionLogger.debug("Deadlock detection task starts.");
         try {
 
@@ -398,6 +411,11 @@ public class DeadlockDetectionTask implements Runnable {
                     // Since all data sources are in the same DN, any data source is ok
                     final TGroupDataSource groupDataSource = groupDataSources.get(0);
 
+                    if (StringUtils.containsIgnoreCase(groupDataSource.getMasterDNId(), "pxc-xdb-m-")) {
+                        // Skip meta-db.
+                        continue;
+                    }
+
                     // Get all group names in this DN
                     final Set<String> groupNames =
                         groupDataSources.stream().map(TGroupDataSource::getDbGroupKey).collect(Collectors.toSet());
@@ -413,6 +431,9 @@ public class DeadlockDetectionTask implements Runnable {
                 final Pair<StringBuilder, StringBuilder> deadlockLog = DeadlockParser.parseGlobalDeadlock(cycle);
                 final StringBuilder simpleDeadlockLog = deadlockLog.getKey();
                 final StringBuilder fullDeadlockLog = deadlockLog.getValue();
+
+                Optional.ofNullable(OptimizerContext.getTransStat(DEFAULT_DB_NAME))
+                    .ifPresent(s -> s.countGlobalDeadlock.incrementAndGet());
 
                 // TODO: kill transaction by some priority, such as create time, or prefer to kill internal transaction.
                 // The index of the transaction to be killed in the cycle
@@ -441,4 +462,8 @@ public class DeadlockDetectionTask implements Runnable {
         return !allSchemas.isEmpty() && ExecUtils.hasLeadership(allSchemas.iterator().next());
     }
 
+    public static Connection createPhysicalConnectionForLeaderStorage(TGroupDataSource dataSource) {
+        String masterDnId = dataSource.getMasterDNId();
+        return DbTopologyManager.getConnectionForStorage(masterDnId);
+    }
 }

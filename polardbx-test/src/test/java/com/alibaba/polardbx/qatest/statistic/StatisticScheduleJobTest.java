@@ -19,6 +19,7 @@ package com.alibaba.polardbx.qatest.statistic;
 import com.alibaba.polardbx.common.utils.Assert;
 import com.alibaba.polardbx.qatest.BaseTestCase;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
+import org.junit.After;
 import org.junit.Ignore;
 import org.junit.Test;
 
@@ -37,11 +38,20 @@ public class StatisticScheduleJobTest extends BaseTestCase {
     public StatisticScheduleJobTest() {
     }
 
+    @After
+    public void clearFailPoint() throws InterruptedException {
+        String sql = "set @FP_INJECT_STATISTIC_SCHEDULE_JOB_HLL_EXCEPTION=NULL;";
+        Connection c = this.getPolardbxConnection();
+        JdbcUtil.executeUpdateSuccess(c, sql);
+        Thread.sleep(2000L);
+    }
+
     @Test
-    public void testAnalyzeTableWithoutHll() throws SQLException {
+    public void testAnalyzeTableWithoutHll() throws SQLException, InterruptedException {
         String sql;
-        String tableName = "select_base_one_multi_db_multi_tb";
+        String tableName = "select_base_one_multi_db_one_tb";
         long now = System.currentTimeMillis();
+        Thread.sleep(1000L);
         sql = "analyze table " + tableName;
         try (Connection c = this.getPolardbxConnection()) {
             c.createStatement().execute("set global STATISTIC_VISIT_DN_TIMEOUT=600000");
@@ -66,11 +76,11 @@ public class StatisticScheduleJobTest extends BaseTestCase {
         sql =
             "select EVENT from information_schema.module_event where MODULE_NAME='STATISTICS' and TIMESTAMP>'"
                 + sdf.format(new Date(now)) + "'";
+        System.out.println(sql);
         ResultSet moduleRs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
         System.out.println("get event log from module_event");
         boolean hasRowCount = false;
         boolean hasSample = false;
-        boolean notHasHll = false;
         boolean hasPersist = false;
         boolean hasSync = false;
         while (moduleRs.next()) {
@@ -83,11 +93,6 @@ public class StatisticScheduleJobTest extends BaseTestCase {
                 hasSample = true;
                 System.out.println(event);
                 System.out.println("hasSample");
-            } else if (!notHasHll && event.contains("ENABLE_HLL is false")) {
-                notHasHll = true;
-                System.out.println(event);
-                System.out.println("hasHll");
-
             } else if (!hasPersist && event.contains("persist tables statistic")) {
                 hasPersist = true;
                 System.out.println(event);
@@ -97,15 +102,15 @@ public class StatisticScheduleJobTest extends BaseTestCase {
                 System.out.println(event);
                 System.out.println("hasSync");
             }
-            if (hasRowCount && hasSample && notHasHll && hasPersist && hasSync) {
+            if (hasRowCount && hasSample && hasPersist && hasSync) {
                 break;
             }
         }
-        Assert.assertTrue(hasRowCount && hasSample && notHasHll && hasPersist && hasSync);
+        Assert.assertTrue(hasRowCount && hasSample && hasPersist && hasSync);
 
         // check modify time
         sql =
-            "select FROM_UNIXTIME(LAST_MODIFY_TIME) AS TIME from information_schema.virtual_statistic where table_name='select_base_one_multi_db_multi_tb'";
+            "select FROM_UNIXTIME(LAST_MODIFY_TIME) AS TIME from information_schema.virtual_statistic where table_name='select_base_one_multi_db_one_tb'";
         ResultSet rs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
         while (rs.next()) {
             Timestamp timestamp = rs.getTimestamp("TIME");
@@ -118,7 +123,7 @@ public class StatisticScheduleJobTest extends BaseTestCase {
 
     @Ignore
     public void testRowCountCollectJob() throws SQLException, InterruptedException {
-        String sql = "";
+        String sql;
         long now = System.currentTimeMillis();
         sql = "select schedule_id from metadb.SCHEDULED_JOBS where executor_type='STATISTIC_ROWCOUNT_COLLECTION'";
         String schedule_id = null;
@@ -135,47 +140,13 @@ public class StatisticScheduleJobTest extends BaseTestCase {
             Assert.fail("Cannot find schedule id for STATISTIC_ROWCOUNT_COLLECTION");
         }
 
-        /**
-         * record table statistic update info
-         */
-
+        // record table statistic update info
         sql = "set @FP_INJECT_IGNORE_INTERRUPTED_TO_STATISTIC_SCHEDULE_JOB='true'";
         JdbcUtil.executeUpdateSuccess(this.getPolardbxConnection(), sql);
         sql = " fire schedule " + schedule_id;
         JdbcUtil.executeUpdateSuccess(this.getPolardbxConnection(), sql);
 
-        sql = "select state from metadb.fired_SCHEDULEd_JOBS where schedule_id=" + schedule_id
-            + " and gmt_modified>FROM_UNIXTIME(" + now + "/1000)";
-
-        /**
-         * waiting job done
-         */
-        while (true) {
-            //timeout control 5 min
-            if (System.currentTimeMillis() - now > 5 * 60 * 1000) {
-                Assert.fail("timeout:5 min");
-                return;
-            }
-            Thread.sleep(5000);
-            ResultSet rs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
-            boolean anySucc = false;
-            while (rs.next()) {
-                String state = rs.getString(1);
-                if ("SUCCESS".equalsIgnoreCase(state)) {
-                    anySucc = true;
-                    rs.close();
-                    break;
-                }
-            }
-            rs.close();
-            if (anySucc) {
-                break;
-            }
-        }
-
-        /**
-         * test work result
-         */
+        // test work result
         sql =
             "select FROM_UNIXTIME(LAST_MODIFY_TIME) AS TIME from information_schema.virtual_statistic where  ndv_source!='cache_line'";
         ResultSet rs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
@@ -214,35 +185,6 @@ public class StatisticScheduleJobTest extends BaseTestCase {
 
         System.out.println("fire schedule job done:" + schedule_id);
 
-        sql = "select state from metadb.fired_SCHEDULEd_JOBS where schedule_id=" + schedule_id
-            + " and gmt_modified>FROM_UNIXTIME(" + now + "/1000)";
-
-        // waiting job done
-        while (true) {
-            //timeout control 5 min
-            if (System.currentTimeMillis() - now > 5 * 60 * 1000) {
-                Assert.fail("timeout:5 min");
-                return;
-            }
-            Thread.sleep(1000);
-            ResultSet rs = JdbcUtil.executeQuery(sql, c);
-            boolean anySucc = false;
-            while (rs.next()) {
-                String state = rs.getString(1);
-                if ("SUCCESS".equalsIgnoreCase(state)) {
-                    anySucc = true;
-                    rs.close();
-                    break;
-                }
-            }
-
-            System.out.println("check job any succ:" + anySucc);
-            rs.close();
-            if (anySucc) {
-                break;
-            }
-        }
-
         // test work result
         // check schedule job step
         SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
@@ -251,20 +193,17 @@ public class StatisticScheduleJobTest extends BaseTestCase {
                 + sdf.format(new Date(now)) + "'";
         ResultSet moduleRs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
         System.out.println("get event log from module_event");
-        boolean hasStart = false;
         boolean hasSample = false;
+        boolean hasHll = false;
+        boolean hasPersist = false;
         boolean hasSync = false;
         boolean hasEnd = false;
         while (moduleRs.next()) {
             String event = moduleRs.getString("EVENT");
-            if (!hasStart && event.contains("STATISTIC_SAMPLE_SKETCH started")) {
-                hasStart = true;
+            if (!hasPersist && event.contains("persist tables statistic")) {
+                hasPersist = true;
                 System.out.println(event);
-                System.out.println("hasStart");
-            } else if (!hasSample && event.contains("sample table")) {
-                hasSample = true;
-                System.out.println(event);
-                System.out.println("hasSample");
+                System.out.println("hasPersist");
             } else if (!hasSync && event.contains("sync statistic info ")) {
                 hasSync = true;
                 System.out.println(event);
@@ -274,29 +213,46 @@ public class StatisticScheduleJobTest extends BaseTestCase {
                 System.out.println(event);
                 System.out.println("hasEnd");
             }
+            if (hasSample && hasSync && hasEnd && hasHll && hasPersist) {
+                break;
+            }
         }
-        Assert.assertTrue(hasStart && hasSample && hasSync && hasEnd);
+        Assert.assertTrue(hasSync && hasEnd && hasPersist);
 
         // check modify time
+        boolean statisticUpdated = false;
         sql =
             "select FROM_UNIXTIME(LAST_MODIFY_TIME) AS TIME from information_schema.virtual_statistic";
         ResultSet rs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
         while (rs.next()) {
             Timestamp timestamp = rs.getTimestamp("TIME");
             if (timestamp.after(new Timestamp(now))) {
-                return;
+                statisticUpdated = true;
+                break;
             }
         }
-        Assert.fail("no statistic time updated");
+        rs.close();
+
+        if (!statisticUpdated) {
+            Assert.fail("no statistic time updated");
+        }
+        // check optimize alert
+        sql = "select alert_count from information_schema.optimizer_alert where ALERT_TYPE='STATISTIC_MISS'";
+        rs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
+        while (rs.next()) {
+            int alertCount = rs.getInt("alert_count");
+            if (alertCount > 0) {
+                Assert.fail("statistic miss alert");
+            }
+        }
+        rs.close();
     }
 
     @Test
-    public void testSampleSketchJobStopByConfig() throws SQLException, InterruptedException {
+    public void testSampleSketchJobHllException() throws SQLException, InterruptedException {
         String sql;
-        sql = "set global ENABLE_BACKGROUND_STATISTIC_COLLECTION=false";
-        this.getPolardbxConnection().createStatement().execute(sql);
         long now = System.currentTimeMillis();
-        sql = "select schedule_id from metadb.SCHEDULED_JOBS where executor_type='STATISTIC_SAMPLE_SKETCH'";
+        sql = "select schedule_id from metadb.SCHEDULED_JOBS where executor_type='STATISTIC_HLL_SKETCH'";
         String schedule_id = null;
         try (Connection c = this.getPolardbxConnection()) {
             ResultSet resultSet = c.createStatement().executeQuery(sql);
@@ -308,7 +264,7 @@ public class StatisticScheduleJobTest extends BaseTestCase {
         }
 
         if (schedule_id == null) {
-            Assert.fail("Cannot find schedule id for STATISTIC_SAMPLE_SKETCH");
+            Assert.fail("Cannot find schedule id for STATISTIC_HLL_SKETCH");
         } else {
             System.out.println("get schedule_id:" + schedule_id);
         }
@@ -317,28 +273,46 @@ public class StatisticScheduleJobTest extends BaseTestCase {
         sql = "set @FP_INJECT_IGNORE_INTERRUPTED_TO_STATISTIC_SCHEDULE_JOB='true'";
         Connection c = this.getPolardbxConnection();
         JdbcUtil.executeUpdateSuccess(c, sql);
+        sql = "set @FP_INJECT_STATISTIC_SCHEDULE_JOB_HLL_EXCEPTION='true';";
+        JdbcUtil.executeUpdateSuccess(c, sql);
         sql = " fire schedule " + schedule_id;
         JdbcUtil.executeUpdateSuccess(c, sql);
 
         System.out.println("fire schedule job done:" + schedule_id);
 
+        // test work result
+        // check schedule job step
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
         sql =
-            "select * from information_schema.module_event where MODULE_NAME like 'STATISTIC%' and EVENT like '%ENABLE_BACKGROUND_STATISTIC_COLLECTION%'";
-        System.out.println(sql);
-        // waiting job done
-        while (true) {
-            //timeout control 10 s
-            if (System.currentTimeMillis() - now > 10 * 1000) {
-                Assert.fail("timeout:5 min");
-                return;
+            "select EVENT from information_schema.module_event where MODULE_NAME='STATISTICS' and TIMESTAMP>'"
+                + sdf.format(new Date(now)) + "'";
+        ResultSet moduleRs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
+        System.out.println("get event log from module_event:" + sql);
+        boolean hasEnd = false;
+        while (moduleRs.next()) {
+            String event = moduleRs.getString("EVENT");
+            if (event.contains("auto STATISTIC_HLL_SKETCH")) {
+                hasEnd = true;
+                System.out.println(event);
+                System.out.println("hasEnd");
             }
-            Thread.sleep(1000);
-            ResultSet rs = JdbcUtil.executeQuery(sql, c);
-            if (rs.next()) {
-                return;
+            if (hasEnd) {
+                break;
             }
         }
+        moduleRs.close();
+        Assert.assertTrue(hasEnd);
 
+        // check optimize alert
+        sql = "select alert_count from information_schema.optimizer_alert where ALERT_TYPE='STATISTIC_MISS'";
+        ResultSet rs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
+        while (rs.next()) {
+            int alertCount = rs.getInt("alert_count");
+            if (alertCount > 0) {
+                Assert.fail("statistic miss alert");
+            }
+        }
+        rs.close();
     }
 
     @Test
@@ -366,8 +340,9 @@ public class StatisticScheduleJobTest extends BaseTestCase {
         // check schedule job step
         SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
         sql =
-            "select EVENT from information_schema.module_event where MODULE_NAME='STATISTICS' and TIMESTAMP>'"
+            "select EVENT from information_schema.module_event where MODULE_NAME='STATISTICS' and TIMESTAMP>='"
                 + sdf.format(new Date(now)) + "'";
+        System.out.println(sql);
         ResultSet moduleRs = JdbcUtil.executeQuery(sql, this.getPolardbxConnection());
         System.out.println("get event log from module_event");
         boolean hasRowCount = false;

@@ -30,6 +30,7 @@ import com.alibaba.polardbx.gms.listener.impl.MetaDbConfigManager;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbDataIdBuilder;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
 import com.alibaba.polardbx.gms.privilege.authorize.PolarAuthorizer;
+import com.alibaba.polardbx.gms.lbac.accessor.LBACAccessorUtils;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -547,7 +548,7 @@ public class PolarPrivManager {
             "All accounts must have same account type!");
 
         {
-            checkModifyReservedAccounts(granter, grantees, false);
+            checkModifyReservedAccounts(granter, grantees, true);
             PermissionCheckContext context = new PermissionCheckContext(granter.getAccountId(), activeRoles,
                 Permission.instancePermission(PrivilegeKind.CREATE_USER));
             if (!checkPermission(context)) {
@@ -577,6 +578,7 @@ public class PolarPrivManager {
                 }
 
                 PolarRolePrivilege.dropAccounts(conn, accountIds);
+                LBACAccessorUtils.dropUserSecurityAttr(grantees, conn);
 
                 conn.commit();
                 logger.info("Finished deleting account data!");
@@ -588,6 +590,7 @@ public class PolarPrivManager {
 
         reloadPriv();
         triggerReload();
+        triggerLBACReload();
     }
 
     public void grantPrivileges(PolarAccountInfo granter, ActiveRoles activeRoles, List<PolarAccountInfo> grantees) {
@@ -819,6 +822,11 @@ public class PolarPrivManager {
     public void triggerReload() {
         MetaDbConfigManager.getInstance().notify(MetaDbDataIdBuilder.getPrivilegeInfoDataId(), null);
         MetaDbConfigManager.getInstance().sync(MetaDbDataIdBuilder.getPrivilegeInfoDataId());
+    }
+
+    public void triggerLBACReload() {
+        MetaDbConfigManager.getInstance().notify(MetaDbDataIdBuilder.getLBACSecurityDataId(), null);
+        MetaDbConfigManager.getInstance().sync(MetaDbDataIdBuilder.getLBACSecurityDataId());
     }
 
     private void registerLoginErrListener() {

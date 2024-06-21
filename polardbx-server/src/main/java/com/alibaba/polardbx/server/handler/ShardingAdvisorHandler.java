@@ -17,27 +17,18 @@
 package com.alibaba.polardbx.server.handler;
 
 import com.alibaba.fastjson.JSON;
-import com.alibaba.polardbx.common.jdbc.Parameters;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
-import com.alibaba.polardbx.executor.ExecutorHelper;
-import com.alibaba.polardbx.executor.cursor.Cursor;
 import com.alibaba.polardbx.executor.sync.FetchPlanCacheSyncAction;
 import com.alibaba.polardbx.executor.sync.SyncManagerHelper;
 import com.alibaba.polardbx.executor.whatIf.ShardingWhatIf;
-import com.alibaba.polardbx.optimizer.context.ExecutionContext;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
-import com.alibaba.polardbx.optimizer.core.planner.ExecutionPlan;
-import com.alibaba.polardbx.optimizer.core.planner.Planner;
-import com.alibaba.polardbx.optimizer.core.row.Row;
 import com.alibaba.polardbx.optimizer.sharding.advisor.ShardResultForOutput;
 import com.alibaba.polardbx.optimizer.sharding.advisor.ShardingAdvisor;
 import com.alibaba.polardbx.server.ServerConnection;
 import com.alibaba.polardbx.server.response.ShardingAdvice;
-import com.alibaba.polardbx.statistics.RuntimeStatHelper;
 import com.google.common.base.Preconditions;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -46,13 +37,14 @@ import java.util.TreeMap;
  * @author shengyu
  */
 public class ShardingAdvisorHandler {
-    public static void handle(ByteString stmt, ServerConnection c, boolean hasMore) {
+    public static boolean handle(ByteString stmt, ServerConnection c, boolean hasMore) {
         try {
             Preconditions.checkArgument(c.getSchema() != null);
             // fetch plan caches
             List<List<Map<String, Object>>> results = SyncManagerHelper.sync(
                 new FetchPlanCacheSyncAction(c.getSchema(), false, true),
-                c.getSchema());
+                c.getSchema(),
+                SyncScope.ALL);
             Map<String, ShardingAdvisor.AdvisorCache> caches = new TreeMap<>(String::compareToIgnoreCase);
             for (List<Map<String, Object>> nodeRows : results) {
                 if (nodeRows == null) {
@@ -82,7 +74,7 @@ public class ShardingAdvisorHandler {
             ShardingWhatIf shardingWhatIf = new ShardingWhatIf();
             shardingWhatIf.whatIf(result, c.getSchema(), shardingAdvisor.getParamManager());
             // response
-            ShardingAdvice.response(c, hasMore, result, shardingWhatIf);
+            return ShardingAdvice.response(c, hasMore, result, shardingWhatIf);
         } catch (Throwable ex) {
             ex.printStackTrace();
             throw ex;

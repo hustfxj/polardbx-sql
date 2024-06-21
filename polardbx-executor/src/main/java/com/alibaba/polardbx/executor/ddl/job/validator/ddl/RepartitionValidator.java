@@ -34,7 +34,6 @@ import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.partition.PartitionByDefinition;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
-import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoUtil;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
 import com.alibaba.polardbx.optimizer.sequence.SequenceManagerProxy;
@@ -47,7 +46,6 @@ import org.apache.calcite.sql.SqlNode;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
 
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -79,6 +77,16 @@ public class RepartitionValidator {
                                 boolean isBroadcast,
                                 boolean isSingle,
                                 boolean newPartDb) {
+        if (newPartDb && !DbInfoManager.getInstance().isNewPartitionDb(schemaName)) {
+            throw new TddlRuntimeException(ErrorCode.ERR_REPARTITION_KEY,
+                "can not use 'alter table partition by' in drds mode database, please use 'alter table dbpartition by' instead");
+        }
+
+        if (!newPartDb && DbInfoManager.getInstance().isNewPartitionDb(schemaName)) {
+            throw new TddlRuntimeException(ErrorCode.ERR_REPARTITION_KEY,
+                "can not use 'alter table dbpartition by' in auto mode database, please use 'alter table partition by' instead");
+        }
+
         if (newPartDb && !DbInfoManager.getInstance().isNewPartitionDb(schemaName)) {
             throw new TddlRuntimeException(ErrorCode.ERR_REPARTITION_KEY,
                 "can not use 'alter table partition by' in drds mode database, please use 'alter table dbpartition by' instead");
@@ -160,10 +168,25 @@ public class RepartitionValidator {
         PartitionInfo partitionInfo = OptimizerContext.getContext(schemaName).getPartitionInfoManager()
             .getPartitionInfo(sourceTableName);
 
-        if (partitionInfo.getActualPartitionColumns().size() != 1) {
-            throw new TddlRuntimeException(ERR_DDL_JOB_UNSUPPORTED,
-                "can not alter partition count on the table which has been hot split");
+        List<List<String>> allLevelActualPartCols = partitionInfo.getAllLevelActualPartCols();
+        boolean useSubPartBy = partitionInfo.getPartitionBy().getSubPartitionBy() != null;
+        if (!useSubPartBy) {
+            if (allLevelActualPartCols.get(0).size() != 1) {
+                throw new TddlRuntimeException(ERR_DDL_JOB_UNSUPPORTED,
+                    "can not alter partition count on the table which has been hot split");
+            }
+        } else {
+            if (allLevelActualPartCols.get(0).size() > 1) {
+                throw new TddlRuntimeException(ERR_DDL_JOB_UNSUPPORTED,
+                    "can not alter partition count on the table which partitions has been hot split");
+            }
+
+            if (allLevelActualPartCols.get(1).size() > 1) {
+                throw new TddlRuntimeException(ERR_DDL_JOB_UNSUPPORTED,
+                    "can not alter partition count on the table which subpartitions has been hot split");
+            }
         }
+
     }
 
     /**

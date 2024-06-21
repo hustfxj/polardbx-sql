@@ -20,11 +20,14 @@ import com.alibaba.polardbx.executor.ddl.job.builder.gsi.DropTableWithGsiBuilder
 import com.alibaba.polardbx.executor.ddl.job.converter.DdlJobDataConverter;
 import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
 import com.alibaba.polardbx.executor.ddl.job.factory.gsi.DropGsiJobFactory;
+import com.alibaba.polardbx.executor.ddl.job.task.gsi.GsiStatisticsInfoSyncTask;
 import com.alibaba.polardbx.executor.ddl.job.task.gsi.ValidateTableVersionTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJobFactory;
+import com.alibaba.polardbx.executor.ddl.newengine.job.DdlTask;
 import com.alibaba.polardbx.executor.ddl.newengine.job.ExecutableDdlJob;
 import com.alibaba.polardbx.executor.ddl.newengine.job.wrapper.ExecutableDdlJob4DropGsi;
 import com.alibaba.polardbx.executor.ddl.newengine.job.wrapper.ExecutableDdlJob4DropTable;
+import com.alibaba.polardbx.executor.sync.GsiStatisticsSyncAction;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.PhyDdlTableOperation;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.gsi.DropGlobalIndexPreparedData;
@@ -92,7 +95,8 @@ public class DropTableWithGsiJobFactory extends DdlJobFactory {
             preparedData.getPrimaryTablePreparedData().getTableVersion());
 
         PhysicalPlanData physicalPlanData =
-            DdlJobDataConverter.convertToPhysicalPlanData(primaryTableTopology, primaryTablePhysicalPlans);
+            DdlJobDataConverter.convertToPhysicalPlanData(primaryTableTopology, primaryTablePhysicalPlans,
+                executionContext);
         ExecutableDdlJob4DropTable dropPrimaryTableJob =
             (ExecutableDdlJob4DropTable) new DropTableJobFactory(physicalPlanData).create();
         result.combineTasks(dropPrimaryTableJob);
@@ -103,12 +107,20 @@ public class DropTableWithGsiJobFactory extends DdlJobFactory {
             ExecutableDdlJob4DropGsi dropGsiJob =
                 (ExecutableDdlJob4DropGsi) DropGsiJobFactory.create(gsiPreparedData, executionContext, true, false);
 
+            DdlTask gsiStatisticsInfoTask = new GsiStatisticsInfoSyncTask(
+                gsiPreparedData.getSchemaName(),
+                gsiPreparedData.getPrimaryTableName(),
+                gsiPreparedData.getIndexTableName(),
+                GsiStatisticsSyncAction.DELETE_RECORD,
+                null);
+
             result.addTaskRelationship(dropGsiJob.getValidateTask(), dropPrimaryTableJob.getRemoveMetaTask());
             result.addSequentialTasksAfter(dropPrimaryTableJob.getCdcDdlMarkTask(),
                 Lists.newArrayList(
                     dropGsiJob.getDropGsiPhyDdlTask(),
                     dropGsiJob.getDropGsiTableRemoveMetaTask(),
-                    dropGsiJob.getFinalSyncTask()
+                    dropGsiJob.getFinalSyncTask(),
+                    gsiStatisticsInfoTask
                 )
             );
             tableVersions.put(gsiPreparedData.getTableName(),

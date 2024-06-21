@@ -17,13 +17,19 @@
 package com.alibaba.polardbx.cdc;
 
 import com.alibaba.fastjson.JSONObject;
-import com.alibaba.polardbx.cdc.entity.DDLExtInfo;
 import com.alibaba.polardbx.cdc.entity.LogicMeta;
 import com.alibaba.polardbx.cdc.entity.StorageChangeEntity;
 import com.alibaba.polardbx.cdc.entity.StorageRemoveRequest;
 import com.alibaba.polardbx.common.cdc.CdcDDLContext;
-import com.alibaba.polardbx.common.cdc.DdlVisibility;
+import com.alibaba.polardbx.common.cdc.CdcDdlMarkVisibility;
+import com.alibaba.polardbx.common.cdc.CdcDdlRecord;
+import com.alibaba.polardbx.common.cdc.DdlScope;
 import com.alibaba.polardbx.common.cdc.ICdcManager;
+import com.alibaba.polardbx.common.cdc.TableMode;
+import com.alibaba.polardbx.common.cdc.TablesExtInfo;
+import com.alibaba.polardbx.common.cdc.entity.DDLExtInfo;
+import com.alibaba.polardbx.common.ddl.Attribute;
+import com.alibaba.polardbx.common.ddl.Job;
 import com.alibaba.polardbx.common.ddl.newengine.DdlConstants;
 import com.alibaba.polardbx.common.ddl.newengine.DdlType;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
@@ -32,7 +38,9 @@ import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.model.lifecycle.AbstractLifecycle;
 import com.alibaba.polardbx.common.model.sqljep.Comparative;
 import com.alibaba.polardbx.common.model.sqljep.ComparativeMapChoicer;
+import com.alibaba.polardbx.common.properties.ConnectionParams;
 import com.alibaba.polardbx.common.properties.ConnectionProperties;
+import com.alibaba.polardbx.common.properties.ParamManager;
 import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.extension.Activate;
@@ -44,21 +52,23 @@ import com.alibaba.polardbx.druid.DbType;
 import com.alibaba.polardbx.druid.sql.ast.SQLStatement;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableStatement;
 import com.alibaba.polardbx.druid.sql.parser.SQLParserUtils;
+import com.alibaba.polardbx.executor.ddl.ImplicitTableGroupUtil;
+import com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcMarkUtil;
+import com.alibaba.polardbx.executor.sync.SyncManagerHelper;
+import com.alibaba.polardbx.druid.sql.parser.SQLStatementParser;
 import com.alibaba.polardbx.executor.utils.ExecUtils;
 import com.alibaba.polardbx.executor.utils.failpoint.FailPoint;
 import com.alibaba.polardbx.gms.config.impl.MetaDbInstConfigManager;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbConfigManager;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbDataIdBuilder;
 import com.alibaba.polardbx.gms.metadb.MetaDbDataSource;
-import com.alibaba.polardbx.gms.metadb.cdc.PolarxCommandAccessor;
-import com.alibaba.polardbx.gms.metadb.cdc.PolarxCommandRecord;
+import com.alibaba.polardbx.gms.metadb.cdc.BinlogCommandAccessor;
+import com.alibaba.polardbx.gms.metadb.cdc.BinlogCommandRecord;
 import com.alibaba.polardbx.gms.metadb.limit.LimitValidator;
 import com.alibaba.polardbx.gms.metadb.table.TablesExtAccessor;
 import com.alibaba.polardbx.gms.metadb.table.TablesExtRecord;
-import com.alibaba.polardbx.gms.partition.TablePartitionAccessor;
 import com.alibaba.polardbx.gms.partition.TablePartitionConfig;
 import com.alibaba.polardbx.gms.partition.TablePartitionConfigUtil;
-import com.alibaba.polardbx.gms.partition.TablePartitionRecord;
 import com.alibaba.polardbx.gms.topology.DbGroupInfoAccessor;
 import com.alibaba.polardbx.gms.topology.DbGroupInfoRecord;
 import com.alibaba.polardbx.gms.topology.DbInfoAccessor;
@@ -75,8 +85,8 @@ import com.alibaba.polardbx.gms.util.InstIdUtil;
 import com.alibaba.polardbx.gms.util.MetaDbLogUtil;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
-import com.alibaba.polardbx.optimizer.config.table.GsiMetaManager;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
+import com.alibaba.polardbx.optimizer.core.planner.rule.util.CBOUtil;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
 import com.alibaba.polardbx.optimizer.partition.pruning.PartitionPrunerUtils;
@@ -93,12 +103,14 @@ import com.alibaba.polardbx.server.conn.InnerConnection;
 import com.google.common.collect.Lists;
 import lombok.Data;
 import org.apache.calcite.sql.SqlKind;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.glassfish.jersey.internal.guava.Sets;
 
+import java.rmi.UnexpectedException;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -118,15 +130,17 @@ import static com.alibaba.polardbx.cdc.CdcDbLock.releaseCdcDbLockByCommit;
 import static com.alibaba.polardbx.cdc.CdcStorageUtil.isStorageContainsGroup;
 import static com.alibaba.polardbx.cdc.MetaBuilder.checkLogicDbMeta;
 import static com.alibaba.polardbx.cdc.MetaBuilder.checkLogicTableMeta;
+import static com.alibaba.polardbx.cdc.SQLHelper.checkToString;
 import static com.alibaba.polardbx.cdc.SQLHelper.filterColumns;
 import static com.alibaba.polardbx.common.cdc.ICdcManager.InstructionType.StorageInstChange;
+import static com.alibaba.polardbx.executor.ddl.ImplicitTableGroupUtil.tryAttachImplicitTableGroup;
 import static com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcSqlUtils.SQL_PARSE_FEATURES;
 import static com.alibaba.polardbx.executor.utils.failpoint.FailPointKey.FP_INJECT_FAILURE_TO_CDC_AFTER_ADD_NEW_GROUP;
-import static com.alibaba.polardbx.gms.metadb.cdc.PolarxCommandRecord.COMMAND_STATUS_INITIAL;
-import static com.alibaba.polardbx.gms.metadb.cdc.PolarxCommandRecord.COMMAND_STATUS_SUCCESS;
-import static com.alibaba.polardbx.gms.metadb.cdc.PolarxCommandRecord.COMMAND_TYPE.ADD_STORAGE;
-import static com.alibaba.polardbx.gms.metadb.cdc.PolarxCommandRecord.COMMAND_TYPE.REMOVE_STORAGE;
-import static com.alibaba.polardbx.gms.partition.TablePartitionRecord.PARTITION_TABLE_TYPE_GSI_TABLE;
+import static com.alibaba.polardbx.gms.metadb.cdc.BinlogCommandRecord.COMMAND_STATUS.INITIAL;
+import static com.alibaba.polardbx.gms.metadb.cdc.BinlogCommandRecord.COMMAND_STATUS.READY;
+import static com.alibaba.polardbx.gms.metadb.cdc.BinlogCommandRecord.COMMAND_STATUS.SUCCESS;
+import static com.alibaba.polardbx.gms.metadb.cdc.BinlogCommandRecord.COMMAND_TYPE.ADD_STORAGE;
+import static com.alibaba.polardbx.gms.metadb.cdc.BinlogCommandRecord.COMMAND_TYPE.REMOVE_STORAGE;
 import static com.alibaba.polardbx.gms.topology.SystemDbHelper.CDC_DB_NAME;
 
 /**
@@ -154,6 +168,8 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
      */
     private final ScheduledExecutorService commandScanExecutor;
 
+    private final Set<String> orginalAcceptSet;
+
     public CdcManager() {
         managerCoreExecutor = Executors.newCachedThreadPool(
             new NamedThreadFactory("cdc-core-executor", true));
@@ -161,12 +177,20 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
             new NamedThreadFactory("cdc-storage-check-executor", true));
         commandScanExecutor = Executors.newSingleThreadScheduledExecutor(
             new NamedThreadFactory("cdc-command-scan-executor", true));
+        orginalAcceptSet = Sets.newHashSet();
+        orginalAcceptSet.addAll(Arrays.asList(SqlKind.CREATE_TABLE.name(),
+            SqlKind.ALTER_TABLE.name(),
+            SqlKind.DROP_TABLE.name(),
+            SqlKind.CREATE_INDEX.name(),
+            SqlKind.RENAME_TABLE.name(),
+            SqlKind.ALTER_RENAME_INDEX.name(),
+            SqlKind.DROP_INDEX.name()));
     }
 
     @Override
     protected void doInit() {
-        if (ConfigDataMode.isMasterMode()) {
-            SysTableUtil.getInstance().prepareCdcSysTables();
+        if (ConfigDataMode.isPolarDbX() && ConfigDataMode.isMasterMode()) {
+            CdcTableUtil.getInstance().prepareCdcSysTables();
 
             // init storage check scheduler
             final int checkStorageChangeInterval = 2000;
@@ -230,7 +254,43 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
             future.get();
         } catch (Throwable t) {
             MetaDbLogUtil.META_DB_LOG.error(t);
-            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t);
+            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t, t.getMessage());
+        }
+    }
+
+    @Override
+    public List<CdcDdlRecord> getDdlRecord(CdcDDLContext cdcDDLContext) {
+        //init parameter
+        final String schemaName = cdcDDLContext.getSchemaName();
+        final String tableName = cdcDDLContext.getTableName();
+        final String sqlKind = cdcDDLContext.getSqlKind();
+        final Long jobId = cdcDDLContext.getJobId();
+        final Long versionId = cdcDDLContext.getVersionId();
+
+        final boolean jobIdSpecified = (null != jobId);
+
+        try (Connection connection = prepareConnection()) {
+            if (jobIdSpecified) {
+                return queryDdlByJobId(connection, cdcDDLContext);
+            } else {
+                return queryDdl(connection, cdcDDLContext);
+            }
+        } catch (Throwable t) {
+            String errorMsg = String.format(
+                "get ddl record error , the detail info as below : \n"
+                    + " schemaName is : %s \n"
+                    + " tableName is : %s \n"
+                    + " sqlKind is : %s \n "
+                    + " versionId is : %s \n "
+                    + " job is : %s ",
+                schemaName == null ? "" : schemaName,
+                tableName == null ? "" : tableName,
+                sqlKind == null ? "" : sqlKind,
+                versionId == null ? "" : versionId,
+                jobId == null ? "" : jobId);
+            logger.error(errorMsg, t);
+            MetaDbLogUtil.META_DB_LOG.error(errorMsg, t);
+            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t, t.getMessage());
         }
     }
 
@@ -241,15 +301,24 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         String tableName = cdcDDLContext.getTableName();
         String sqlKind = cdcDDLContext.getSqlKind();
         String ddlSql = cdcDDLContext.getDdlSql();
-        DdlVisibility visibility = cdcDDLContext.getVisibility();
+        CdcDdlMarkVisibility visibility = cdcDDLContext.getVisibility();
         Map<String, Object> extendParams = cdcDDLContext.getExtendParams();
 
         // 对于if not exists 和 if exists，外部没有对长度进行判断，此处进行判断
         checkLength(schemaName, tableName);
 
+        boolean isGSI = isDdlOnGsi(cdcDDLContext, extendParams);
+
+        extendParams.put(CDC_IS_GSI, isGSI);
+
         // check if ignore
         if (!checkDdl(schemaName, ddlSql, cdcDDLContext, extendParams)) {
             return;
+        }
+
+        if (!orginalAcceptSet.contains(sqlKind)) {
+            // 目前只考虑 table 和 索引的DDL使用原始SQL
+            extendParams.put(CDC_ORIGINAL_DDL, "");
         }
 
         checkSleep(extendParams);
@@ -257,15 +326,30 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         Future<?> future = managerCoreExecutor.submit(() -> {
             CdcManager.this.checkState();
             synchronized (CdcManager.this) {
-                try (Connection connection = prepareConnection()) {
-                    // 虽然checkStorageChangeExecutor可以定时扫描Storage的变化，但这是一个异步操作，一旦Storage插入Storage_info表之后，就会
-                    // 立即生效，所以，在checkStorageChangeExecutor扫描到变化之前，在新的Storage上可能已经发生了逻辑ddl和dml操作，所以这里加入
-                    // 一个Barrier，每次ddl打标前，调用一下checkStorageChange方法，保证下游先收到storage的变化，再收到新的逻辑Schema变化
-                    checkStorageChange();
-                    recordDdl(connection, schemaName, tableName, sqlKind, ddlSql, cdcDDLContext, visibility,
-                        extendParams);
-                } catch (Throwable t) {
-                    throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t);
+                int retry = 0;
+                while (true) {
+                    if (Thread.interrupted()) {
+                        throw new RuntimeException("cdc ddl mark is interrupted");
+                    }
+                    try (Connection connection = prepareConnection()) {
+                        // 虽然checkStorageChangeExecutor可以定时扫描Storage的变化，但这是一个异步操作，一旦Storage插入Storage_info表之后，就会
+                        // 立即生效，所以，在checkStorageChangeExecutor扫描到变化之前，在新的Storage上可能已经发生了逻辑ddl和dml操作，所以这里加入
+                        // 一个Barrier，每次ddl打标前，调用一下checkStorageChange方法，保证下游先收到storage的变化，再收到新的逻辑Schema变化
+                        checkStorageChange();
+                        recordDdl(connection, schemaName, tableName, sqlKind, ddlSql, cdcDDLContext, visibility,
+                            extendParams);
+                        break;
+                    } catch (Throwable t) {
+                        if (retry < 3) {
+                            try {
+                                Thread.sleep(1000);
+                                retry++;
+                            } catch (InterruptedException ignore) {
+                            }
+                        } else {
+                            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t, t.getMessage());
+                        }
+                    }
                 }
             }
         });
@@ -285,17 +369,17 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
                 JSONObject.toJSONString(extendParams));
             logger.error(errorMsg, t);
             MetaDbLogUtil.META_DB_LOG.error(errorMsg, t);
-            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t);
+            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t, t.getMessage());
         }
     }
 
     @Override
-    public void checkCdcBeforeStorageRemove(Set<String> storageInstIds, String identifer) {
+    public void checkCdcBeforeStorageRemove(Set<String> storageInstIds, String identifier) {
         if (isCdcDisabled()) {
             logger.warn("cdc is disabled, check storage removing stage is skipped.");
             return;
         }
-        CdcStorageUtil.checkCdcBeforeStorageRemove(storageInstIds, identifer);
+        CdcStorageUtil.checkCdcBeforeStorageRemove(storageInstIds, identifier);
     }
 
     private void checkState() {
@@ -318,11 +402,6 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
 
     private boolean checkDdl(String schemaName, String ddlSql, CdcDDLContext cdcDDLContext,
                              Map<String, Object> extendParams) {
-        if (isCdcDisabled()) {
-            logger.warn("cdc is disabled, ddl mark is ignored.");
-            return false;
-        }
-
         if (!ConfigDataMode.isMasterMode()) {
             logger.warn("notifyCdc method is not supported when server is not in master mode.");
             return false;
@@ -341,9 +420,36 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         }
 
         // 全局二级索引(即：GSI)，如果没有特殊标识，忽略打标
-        if (!extendParams.containsKey(ICdcManager.NOT_IGNORE_GSI_JOB_TYPE_FLAG) && isDdlOnGsi(cdcDDLContext,
-            extendParams)) {
+        Boolean isGSI = (Boolean) extendParams.get(CDC_IS_GSI);
+        if (isGSI == null) {
+            isGSI = false;
+        }
+        if (!extendParams.containsKey(ICdcManager.NOT_IGNORE_GSI_JOB_TYPE_FLAG) && isGSI) {
             logger.warn(String.format("ddl sql is related to global index, is ignored, ddl sql is : %s", ddlSql));
+            return false;
+        }
+        SqlKind sqlKind = SqlKind.valueOf(cdcDDLContext.getSqlKind());
+
+        if (sqlKind == SqlKind.FLUSH_LOGS) {
+            return true;
+        }
+
+        if (StringUtils.isEmpty(ddlSql)) {
+            logger.warn("ddl sql is empty, ddl job id is:" + cdcDDLContext.getJobId());
+            return false;
+        }
+
+        SQLHelper.checkToString(ddlSql);
+
+        // 存储引擎为OSS/S3等的表暂不支持同步
+        if (StringUtils.isNotBlank(schemaName) && StringUtils.isNotBlank(cdcDDLContext.getTableName())
+            && CdcTableUtil.getInstance().isFileStoreTable(schemaName, cdcDDLContext.getTableName())) {
+            return false;
+        }
+
+        // 存储引擎为OSS/S3等的表暂不支持同步
+        if (StringUtils.isNotBlank(schemaName) && StringUtils.isNotBlank(cdcDDLContext.getTableName())
+            && CdcTableUtil.getInstance().isFileStoreTable(schemaName, cdcDDLContext.getTableName())) {
             return false;
         }
 
@@ -370,48 +476,46 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         DdlType ddlType = cdcDDLContext.getDdlType();
         if (cdcDDLContext.getJobId() != null && (ddlType == DdlType.CREATE_GLOBAL_INDEX
             || ddlType == DdlType.ALTER_GLOBAL_INDEX || ddlType == DdlType.DROP_GLOBAL_INDEX
-            || ddlType == DdlType.RENAME_GLOBAL_INDEX || ddlType == DdlType.CHECK_GLOBAL_INDEX)) {
+            || ddlType == DdlType.RENAME_GLOBAL_INDEX || ddlType == DdlType.CHECK_GLOBAL_INDEX
+            || ddlType == DdlType.CHECK_COLUMNAR_INDEX)) {
             return true;
         }
 
-        try {
-            return isGsiTable(cdcDDLContext);
-        } catch (SQLException e) {
-            throw new TddlNestableRuntimeException("checking gsi table failed.", e);
+        Boolean isGsi = (Boolean) extendParams.get(ICdcManager.CDC_IS_GSI);
+        if (isGsi != null && isGsi) {
+            return true;
         }
+        return isGsiTable(cdcDDLContext);
     }
 
-    private boolean isGsiTable(CdcDDLContext cdcDDLContext) throws SQLException {
+    private boolean isGsiTable(CdcDDLContext cdcDDLContext) {
         String schemaName = cdcDDLContext.getSchemaName();
         String tableName = cdcDDLContext.getTableName();
-        if (StringUtils.isNotBlank(schemaName) && StringUtils.isNotBlank(tableName)) {
-            try (Connection metaDbConn = MetaDbUtil.getConnection()) {
-                if (DbInfoManager.getInstance().isNewPartitionDb(schemaName)) {
-                    TablePartitionAccessor tablePartitionAccessor = new TablePartitionAccessor();
-                    tablePartitionAccessor.setConnection(metaDbConn);
-                    List<TablePartitionRecord> partitionRecords =
-                        tablePartitionAccessor.getTablePartitionsByDbNameTbName(schemaName, tableName, false);
-                    return !partitionRecords.isEmpty()
-                        && partitionRecords.get(0).tblType == PARTITION_TABLE_TYPE_GSI_TABLE;
-                } else {
-                    TablesExtAccessor tablesExtAccessor = new TablesExtAccessor();
-                    tablesExtAccessor.setConnection(metaDbConn);
-                    TablesExtRecord tablesExtRecord = tablesExtAccessor.query(schemaName, tableName, false);
-                    return tablesExtRecord != null && tablesExtRecord.tableType == GsiMetaManager.TableType.GSI
-                        .getValue();
-                }
-            }
-        }
-        return false;
+        return CBOUtil.isGsi(schemaName, tableName);
     }
 
     private Connection prepareConnection() throws SQLException {
         return new InnerConnection(SystemDbHelper.CDC_DB_NAME);
     }
 
+    private List<CdcDdlRecord> queryDdl(Connection connection, CdcDDLContext context) throws SQLException {
+        return CdcTableUtil.getInstance().queryDdlRecord(
+            connection,
+            context.getSchemaName(),
+            context.getTableName(),
+            context.getSqlKind(),
+            context.getVersionId());
+    }
+
+    private List<CdcDdlRecord> queryDdlByJobId(Connection connection, CdcDDLContext context) throws SQLException {
+        return CdcTableUtil.getInstance().queryDdlRecordByJobId(
+            connection,
+            context.getJobId());
+    }
+
     private void recordDdl(Connection connection, String schema, String tableName, String sqlKind, String ddlSql,
                            CdcDDLContext cdcDDLContext,
-                           DdlVisibility visibility,
+                           CdcDdlMarkVisibility visibility,
                            Map<String, Object> extendParams)
         throws SQLException {
         if (cdcDDLContext.getJobId() != null) {
@@ -421,9 +525,8 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
             //  2. drop database ...
             //  3. create table if not exists ...
             //  4. drop table if exists ...
-            boolean isDuplicateJobId =
-                SysTableUtil.getInstance()
-                    .isDdlRecordExistForJobId(connection, getJobId(cdcDDLContext), cdcDDLContext.getTaskId());
+            boolean isDuplicateJobId = CdcTableUtil.getInstance().isDdlRecordExistForJobId(
+                connection, getJobId(cdcDDLContext), cdcDDLContext.getTaskId(), getTaskSubSeq(extendParams));
             if (isDuplicateJobId) {
                 logger.warn("ddl record for job_id " + getJobId(cdcDDLContext) + " is already existed, ignore it.");
                 return;
@@ -436,22 +539,141 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
 
         DDLExtInfo extInfo = new DDLExtInfo();
         extInfo.setTaskId(cdcDDLContext.getTaskId());
-        extInfo.setCreateSql4PhyTable(tryBuildCreateSql4PhyTable(schema, tableName, extendParams));
-        if (extendParams.containsKey("polardbx_server_id")) {
-            extInfo.setServerId(extendParams.get("polardbx_server_id").toString());
+        extInfo.setCreateSql4PhyTable(tryBuildCreateSql4PhyTable(schema, tableName, extendParams, cdcDDLContext));
+        if (extendParams.containsKey(POLARDBX_SERVER_ID)) {
+            extInfo.setServerId(extendParams.get(POLARDBX_SERVER_ID).toString());
         }
-        SysTableUtil.getInstance()
-            .insertDdlRecord(connection, getJobId(cdcDDLContext), sqlKind, schema, tableName, ddlSql,
-                buildMetaInfo(cdcDDLContext.isRefreshTableMetaInfo(), schema, tableName, sqlKind, extendParams,
-                    cdcDDLContext.getNewTableTopology()),
-                visibility, JSONObject.toJSONString(extInfo));
+        if (extendParams.containsKey(USE_OMC)) {
+            extInfo.setUseOMC(Boolean.parseBoolean(extendParams.get(USE_OMC).toString()));
+        }
+        if (extendParams.containsKey(ICdcManager.TASK_MARK_SEQ)) {
+            extInfo.setTaskSubSeq(Long.parseLong(extendParams.get(ICdcManager.TASK_MARK_SEQ).toString()));
+        }
+        if (extendParams.containsKey(CDC_MARK_SQL_MODE)) {
+            extInfo.setSqlMode(extendParams.get(CDC_MARK_SQL_MODE).toString());
+        }
+        if (extendParams.containsKey(CDC_ORIGINAL_DDL)) {
+            extInfo.setOriginalDdl(extendParams.get(CDC_ORIGINAL_DDL).toString());
+            if (StringUtils.isNotBlank(extInfo.getOriginalDdl())) {
+                checkToString(extInfo.getOriginalDdl());
+            }
+        }
+        if (extendParams.containsKey(CDC_IS_GSI)) {
+            extInfo.setGsi((Boolean) extendParams.get(CDC_IS_GSI));
+        }
+        if (extendParams.containsKey(CDC_GROUP_NAME)) {
+            extInfo.setGroupName(extendParams.get(CDC_GROUP_NAME).toString());
+        }
+        if (extendParams.containsKey(FOREIGN_KEYS_DDL)) {
+            extInfo.setForeignKeysDdl(Boolean.parseBoolean(extendParams.get(FOREIGN_KEYS_DDL).toString()));
+        }
+        if (extendParams.containsKey(DDL_ID)) {
+            extInfo.setDdlId(Long.parseLong(extendParams.get(DDL_ID).toString()));
+        }
+
+        StringBuilder flags2Builder = new StringBuilder();
+        if (extendParams.containsKey(ConnectionParams.FOREIGN_KEY_CHECKS.getName()) && StringUtils.equalsAnyIgnoreCase(
+            String.valueOf(extendParams.get(ConnectionParams.FOREIGN_KEY_CHECKS.getName())), "OFF", "0", "FALSE")) {
+            flags2Builder.append("OPTION_NO_FOREIGN_KEY_CHECKS,");
+        }
+        final String uniqueCheckVariableName = "unique_checks";
+        if (extendParams.containsKey(uniqueCheckVariableName) && StringUtils.equalsAnyIgnoreCase(
+            String.valueOf(extendParams.get(uniqueCheckVariableName)), "OFF", "0", "FALSE")) {
+            flags2Builder.append("OPTION_RELAXED_UNIQUE_CHECKS");
+        }
+
+        if (flags2Builder.length() > 0) {
+            extInfo.setFlags2(flags2Builder.toString());
+        }
+
+        if (extendParams.containsKey(CDC_TABLE_GROUP_MANUAL_CREATE_FLAG)) {
+            extInfo.setManuallyCreatedTableGroup((Boolean) extendParams.get(CDC_TABLE_GROUP_MANUAL_CREATE_FLAG));
+        }
+
+        if (extendParams.containsKey(CDC_DDL_SCOPE)) {
+            extInfo.setDdlScope(((DdlScope) extendParams.get(CDC_DDL_SCOPE)).getValue());
+        }
+
+        tryAttachImplicitTableGroupInfo(schema, tableName, ddlSql, extInfo, extendParams);
+        doFinalMark(connection, getJobId(cdcDDLContext), sqlKind, schema, tableName, ddlSql,
+            buildMetaInfo(cdcDDLContext.isRefreshTableMetaInfo(),
+                schema,
+                tableName,
+                sqlKind,
+                extendParams,
+                cdcDDLContext.getNewTableTopology(),
+                cdcDDLContext.getTablesExtInfoPair()),
+            visibility,
+            JSONObject.toJSONString(extInfo));
     }
 
-    private String tryBuildCreateSql4PhyTable(String schema, String tableName, Map<String, Object> extendParams)
+    private void doFinalMark(Connection connection, Long jobId, String sqlKind, String schema, String tableName,
+                             String ddlSql, String metaInfo, CdcDdlMarkVisibility visibility, String ext) {
+        CdcDdlMarkSyncAction syncAction = new CdcDdlMarkSyncAction(
+            jobId, sqlKind, schema, tableName, ddlSql, metaInfo, visibility, ext);
+        if (ExecUtils.hasLeadership(null)) {
+            syncAction.doSync(connection);
+        } else {
+            boolean success = false;
+            try {
+                String leaderKey = ExecUtils.getLeaderKey(null);
+                SyncManagerHelper.sync(syncAction, SystemDbHelper.CDC_DB_NAME, leaderKey);
+                success = true;
+            } catch (Throwable e) {
+                logger.error(
+                    "Hit sync failure (" + e.getMessage() + ") when sending a cdc ddl mark action to the leader. "
+                        + " will retry in local node , " + ddlSql, e);
+            }
+
+            if (!success) {
+                syncAction.doSync(connection);
+            }
+        }
+    }
+
+    private void tryAttachImplicitTableGroupInfo(String schema, String tableName, String ddlSql,
+                                                 DDLExtInfo ddlExtInfo, Map<String, Object> extendParams) {
+        ParamManager paramManager = new ParamManager(extendParams);
+        boolean enableImplicitTg = paramManager.getBoolean(ConnectionParams.ENABLE_IMPLICIT_TABLE_GROUP);
+        if (!enableImplicitTg) {
+            return;
+        }
+        ddlExtInfo.setEnableImplicitTableGroup(true);
+
+        if (extendParams.containsKey(EXCHANGE_NAMES_MAPPING)) {
+            Map<String, String> exchangeNamesMapping = (Map<String, String>) extendParams.get(EXCHANGE_NAMES_MAPPING);
+            ImplicitTableGroupUtil.exchangeNamesMapping.set(exchangeNamesMapping);
+        }
+
+        if (StringUtils.isNotBlank(ddlExtInfo.getOriginalDdl())) {
+            String sql = tryAttachImplicitTableGroup(schema, tableName, ddlExtInfo.getOriginalDdl());
+            if (!StringUtils.equals(sql, ddlExtInfo.getOriginalDdl())) {
+                ddlExtInfo.setOriginalDdl(tryReAttacheDdlVersionId(sql, ddlExtInfo));
+            }
+        } else {
+            String sql = tryAttachImplicitTableGroup(schema, tableName, ddlSql);
+            if (!StringUtils.equals(sql, ddlSql)) {
+                ddlExtInfo.setOriginalDdl(tryReAttacheDdlVersionId(sql, ddlExtInfo));
+            }
+        }
+    }
+
+    private String tryReAttacheDdlVersionId(String ddlSql, DDLExtInfo ddlExtInfo) {
+        if (ddlExtInfo.getDdlId() != null && ddlExtInfo.getDdlId() > 0) {
+            String hints = CdcMarkUtil.buildVersionIdHint(ddlExtInfo.getDdlId());
+            if (!StringUtils.containsIgnoreCase(ddlSql, hints)) {
+                return hints + ddlSql;
+            }
+        }
+        return ddlSql;
+    }
+
+    private String tryBuildCreateSql4PhyTable(String schema, String tableName, Map<String, Object> extendParams,
+                                              CdcDDLContext cdcDDLContext)
         throws SQLException {
-        Object refreshCreateSql4PhyFlag = extendParams.get(REFRESH_CREATE_SQL_4_PHY_TABLE);
-        if ("true".equals(refreshCreateSql4PhyFlag)) {
-            MetaInfo metaInfo = buildMetaForTable(schema, tableName, extendParams, Lists.newArrayList());
+        if (shouldRebuildCreatSql4PhyTable(cdcDDLContext, extendParams)) {
+            MetaInfo metaInfo = buildMetaForTable(schema, tableName, extendParams,
+                tryBuildTargetDBs(cdcDDLContext.getNewTableTopology()), cdcDDLContext.getTablesExtInfoPair());
             LogicMeta.LogicTableMeta tableMeta = metaInfo.getLogicTableMeta();
             String phyCreateSql = MetaBuilder.getPhyCreateSql(schema, tableMeta);
 
@@ -466,6 +688,14 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         return "";
     }
 
+    private boolean shouldRebuildCreatSql4PhyTable(CdcDDLContext cdcDDLContext, Map<String, Object> extendParams) {
+        Object refreshCreateSql4PhyFlag = extendParams.get(REFRESH_CREATE_SQL_4_PHY_TABLE);
+        return "true".equals(refreshCreateSql4PhyFlag) || cdcDDLContext.isRefreshTableMetaInfo() ||
+            ((SqlKind.valueOf(cdcDDLContext.getSqlKind()) == SqlKind.ALTER_TABLE
+                || SqlKind.valueOf(cdcDDLContext.getSqlKind()) == SqlKind.ALTER_TABLE_SET_TABLEGROUP) && extendParams
+                .containsKey(ICdcManager.ALTER_TRIGGER_TOPOLOGY_CHANGE_FLAG));
+    }
+
     private void sendInstructionInternal(InstructionType instructionType, String instructionId,
                                          String instructionContent) {
         try (Connection connection = prepareConnection()) {
@@ -473,14 +703,14 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
                 + "instructionId is " + instructionId + ", size of instructionContent is " +
                 instructionContent.getBytes().length + ".");
 
-            SysTableUtil.getInstance()
+            CdcTableUtil.getInstance()
                 .insertInstruction(connection, instructionType, instructionId, instructionContent);
 
             logger.warn("successfully send instruction, instructionType is " + instructionType + ", "
                 + "instructionId is " + instructionId + ", size of instructionContent is " +
                 instructionContent.getBytes().length + ".");
         } catch (Throwable t) {
-            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t);
+            throw new TddlRuntimeException(ErrorCode.ERR_CDC_GENERIC, t, t.getMessage());
         }
     }
 
@@ -489,8 +719,16 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         return (jobId == null || jobId == 0) ? null : jobId;
     }
 
+    private Long getTaskSubSeq(Map<String, Object> extendParams) {
+        if (extendParams.containsKey(ICdcManager.TASK_MARK_SEQ)) {
+            return Long.parseLong(extendParams.get(ICdcManager.TASK_MARK_SEQ).toString());
+        }
+        return null;
+    }
+
     private String buildMetaInfo(boolean refreshTableMetaInfo, String schemaName, String tableName, String sqlKind,
-                                 Map<String, Object> extendParams, Map<String, Set<String>> newTableTopology)
+                                 Map<String, Object> extendParams, Map<String, Set<String>> newTableTopology,
+                                 Pair<String, TablesExtInfo> tableMetaRecords)
         throws SQLException {
         SqlKind kind = SqlKind.valueOf(sqlKind);
 
@@ -498,18 +736,19 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
 
         // 如果外部显示指定了需要刷新元数据，则直接构建即可
         if (refreshTableMetaInfo) {
-            return JSONObject.toJSONString(buildMetaForTable(schemaName, tableName, extendParams, targetDBList));
+            return JSONObject.toJSONString(
+                buildMetaForTable(schemaName, tableName, extendParams, targetDBList, tableMetaRecords));
         }
 
         if (kind == SqlKind.CREATE_DATABASE || kind == SqlKind.MOVE_DATABASE) {
             return JSONObject.toJSONString(buildMetaForDb(schemaName));
         } else if (kind == SqlKind.CREATE_TABLE || kind == SqlKind.RENAME_TABLE) {
             return JSONObject
-                .toJSONString(buildMetaForTable(schemaName, tableName, extendParams, targetDBList));
-        } else if (kind == SqlKind.ALTER_TABLE && extendParams
+                .toJSONString(buildMetaForTable(schemaName, tableName, extendParams, targetDBList, tableMetaRecords));
+        } else if ((kind == SqlKind.ALTER_TABLE || kind == SqlKind.ALTER_TABLE_SET_TABLEGROUP) && extendParams
             .containsKey(ICdcManager.ALTER_TRIGGER_TOPOLOGY_CHANGE_FLAG)) {
             return JSONObject
-                .toJSONString(buildMetaForTable(schemaName, tableName, extendParams, targetDBList));
+                .toJSONString(buildMetaForTable(schemaName, tableName, extendParams, targetDBList, tableMetaRecords));
         } else {
             return null;
         }
@@ -538,7 +777,8 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
 
     private MetaInfo buildMetaForTable(String schemaName, String tableName,
                                        Map<String, Object> extendParams,
-                                       List<TargetDB> assignedTargetDBList)
+                                       List<TargetDB> assignedTargetDBList,
+                                       Pair<String, TablesExtInfo> tableMetaRecords)
         throws SQLException {
         MetaInfo metaInfo = new MetaInfo();
 
@@ -546,12 +786,14 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
             List<TargetDB> targetDbList = !assignedTargetDBList.isEmpty() ? assignedTargetDBList :
                 getTargetDBs(schemaName, tableName, extendParams);
             metaInfo.logicTableMeta =
-                MetaBuilder.buildLogicTableMeta(TableMode.SHARDING, schemaName, tableName, targetDbList);
+                MetaBuilder.buildLogicTableMeta(TableMode.SHARDING, schemaName, tableName, targetDbList,
+                    tableMetaRecords);
         } else {
             List<TargetDB> targetDbList = !assignedTargetDBList.isEmpty() ? assignedTargetDBList :
                 getTargetDBs(schemaName, tableName, extendParams);
             metaInfo.logicTableMeta =
-                MetaBuilder.buildLogicTableMeta(TableMode.PARTITION, schemaName, tableName, targetDbList);
+                MetaBuilder.buildLogicTableMeta(TableMode.PARTITION, schemaName, tableName, targetDbList,
+                    tableMetaRecords);
         }
 
         if (extendParams.containsKey(ICdcManager.TABLE_NEW_NAME)) {
@@ -639,7 +881,7 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         }
     }
 
-    private void checkStorageChange() throws SQLException {
+    private void checkStorageChange() throws Exception {
         // 系统启动的时候，会对cdc db进行初始化，但不排除出现一些异常情况导致cdc db不复存在，所以此处增加判断
         if (!isCdcDbExist()) {
             logger.warn("cdc db is not exist, please check the reason.");
@@ -693,20 +935,21 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
                 logger.warn("acquire cdc db lock for processing storage added.");
             } catch (Throwable ex) {
                 throw new TddlRuntimeException(com.alibaba.polardbx.common.exception.code.ErrorCode.ERR_GMS_GENERIC, ex,
-                    "Get metaDb lock timeout during update cdc group info, please retry");
+                    "get metaDb lock timeout during update cdc group info, please retry");
             }
 
-            PolarxCommandRecord commandParameter = new PolarxCommandRecord();
+            BinlogCommandRecord commandParameter = new BinlogCommandRecord();
             commandParameter.cmdId = UUID.randomUUID().toString();
             commandParameter.cmdType = ADD_STORAGE.getValue();
-            commandParameter.cmdStatus = COMMAND_STATUS_INITIAL;
+            commandParameter.cmdStatus = INITIAL.getValue();
             commandParameter.cmdRequest = JSONObject.toJSONString(storageInstIdListAdded);
 
             List<String> actualProcessedInsts = doAdd(commandParameter, storageInstIdListAdded);
             if (!actualProcessedInsts.isEmpty()) {
-                PolarxCommandRecord commandRecord =
+                BinlogCommandRecord commandRecord =
                     getBinlogCommandRecordByTypeAndCmdId(commandParameter.cmdType, commandParameter.cmdId);
                 sendStorageChangeInstruction(commandRecord, Sets.newHashSet());
+                notifyCommandSuccess(commandRecord.id);
             }
 
             releaseCdcDbLockByCommit(metaDbLockConn);
@@ -716,7 +959,7 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         }
     }
 
-    private List<String> doAdd(PolarxCommandRecord commandParameter, List<String> storageInstIdListAdded) {
+    private List<String> doAdd(BinlogCommandRecord commandParameter, List<String> storageInstIdListAdded) {
         String dbName = CDC_DB_NAME;
         String instId = InstIdUtil.getInstId();
         storageInstIdListAdded = storageInstIdListAdded.stream().sorted().collect(Collectors.toList());
@@ -783,7 +1026,7 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
                             metaDbConn);
                 }
 
-                PolarxCommandAccessor commandAccessor = new PolarxCommandAccessor();
+                BinlogCommandAccessor commandAccessor = new BinlogCommandAccessor();
                 commandAccessor.setConnection(metaDbConn);
                 commandAccessor.insertIgnoreBinlogCommandRecord(commandParameter);
 
@@ -881,7 +1124,7 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         }
     }
 
-    private void sendStorageChangeInstruction(PolarxCommandRecord commandRecord, Set<String> excludeStorages)
+    private void sendStorageChangeInstruction(BinlogCommandRecord commandRecord, Set<String> excludeStorages)
         throws SQLException {
         try (Connection metaDbConn = MetaDbDataSource.getInstance().getConnection()) {
             GroupDetailInfoAccessor groupDetailInfoAccessor = new GroupDetailInfoAccessor();
@@ -898,13 +1141,11 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
             sendInstructionInternal(StorageInstChange, commandRecord.cmdId, JSONObject.toJSONString(entity));
             logger.warn("instruction is successfully send for command " + commandRecord);
         }
-
-        replyCommandRecord(commandRecord.id);
     }
 
-    private void processCommands() throws SQLException {
+    private void processCommands() throws Exception {
         // 对add storage进行recover
-        List<PolarxCommandRecord> addStorageCommands = getAddStorageCommandsInInitial();
+        List<BinlogCommandRecord> addStorageCommands = getAddStorageCommandsInInitial();
         if (!addStorageCommands.isEmpty()) {
             CdcDbLock.processInLock(() -> {
                 processAddStorageCommands(addStorageCommands);
@@ -912,26 +1153,30 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
             });
         }
 
-        //对remove storage进行处理(可能是首次操作，也可能是recover)
-        List<PolarxCommandRecord> removeStorageCommands = getRemoveStorageCommandsInInitial();
-        if (!removeStorageCommands.isEmpty()) {
-            MetaDbConfigManager.getInstance().sync(MetaDbDataIdBuilder.getDbTopologyDataId(CDC_DB_NAME));
-            CdcDbLock.processInLock(() -> {
-                processRemoveStorageCommands(removeStorageCommands);
-                return null;
-            });
+        List<BinlogCommandRecord> readyCommands = getRemoveStorageCommandsByStatus(READY.getValue());
+        if (readyCommands.size() > 1) {
+            throw new UnexpectedException("unexpected ready remove storage commands num: " + readyCommands.size());
+        }
+        if (!readyCommands.isEmpty()) {
+            processRemoveStorageCommands(readyCommands);
+        }
+
+        // 对remove storage进行处理(可能是首次操作，也可能是recover)
+        List<BinlogCommandRecord> initialCommands = getRemoveStorageCommandsByStatus(INITIAL.getValue());
+        if (!initialCommands.isEmpty()) {
+            processRemoveStorageCommands(initialCommands);
         }
     }
 
-    private void processAddStorageCommands(List<PolarxCommandRecord> addStorageCommands) {
+    private void processAddStorageCommands(List<BinlogCommandRecord> addStorageCommands) {
         try {
             //在对command进行恢复时，当前节点和生成command的节点可能是不同的，需要对cdc系统库元数据强制进行一次sync，保证一致性
             logger.warn("sync cdc topology info before process add storage commands.");
             MetaDbConfigManager.getInstance().sync(MetaDbDataIdBuilder.getDbTopologyDataId(CDC_DB_NAME));
 
-            for (PolarxCommandRecord c : addStorageCommands) {
+            for (BinlogCommandRecord c : addStorageCommands) {
                 logger.warn("recover for add_storage_command : " + c);
-                boolean flag = SysTableUtil.getInstance().isInstructionExists(StorageInstChange, c.cmdId);
+                boolean flag = CdcTableUtil.getInstance().isInstructionExists(StorageInstChange, c.cmdId);
                 if (!flag) {
                     logger.warn("instruction for add_storage_command " + c.cmdId + " is not found,"
                         + " will retry to send.");
@@ -939,7 +1184,7 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
                 } else {
                     logger.warn(
                         "instruction for add_storage_command " + c.cmdId + " has existed, will do reply.");
-                    replyCommandRecord(c.id);
+                    notifyCommandSuccess(c.id);
                 }
             }
         } catch (SQLException se) {
@@ -947,62 +1192,105 @@ public class CdcManager extends AbstractLifecycle implements ICdcManager {
         }
     }
 
-    private void processRemoveStorageCommands(List<PolarxCommandRecord> removeStorageCommands) {
+    private void processRemoveStorageCommands(List<BinlogCommandRecord> removeStorageCommands) {
         try {
             //在对command进行恢复时，当前节点和生成command的节点可能是不同的，需要对cdc系统库元数据强制进行一次sync，保证一致性
             logger.warn("sync cdc topology info before process remove storage commands.");
             MetaDbConfigManager.getInstance().sync(MetaDbDataIdBuilder.getDbTopologyDataId(CDC_DB_NAME));
 
-            for (PolarxCommandRecord c : removeStorageCommands) {
+            for (BinlogCommandRecord c : removeStorageCommands) {
                 logger.warn("start to process remove_storage_command :" + c);
-                boolean flag = SysTableUtil.getInstance().isInstructionExists(StorageInstChange, c.cmdId);
-                if (!flag) {
-                    logger.warn("instruction for remove_storage_command " + c.cmdId + " is not found, "
-                        + "will try to send.");
-                    StorageRemoveRequest removeRequest =
-                        JSONObject.parseObject(c.cmdRequest, StorageRemoveRequest.class);
-                    sendStorageChangeInstruction(c, removeRequest.getToRemoveStorageInstIds());
-                } else {
-                    logger.warn("instruction for remove_storage_command " + c.cmdId + " has existed, will do reply.");
-                    replyCommandRecord(c.id);
+                if (c.cmdStatus == INITIAL.getValue()) {
+                    boolean flag = CdcTableUtil.getInstance().isInstructionExists(StorageInstChange, c.cmdId);
+                    if (!flag) {
+                        logger.warn("instruction for remove_storage_command " + c.cmdId + " is not found, "
+                            + "will try to send.");
+                        StorageRemoveRequest removeRequest =
+                            JSONObject.parseObject(c.cmdRequest, StorageRemoveRequest.class);
+                        sendStorageChangeInstruction(c, removeRequest.getToRemoveStorageInstIds());
+
+                        notifyCommandReady(c.id);
+                    } else {
+                        logger.warn(
+                            "instruction for remove_storage_command " + c.cmdId + " has existed, will do reply.");
+                        notifyCommandReady(c.id);
+                    }
+
+                    waitCommandSuccess(c.id);
+                } else if (c.cmdStatus == READY.getValue()) {
+                    // fix #55184772 串行处理缩容任务
+                    waitCommandSuccess(c.id);
                 }
             }
-        } catch (SQLException se) {
+        } catch (Exception se) {
             throw new TddlNestableRuntimeException("error in processing remove storage command.", se);
         }
     }
 
-    private List<PolarxCommandRecord> getAddStorageCommandsInInitial() throws SQLException {
+    private List<BinlogCommandRecord> getAddStorageCommandsInInitial() throws SQLException {
         try (Connection connection = MetaDbDataSource.getInstance().getConnection()) {
-            PolarxCommandAccessor accessor = new PolarxCommandAccessor();
+            BinlogCommandAccessor accessor = new BinlogCommandAccessor();
             accessor.setConnection(connection);
-            return accessor.getBinlogCommandRecordByTypeAndStatus(ADD_STORAGE.getValue(), COMMAND_STATUS_INITIAL);
+            return accessor.getBinlogCommandRecordByTypeAndStatus(ADD_STORAGE.getValue(), INITIAL.getValue());
         }
     }
 
-    private List<PolarxCommandRecord> getRemoveStorageCommandsInInitial() throws SQLException {
+    private List<BinlogCommandRecord> getRemoveStorageCommandsByStatus(int status) throws SQLException {
         try (Connection connection = MetaDbDataSource.getInstance().getConnection()) {
-            PolarxCommandAccessor accessor = new PolarxCommandAccessor();
+            BinlogCommandAccessor accessor = new BinlogCommandAccessor();
             accessor.setConnection(connection);
-            return accessor.getBinlogCommandRecordByTypeAndStatus(REMOVE_STORAGE.getValue(), COMMAND_STATUS_INITIAL);
+            return accessor.getBinlogCommandRecordByTypeAndStatus(REMOVE_STORAGE.getValue(), status);
         }
     }
 
-    private PolarxCommandRecord getBinlogCommandRecordByTypeAndCmdId(String commandType, String commandId)
+    private BinlogCommandRecord getBinlogCommandRecordByTypeAndCmdId(String commandType, String commandId)
         throws SQLException {
         try (Connection connection = MetaDbDataSource.getInstance().getConnection()) {
-            PolarxCommandAccessor accessor = new PolarxCommandAccessor();
+            BinlogCommandAccessor accessor = new BinlogCommandAccessor();
             accessor.setConnection(connection);
-            List<PolarxCommandRecord> list = accessor.getBinlogCommandRecordByTypeAndCmdId(commandType, commandId);
+            List<BinlogCommandRecord> list = accessor.getBinlogCommandRecordByTypeAndCmdId(commandType, commandId);
             return list.isEmpty() ? null : list.get(0);
         }
     }
 
-    private void replyCommandRecord(Long primaryKey) throws SQLException {
-        try (Connection connection = MetaDbDataSource.getInstance().getConnection()) {
-            PolarxCommandAccessor accessor = new PolarxCommandAccessor();
-            accessor.setConnection(connection);
-            accessor.updateBinlogCommandStatusAndReply(COMMAND_STATUS_SUCCESS, "", primaryKey);
+    private void updateCommandStatusAndReply(Long primaryKey, int status, String reply) throws SQLException {
+        try (Connection conn = MetaDbDataSource.getInstance().getConnection()) {
+            BinlogCommandAccessor accessor = new BinlogCommandAccessor();
+            accessor.setConnection(conn);
+            accessor.updateBinlogCommandStatusAndReply(status, reply, primaryKey);
+        }
+    }
+
+    private void notifyCommandReady(Long primaryKey) throws SQLException {
+        updateCommandStatusAndReply(primaryKey, READY.getValue(), "");
+    }
+
+    private void notifyCommandSuccess(Long primaryKey) throws SQLException {
+        updateCommandStatusAndReply(primaryKey, SUCCESS.getValue(), "");
+    }
+
+    private void waitCommandSuccess(Long primaryKey) throws Exception {
+        try (Connection conn = MetaDbDataSource.getInstance().getConnection()) {
+            BinlogCommandAccessor accessor = new BinlogCommandAccessor();
+            accessor.setConnection(conn);
+
+            while (true) {
+                if (Thread.interrupted()) {
+                    throw new InterruptedException("thread is interrupted while waiting for command success!");
+                }
+
+                BinlogCommandRecord record = accessor.getBinlogCommandRecordById(primaryKey).get(0);
+                if (record.cmdStatus == READY.getValue()) {
+                    logger.warn("waiting for command status success...");
+                    Thread.sleep(1000);
+                } else if (record.cmdStatus == SUCCESS.getValue()) {
+                    logger.warn("command status become success, will stop wait.");
+                    break;
+                } else {
+                    logger.warn("unexpected command:" + record);
+                    throw new IllegalStateException("unexpected command status:" + record.cmdStatus);
+                }
+            }
         }
     }
 

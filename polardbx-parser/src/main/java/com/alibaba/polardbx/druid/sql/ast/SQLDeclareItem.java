@@ -23,17 +23,17 @@ import java.util.List;
 
 public class SQLDeclareItem extends SQLObjectImpl implements SQLObjectWithDataType, SQLReplaceable {
 
-    protected Type                  type;
+    protected Type type;
 
-    protected SQLName               name;
+    protected SQLName name;
 
-    protected SQLDataType           dataType;
+    protected SQLDataType dataType;
 
-    protected SQLExpr               value;
+    protected SQLExpr value;
 
     protected List<SQLTableElement> tableElementList = new ArrayList<SQLTableElement>();
 
-    protected transient SQLObject             resolvedObject;
+    protected transient SQLObject resolvedObject;
 
     public SQLDeclareItem() {
 
@@ -134,5 +134,38 @@ public class SQLDeclareItem extends SQLObjectImpl implements SQLObjectWithDataTy
 
     public void setResolvedObject(SQLObject resolvedObject) {
         this.resolvedObject = resolvedObject;
+    }
+
+    @Override
+    public SQLObject clone() {
+        SQLDeclareItem x = new SQLDeclareItem();
+        x.type = this.type;
+
+        if (this.name != null) {
+            x.name = this.name.clone();
+            x.name.setParent(x);
+        }
+
+        if (this.dataType != null) {
+            x.dataType = this.dataType.clone();
+            x.dataType.setParent(x);
+        }
+
+        if (this.value != null) {
+            x.value = this.value.clone();
+            x.value.setParent(x);
+        }
+
+        if (this.resolvedObject != null) {
+            x.resolvedObject = this.resolvedObject.clone();
+            x.resolvedObject.setParent(x);
+        }
+
+        for (SQLTableElement element : this.tableElementList) {
+            SQLTableElement newElement = element.clone();
+            x.tableElementList.add(newElement);
+        }
+
+        return x;
     }
 }

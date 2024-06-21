@@ -24,16 +24,17 @@ import com.alibaba.polardbx.executor.ddl.job.builder.DdlPhyPlanBuilder;
 import com.alibaba.polardbx.executor.ddl.job.builder.gsi.CreateGlobalIndexBuilder;
 import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
 import com.alibaba.polardbx.executor.ddl.job.factory.gsi.RepartitionJobFactory;
-import com.alibaba.polardbx.executor.ddl.job.task.basic.oss.CheckOSSArchiveUtil;
 import com.alibaba.polardbx.executor.ddl.job.validator.ddl.RepartitionValidator;
 import com.alibaba.polardbx.executor.ddl.newengine.job.DdlJob;
 import com.alibaba.polardbx.executor.ddl.newengine.job.TransientDdlJob;
 import com.alibaba.polardbx.executor.gms.util.AlterRepartitionUtils;
 import com.alibaba.polardbx.executor.gsi.GsiUtils;
 import com.alibaba.polardbx.executor.spi.IRepository;
+import com.alibaba.polardbx.executor.utils.DdlUtils;
 import com.alibaba.polardbx.gms.tablegroup.TableGroupConfig;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
 import com.alibaba.polardbx.optimizer.PlannerContext;
+import com.alibaba.polardbx.optimizer.archive.CheckOSSArchiveUtil;
 import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.planner.SqlConverter;
@@ -50,7 +51,6 @@ import org.apache.calcite.sql.SqlAlterTableRepartition;
 import org.apache.calcite.sql.SqlCreateTable;
 import org.apache.calcite.sql.SqlIndexDefinition;
 import org.apache.calcite.sql.SqlNode;
-import org.apache.calcite.sql.SqlPartition;
 import org.apache.calcite.sql.SqlPartitionBy;
 import org.apache.calcite.sql.SqlPartitionByHash;
 import org.apache.calcite.sql.SqlPartitionByList;
@@ -81,13 +81,18 @@ public class LogicalAlterTableRepartitionHandler extends LogicalCommonDdlHandler
             logicalAlterTableRepartition.getTableName());
 
         SqlAlterTableRepartition ast = (SqlAlterTableRepartition) logicalAlterTableRepartition.relDdl.sqlNode;
+
+        String schemaName = logicalDdlPlan.getSchemaName();
+        String tableName = logicalAlterTableRepartition.getTableName();
+        TableMeta tableMeta = executionContext.getSchemaManager(schemaName).getTable(tableName);
+
+        boolean repartitionGsi = false;
         if (ast.isAlignToTableGroup()) {
-            String schemaName = logicalDdlPlan.getSchemaName();
-            String tableName = logicalAlterTableRepartition.getTableName();
-            TableMeta tableMeta = executionContext.getSchemaManager(schemaName).getTable(tableName);
+            repartitionGsi = tableMeta.isGsi();
             String tableGroup = ast.getTableGroupName().getLastName();
             TableGroupInfoManager tgInfoManager = OptimizerContext.getContext(schemaName).getTableGroupInfoManager();
             TableGroupConfig tableGroupConfig = tgInfoManager.getTableGroupConfigByName(tableGroup);
+
             if (tableGroupConfig == null) {
                 throw new TddlRuntimeException(ErrorCode.ERR_TABLE_GROUP_NOT_EXISTS,
                     String.format("the tablegroup:[%s] is not exists", tableGroup));
@@ -96,16 +101,23 @@ public class LogicalAlterTableRepartitionHandler extends LogicalCommonDdlHandler
                 throw new TddlRuntimeException(ErrorCode.ERR_TABLE_GROUP_IS_EMPTY,
                     String.format("the tablegroup:[%s] is empty, it's not expected", tableGroup));
             }
-            String firstTbInTg = tableGroupConfig.getTables().get(0).getTableName();
+
+            String firstTbInTg = tableGroupConfig.getTables().get(0);
             TableMeta refTableMeta = executionContext.getSchemaManager(schemaName).getTable(firstTbInTg);
-            PartitionInfo refPartitionInfo = refTableMeta.getPartitionInfo();
-            SqlPartitionBy sqlPartitionBy = AlterRepartitionUtils.generateSqlPartitionBy(tableMeta, refPartitionInfo);
+
+            SqlPartitionBy sqlPartitionBy = AlterRepartitionUtils.generateSqlPartitionBy(tableName, tableGroup,
+                tableMeta.getPartitionInfo(), refTableMeta.getPartitionInfo());
+
             ast.setSqlPartition(sqlPartitionBy);
+
             SqlConverter sqlConverter = SqlConverter.getInstance(logicalDdlPlan.getSchemaName(), executionContext);
             PlannerContext plannerContext = PlannerContext.getPlannerContext(logicalDdlPlan.getCluster());
-            Map<SqlNode, RexNode> partRexInfoCtx = sqlConverter.getRexInfoFromPartition(sqlPartitionBy, plannerContext);
+
+            Map<SqlNode, RexNode> partRexInfoCtx = sqlConverter.convertPartition(sqlPartitionBy, plannerContext);
+
             ((AlterTableRepartition) (logicalDdlPlan.relDdl)).getAllRexExprInfo().putAll(partRexInfoCtx);
         }
+
         //validate
         RepartitionValidator.validate(
             ast.getSchemaName(),
@@ -126,11 +138,13 @@ public class LogicalAlterTableRepartitionHandler extends LogicalCommonDdlHandler
         // prepare data for local indexes
         logicalAlterTableRepartition.prepareLocalIndexData();
         RepartitionPrepareData repartitionPrepareData = logicalAlterTableRepartition.getRepartitionPrepareData();
+        repartitionPrepareData.setRepartitionGsi(repartitionGsi);
         globalIndexPreparedData.setRepartitionPrepareData(repartitionPrepareData);
 
         DdlPhyPlanBuilder builder = CreateGlobalIndexBuilder.create(
             logicalAlterTableRepartition.relDdl,
             globalIndexPreparedData,
+            null,
             executionContext).build();
 
         PhysicalPlanData physicalPlanData = builder.genPhysicalPlanData();
@@ -152,11 +166,18 @@ public class LogicalAlterTableRepartitionHandler extends LogicalCommonDdlHandler
             return new TransientDdlJob();
         }
 
+        final Long versionId = DdlUtils.generateVersionId(executionContext);
+        logicalAlterTableRepartition.setDdlVersionId(versionId);
+
+        // get foreign keys
+        logicalAlterTableRepartition.prepareForeignKeyData(tableMeta, ast);
+
         return new RepartitionJobFactory(
             globalIndexPreparedData,
             repartitionPrepareData,
             physicalPlanData,
-            executionContext
+            executionContext,
+            logicalAlterTableRepartition.getCluster()
         ).create();
     }
 
@@ -189,30 +210,8 @@ public class LogicalAlterTableRepartitionHandler extends LogicalCommonDdlHandler
         ast.getAlters().addAll(sqlAddIndexList);
     }
 
-    private SqlPartitionBy generateSqlPartitionBy(String schemaName, String tableName,
-                                                  PartitionInfo referPartitionInfo) {
-        SqlPartitionBy sqlPartitionBy;
-        switch (referPartitionInfo.getPartitionBy().getStrategy()) {
-        case HASH:
-            sqlPartitionBy = new SqlPartitionByHash(false, false, SqlParserPos.ZERO);
-            break;
-        case KEY:
-            sqlPartitionBy = new SqlPartitionByHash(true, false, SqlParserPos.ZERO);
-            break;
-        case RANGE:
-        case RANGE_COLUMNS:
-            sqlPartitionBy = new SqlPartitionByRange(SqlParserPos.ZERO);
-            break;
-        case LIST:
-        case LIST_COLUMNS:
-            sqlPartitionBy = new SqlPartitionByList(SqlParserPos.ZERO);
-            break;
-        }
-        return null;
-    }
-
     @Override
     protected boolean validatePlan(BaseDdlOperation logicalDdlPlan, ExecutionContext executionContext) {
-        return super.validatePlan(logicalDdlPlan, executionContext);
+        return false;
     }
 }

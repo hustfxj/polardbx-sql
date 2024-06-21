@@ -18,7 +18,11 @@ package com.alibaba.polardbx.qatest.protocol;
 
 import com.alibaba.polardbx.qatest.ReadBaseTestCase;
 import com.alibaba.polardbx.qatest.util.JdbcUtil;
+import com.google.common.collect.ImmutableList;
+import com.google.common.truth.Truth;
 import net.jcip.annotations.NotThreadSafe;
+import org.apache.calcite.util.Pair;
+import org.apache.commons.lang.StringUtils;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -89,6 +93,8 @@ public class XPlanTest extends ReadBaseTestCase {
 
     private static final String INSERT_TEMPLATE = "insert into {0} values "
         + "(1,101,1001,10001),(2,102,null,10002),(3,103,1003,null),(4,104,null,null),(5,105,1005,10005);";
+
+    private static final String ANALYZE_TEMPLATE = "analyze table {0}";
 
     private final String partition;
 
@@ -161,32 +167,41 @@ public class XPlanTest extends ReadBaseTestCase {
             MessageFormat.format(INSERT_TEMPLATE, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)));
         JdbcUtil.executeUpdateSuccess(mysqlConnection,
             MessageFormat.format(INSERT_TEMPLATE, quoteSpecialName(MULTI_KEY_TABLE_NAME)));
+
+        JdbcUtil.executeUpdateSuccess(mysqlConnection,
+            MessageFormat.format(ANALYZE_TEMPLATE, quoteSpecialName(PK_TABLE_NAME)));
+        JdbcUtil.executeUpdateSuccess(mysqlConnection,
+            MessageFormat.format(ANALYZE_TEMPLATE, quoteSpecialName(NO_PK_TABLE_NAME)));
+        JdbcUtil.executeUpdateSuccess(mysqlConnection,
+            MessageFormat.format(ANALYZE_TEMPLATE, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)));
+        JdbcUtil.executeUpdateSuccess(mysqlConnection,
+            MessageFormat.format(ANALYZE_TEMPLATE, quoteSpecialName(MULTI_KEY_TABLE_NAME)));
     }
 
-    private final static String[] simpleTestTemplates = {
-        "select * from {0} where pk = null",
-        "select * from {0} where pk <=> null",
-        "select * from {0} where pk is null",
-        "select * from {0} where pk = 1",
-        "select * from {0} where pk <=> 1",
+    private final static Pair<String, Boolean>[] simpleTestTemplates = new Pair[] {
+        new Pair<>("select * from {0} where pk = null", false), // null != null
+        new Pair<>("select * from {0} where pk <=> null", true), // null safe
+        new Pair<>("select * from {0} where pk is null", true), // fixed plan
+        new Pair<>("select * from {0} where pk = 1", true), // basic plan
+        new Pair<>("select * from {0} where pk <=> 1", true), // basic plan
 
-        "select * from {0} where x = null",
-        "select * from {0} where x <=> null",
-        "select * from {0} where x is null",
-        "select * from {0} where x = 101",
-        "select * from {0} where x <=> 101",
+        new Pair<>("select * from {0} where x = null", false),
+        new Pair<>("select * from {0} where x <=> null", true),
+        new Pair<>("select * from {0} where x is null", true),
+        new Pair<>("select * from {0} where x = 101", true),
+        new Pair<>("select * from {0} where x <=> 101", true),
 
-        "select * from {0} where y = null",
-        "select * from {0} where y <=> null",
-        "select * from {0} where y is null",
-        "select * from {0} where y = 1001",
-        "select * from {0} where y <=> 1001",
+        new Pair<>("select * from {0} where y = null", false),
+        new Pair<>("select * from {0} where y <=> null", true),
+        new Pair<>("select * from {0} where y is null", true),
+        new Pair<>("select * from {0} where y = 1001", true),
+        new Pair<>("select * from {0} where y <=> 1001", true),
 
-        "select * from {0} where z = null",
-        "select * from {0} where z <=> null",
-        "select * from {0} where z is null",
-        "select * from {0} where z = 1001",
-        "select * from {0} where z <=> 1001",
+        new Pair<>("select * from {0} where z = null", false),
+        new Pair<>("select * from {0} where z <=> null", true),
+        new Pair<>("select * from {0} where z is null", true),
+        new Pair<>("select * from {0} where z = 1001", true),
+        new Pair<>("select * from {0} where z <=> 1001", true),
     };
 
     @Test
@@ -194,7 +209,8 @@ public class XPlanTest extends ReadBaseTestCase {
         if (usingNewPartDb()) {
             return;
         }
-        for (String sql : simpleTestTemplates) {
+        for (final Pair<String, Boolean> pair : simpleTestTemplates) {
+            final String sql = pair.left;
             selectContentSameAssert(MessageFormat.format(sql, quoteSpecialName(PK_TABLE_NAME)), null,
                 mysqlConnection, tddlConnection, true);
             selectContentSameAssert(MessageFormat.format(sql, quoteSpecialName(NO_PK_TABLE_NAME)), null,
@@ -222,39 +238,121 @@ public class XPlanTest extends ReadBaseTestCase {
         Thread.sleep(3000);
     }
 
-    private void assertX(String sql, boolean useX) {
+    private boolean explainExecuteXplan(String sql) {
+        final List<List<String>> res =
+            JdbcUtil.getAllStringResult(JdbcUtil.executeQuery("explain execute " + sql, tddlConnection), false,
+                ImmutableList.of());
+        boolean useXplan = (!StringUtils.isEmpty(res.get(0).get(11))) && res.get(0).get(11).contains("Using XPlan");
+        if (useXplan) {
+            Truth.assertThat(res.get(0).get(5)).contains(res.get(0).get(6));
+            Truth.assertThat(res.get(0).get(6)).isNotEmpty();
+            Truth.assertThat(Double.valueOf(res.get(0).get(10))).isAtMost(100D);
+            Truth.assertThat(Double.valueOf(res.get(0).get(10))).isAtLeast(0D);
+        }
+        return useXplan;
+    }
+
+    private boolean traceXplan(String sql) {
+        JdbcUtil.executeQuerySuccess(tddlConnection, "trace " + sql);
+        final List<List<String>> res =
+            JdbcUtil.getAllStringResult(JdbcUtil.executeQuery("show trace", tddlConnection), false, ImmutableList.of());
+        final String trace = res.get(0).get(11);
+        return trace.contains("/*PolarDB-X Connection*/") && trace.contains("plan_digest");
+    }
+
+    private void assertX(String sql, boolean genX, boolean useX) {
         final String exp = getExplainResult(tddlConnection, "/*+TDDL: cmd_extra(EXPLAIN_X_PLAN=true)*/" + sql);
-        final boolean actualX = exp.contains("XPlan=");
+        final boolean actualGenX = exp.contains("XPlan=");
         //System.out.println(exp);
-        Assert.assertTrue("Bad XPlan. " + exp, (useX && actualX) || (!useX && !actualX));
+        Assert.assertTrue("Bad XPlan. " + exp, genX == actualGenX);
+
+        // assert data ok when table scan enabled
+        selectContentSameAssert(sql, null, mysqlConnection, tddlConnection, true);
+
+        // test trace
+        JdbcUtil.executeQuerySuccess(tddlConnection, "trace " + sql);
+        final List<List<String>> res =
+            JdbcUtil.getAllStringResult(JdbcUtil.executeQuery("show trace", tddlConnection), false, ImmutableList.of());
+        final String trace = res.get(0).get(11);
+        final boolean actualUseX = trace.contains("/*PolarDB-X Connection*/") && trace.contains("plan_digest");
+
+        // some special case:
+        // 1. can use xplan if table_scan_plan
+        // 2. not go xplan if union
+        if (trace.contains(" UNION ALL ")) {
+            useX = false;
+        } else if (exp.contains("table_scan_plan") && sql.contains(" = null")) {
+            useX = true;
+        }
+
+        if (useX != actualUseX) {
+            System.out.println("----------------------------------------");
+            System.out.println(sql);
+            System.out.println(exp);
+            System.out.println(trace);
+            System.out.println("----------------------------------------");
+        }
+        Assert.assertTrue("Bad XPlan trace. " + sql + " trace: " + trace, useX == actualUseX);
+    }
+
+    private void assertExplainExecute(String sql) {
+        // check trace and explain execute
+        String hint = "/*+TDDL:cmd_extra(merge_union=false)*/ ";
+        Truth.assertWithMessage("Bad explain execute " + sql)
+            .that(explainExecuteXplan(sql))
+            .isEqualTo(traceXplan(sql));
+
+        Truth.assertWithMessage("Bad explain execute " + hint + sql)
+            .that(explainExecuteXplan(hint + sql))
+            .isEqualTo(traceXplan(hint + sql));
     }
 
     @Test
-    public void testExplain() throws Exception {
+    public void testExplainAndTrace() throws Exception {
         if (usingNewPartDb()) {
             return;
         }
         enableXPlanTableScan();
 
         try {
-            final boolean with_partition = partition.contains("dbpartition");
-
-            for (String sql : simpleTestTemplates) {
-                assertX(MessageFormat.format(sql, quoteSpecialName(PK_TABLE_NAME)), true);
-                assertX(MessageFormat.format(sql, quoteSpecialName(NO_PK_TABLE_NAME)), true);
-                assertX(MessageFormat.format(sql, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)), true);
-                assertX(MessageFormat.format(sql, quoteSpecialName(MULTI_KEY_TABLE_NAME)), true);
+            for (final Pair<String, Boolean> pair : simpleTestTemplates) {
+                final String sql = pair.left;
+                final boolean useX = pair.right;
+                assertX(MessageFormat.format(sql, quoteSpecialName(PK_TABLE_NAME)), true, useX);
+                assertX(MessageFormat.format(sql, quoteSpecialName(NO_PK_TABLE_NAME)), true, useX);
+                assertX(MessageFormat.format(sql, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)), true, useX);
+                assertX(MessageFormat.format(sql, quoteSpecialName(MULTI_KEY_TABLE_NAME)), true, useX);
             }
 
             // Again for cache.
-            for (String sql : simpleTestTemplates) {
-                assertX(MessageFormat.format(sql, quoteSpecialName(PK_TABLE_NAME)), true);
-                assertX(MessageFormat.format(sql, quoteSpecialName(NO_PK_TABLE_NAME)), true);
-                assertX(MessageFormat.format(sql, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)), true);
-                assertX(MessageFormat.format(sql, quoteSpecialName(MULTI_KEY_TABLE_NAME)), true);
+            for (final Pair<String, Boolean> pair : simpleTestTemplates) {
+                final String sql = pair.left;
+                final boolean useX = pair.right;
+                assertX(MessageFormat.format(sql, quoteSpecialName(PK_TABLE_NAME)), true, useX);
+                assertX(MessageFormat.format(sql, quoteSpecialName(NO_PK_TABLE_NAME)), true, useX);
+                assertX(MessageFormat.format(sql, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)), true, useX);
+                assertX(MessageFormat.format(sql, quoteSpecialName(MULTI_KEY_TABLE_NAME)), true, useX);
             }
         } finally {
             disableXPlanTableScan();
+        }
+
+        JdbcUtil.executeQuerySuccess(tddlConnection, "clear plancache");
+        for (final Pair<String, Boolean> pair : simpleTestTemplates) {
+            final String sql = pair.left;
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(PK_TABLE_NAME)));
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(NO_PK_TABLE_NAME)));
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)));
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(MULTI_KEY_TABLE_NAME)));
+        }
+
+        // Again for cache.
+        for (final Pair<String, Boolean> pair : simpleTestTemplates) {
+            final String sql = pair.left;
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(PK_TABLE_NAME)));
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(NO_PK_TABLE_NAME)));
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(COMPOSITE_PK_TABLE_NAME)));
+            assertExplainExecute(MessageFormat.format(sql, quoteSpecialName(MULTI_KEY_TABLE_NAME)));
         }
     }
 

@@ -5,6 +5,12 @@ import com.alibaba.polardbx.qatest.util.JdbcUtil;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+import static com.google.common.truth.Truth.assertThat;
+
 public class AlterTableWithGsiTest extends BaseAutoPartitionNewPartition {
 
     private String tableName = "wumu";
@@ -37,9 +43,19 @@ public class AlterTableWithGsiTest extends BaseAutoPartitionNewPartition {
         sql = String.format("alter table %s convert to character set utf8 collate utf8_bin", primaryTable);
         JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
         Assert.assertTrue(showCreateTable(tddlConnection, primaryTable).contains("utf8"));
-        Assert.assertTrue(showCreateTable(tddlConnection, indexTable).contains("utf8_bin"));
+        String indexTable0 = showCreateTable(tddlConnection, indexTable);
+        if (isMySQL80()) {
+            indexTable0 = indexTable0.replace("utf8mb3_bin", "utf8_bin");
+        }
+        System.out.println(indexTable0);
+        Assert.assertTrue(indexTable0.contains("utf8_bin"));
         Assert.assertTrue(showCreateTable(tddlConnection, primaryTable).contains("utf8"));
-        Assert.assertTrue(showCreateTable(tddlConnection, indexTable).contains("utf8_bin"));
+        String indexTable1 = showCreateTable(tddlConnection, indexTable);
+        if (isMySQL80()) {
+            indexTable1 = indexTable1.replace("utf8mb3_bin", "utf8_bin");
+        }
+        System.out.println(indexTable1);
+        Assert.assertTrue(indexTable1.contains("utf8_bin"));
 
         sql = String.format("alter table %s convert to character set utf8 collate utf8_general_cixx", primaryTable);
         JdbcUtil.executeUpdateFailed(tddlConnection, sql, "unknown collate name 'utf8_general_cixx'");
@@ -100,5 +116,61 @@ public class AlterTableWithGsiTest extends BaseAutoPartitionNewPartition {
         JdbcUtil.executeUpdateFailed(tddlConnection, sql, "not supported yet");
 
         dropTableIfExists(primaryTable);
+    }
+
+    @Test
+    public void testAddIndexFailed() {
+        final String primaryTable = tableName + "_4";
+
+        dropTableIfExists(primaryTable);
+        String sql = String.format(HINT_CREATE_GSI
+                + "create table "
+                + createOption
+                + "%s(a int primary key auto_increment,b varchar(30), c varchar(30), d varchar(30), e varchar(30)"
+                + ") partition by hash(b)",
+            primaryTable);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
+
+        sql = String.format("alter table %s add global index `n`(a) partition by key(a)", primaryTable);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
+
+        sql = String.format("alter table %s add index `N`(a)", primaryTable);
+        JdbcUtil.executeUpdateFailed(tddlConnection, sql, "Duplicated index name");
+
+        dropTableIfExists(primaryTable);
+    }
+
+    @Test
+    public void testAddUniqueIndexSuccess() {
+        final String primaryTable = tableName + "_5";
+
+        dropTableIfExists(primaryTable);
+        String sql = String.format(HINT_CREATE_GSI
+                + "create table "
+                + createOption
+                + "%s(a int primary key auto_increment,b varchar(30), c varchar(30), d varchar(30), e varchar(30)"
+                + ") partition by hash(b)",
+            primaryTable);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
+
+        sql = String.format("alter table %s add unique global index `1e1`(a,b,c) partition by key(a)", primaryTable);
+        JdbcUtil.executeUpdateSuccess(tddlConnection, sql);
+
+        dropTableIfExists(primaryTable);
+    }
+
+    public String showCreateTable(Connection conn, String tbName) {
+        String sql = "show create table " + tbName;
+
+        ResultSet rs = JdbcUtil.executeQuerySuccess(conn, sql);
+        try {
+            assertThat(rs.next()).isTrue();
+            return rs.getString("Create Table");
+        } catch (SQLException e) {
+            logger.error(e.getMessage(), e);
+        } finally {
+            JdbcUtil.close(rs);
+        }
+        return null;
     }
 }

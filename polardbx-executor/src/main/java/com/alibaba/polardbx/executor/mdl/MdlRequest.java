@@ -16,8 +16,6 @@
 
 package com.alibaba.polardbx.executor.mdl;
 
-import com.alibaba.polardbx.executor.mpp.metadata.NotNull;
-import com.alibaba.polardbx.common.jdbc.BytesSql;
 import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.executor.mpp.metadata.NotNull;
 
@@ -81,6 +79,20 @@ public final class MdlRequest {
         return new MdlRequest(trxId,
             MdlKey.getTableKeyWithLowerTableName(dbName, tableName),
             MdlType.MDL_SHARED_WRITE,
+            MdlDuration.MDL_TRANSACTION,
+            traceId, sql, frontend);
+    }
+
+    /**
+     * only for ossLoadData , get MDL_EXCLUSIVE mdl ,
+     * downgrade to MDL_SHARED_WRITE later to prevent other ossLoadData
+     */
+    public static MdlRequest getTransactionalOssLoadDataMdlRequest(@NotNull Long trxId, @NotNull String dbName,
+                                                                   @NotNull String tableName, @NotNull String traceId,
+                                                                   @NotNull ByteString sql, @NotNull String frontend) {
+        return new MdlRequest(trxId,
+            MdlKey.getTableKeyWithLowerTableName(dbName, tableName),
+            MdlType.MDL_EXCLUSIVE,
             MdlDuration.MDL_TRANSACTION,
             traceId, sql, frontend);
     }

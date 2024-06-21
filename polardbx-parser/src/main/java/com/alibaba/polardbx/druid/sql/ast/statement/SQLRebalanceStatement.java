@@ -19,6 +19,7 @@ package com.alibaba.polardbx.druid.sql.ast.statement;
 import com.alibaba.polardbx.druid.DbType;
 import com.alibaba.polardbx.druid.sql.ast.SQLExpr;
 import com.alibaba.polardbx.druid.sql.ast.SQLStatementImpl;
+import com.alibaba.polardbx.druid.sql.ast.SqlType;
 import com.alibaba.polardbx.druid.sql.ast.expr.SQLIdentifierExpr;
 import com.alibaba.polardbx.druid.sql.visitor.SQLASTVisitor;
 
@@ -27,10 +28,11 @@ import java.util.List;
 
 public class SQLRebalanceStatement extends SQLStatementImpl {
 
-
     public enum RebalanceTarget {
         TABLE,
         TABLEGROUP,
+        TENANT_DB,
+        TENANT,
         DATABASE,
         CLUSTER
     }
@@ -41,17 +43,25 @@ public class SQLRebalanceStatement extends SQLStatementImpl {
     private boolean logicalDdl = false;
 
     public SQLRebalanceStatement() {
-        super (DbType.mysql);
+        super(DbType.mysql);
     }
 
     public void setRebalanceTable() {
         this.target = RebalanceTarget.TABLE;
     }
 
-    public void setRebalanceTableGroup(){
+    public void setRebalanceTableGroup() {
         this.target = RebalanceTarget.TABLEGROUP;
     }
-    
+
+    public void setRebalanceTenant() {
+        this.target = RebalanceTarget.TENANT;
+    }
+
+    public void setRebalanceTenantDb() {
+        this.target = RebalanceTarget.TENANT_DB;
+    }
+
     public void setRebalanceDatabase() {
         this.target = RebalanceTarget.DATABASE;
     }
@@ -70,6 +80,14 @@ public class SQLRebalanceStatement extends SQLStatementImpl {
 
     public boolean isRebalanceCluster() {
         return this.target.equals(RebalanceTarget.CLUSTER);
+    }
+
+    public boolean isRebalanceTenant() {
+        return this.target.equals(RebalanceTarget.TENANT);
+    }
+
+    public boolean isRebalanceTenantDb() {
+        return this.target.equals(RebalanceTarget.TENANT_DB);
     }
 
     public boolean isRebalanceDatabase() {
@@ -125,6 +143,11 @@ public class SQLRebalanceStatement extends SQLStatementImpl {
             acceptChild(visitor, options);
         }
         visitor.endVisit(this);
+    }
+
+    @Override
+    public SqlType getSqlType() {
+        return null;
     }
 }
 

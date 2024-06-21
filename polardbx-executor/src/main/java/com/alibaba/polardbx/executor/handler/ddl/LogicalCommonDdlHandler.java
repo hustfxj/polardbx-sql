@@ -20,10 +20,34 @@ import com.alibaba.polardbx.common.ddl.newengine.DdlConstants;
 import com.alibaba.polardbx.common.ddl.newengine.DdlType;
 import com.alibaba.polardbx.common.exception.TddlNestableRuntimeException;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
+import com.alibaba.polardbx.common.utils.CaseInsensitive;
 import com.alibaba.polardbx.common.utils.Pair;
 import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.druid.DbType;
+import com.alibaba.polardbx.druid.sql.SQLUtils;
+import com.alibaba.polardbx.druid.sql.ast.SQLExpr;
+import com.alibaba.polardbx.druid.sql.ast.SQLName;
+import com.alibaba.polardbx.druid.sql.ast.SQLStatement;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLIdentifierExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLMethodInvokeExpr;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableAddConstraint;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableAddIndex;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableItem;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLAlterTableStatement;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLConstraint;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLConstraintImpl;
+import com.alibaba.polardbx.druid.sql.ast.statement.SQLTableElement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.MySqlKey;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.MySqlPrimaryKey;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.MySqlUnique;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.MysqlForeignKey;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlTableIndex;
+import com.alibaba.polardbx.druid.sql.parser.SQLParserUtils;
+import com.alibaba.polardbx.druid.sql.visitor.VisitorFeature;
+import com.alibaba.polardbx.druid.util.StringUtils;
 import com.alibaba.polardbx.executor.common.RecycleBin;
 import com.alibaba.polardbx.executor.common.RecycleBinManager;
 import com.alibaba.polardbx.executor.cursor.Cursor;
@@ -40,28 +64,53 @@ import com.alibaba.polardbx.executor.handler.HandlerCommon;
 import com.alibaba.polardbx.executor.spi.IRepository;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
+import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.DdlContext;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypes;
 import com.alibaba.polardbx.optimizer.core.rel.dal.PhyShow;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.BaseDdlOperation;
+import com.alibaba.polardbx.optimizer.core.rel.ddl.LogicalAlterTable;
+import com.alibaba.polardbx.optimizer.core.rel.ddl.LogicalCreateTable;
 import com.alibaba.polardbx.optimizer.core.row.Row;
 import com.alibaba.polardbx.optimizer.parse.FastsqlParser;
+import com.alibaba.polardbx.optimizer.parse.FastsqlUtils;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfo;
 import com.alibaba.polardbx.optimizer.partition.PartitionInfoManager;
-import com.alibaba.polardbx.optimizer.partition.PartitionLocation;
+import com.alibaba.polardbx.optimizer.partition.common.PartitionLocation;
 import com.alibaba.polardbx.optimizer.rule.TddlRuleManager;
+import com.alibaba.polardbx.optimizer.utils.ForeignKeyUtils;
 import com.alibaba.polardbx.optimizer.utils.RelUtils;
 import com.alibaba.polardbx.rule.model.TargetDB;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.sql.SqlAddForeignKey;
+import org.apache.calcite.sql.SqlAddPrimaryKey;
+import org.apache.calcite.sql.SqlAlterSpecification;
+import org.apache.calcite.sql.SqlAlterTable;
+import org.apache.calcite.sql.SqlChangeColumn;
+import org.apache.calcite.sql.SqlColumnDeclaration;
 import org.apache.calcite.sql.SqlCreateTable;
 import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlModifyColumn;
 import org.apache.calcite.sql.SqlShowCreateTable;
+import org.apache.calcite.sql.dialect.MysqlSqlDialect;
 import org.apache.calcite.sql.parser.SqlParserPos;
+import org.apache.calcite.sql.pretty.SqlPrettyWriter;
+import org.apache.calcite.util.EqualsContext;
+import org.apache.calcite.util.Litmus;
 import org.apache.commons.collections.CollectionUtils;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
+
+import static com.alibaba.polardbx.executor.ddl.job.task.cdc.CdcSqlUtils.SQL_PARSE_FEATURES;
+import static com.alibaba.polardbx.executor.handler.LogicalShowCreateTableHandler.reorgLogicalColumnOrder;
+import static com.alibaba.polardbx.executor.handler.ddl.LogicalCreateTableHandler.generateCreateTableSqlForLike;
+import static com.alibaba.polardbx.optimizer.sql.sql2rel.TddlSqlToRelConverter.unwrapGsiName;
 
 public abstract class LogicalCommonDdlHandler extends HandlerCommon {
 
@@ -77,6 +126,8 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
 
         initDdlContext(logicalDdlPlan, executionContext);
 
+        // Validate the plan on file storage first
+        TableValidator.validateTableEngine(logicalDdlPlan, executionContext);
         // Validate the plan first and then return immediately if needed.
         boolean returnImmediately = validatePlan(logicalDdlPlan, executionContext);
 
@@ -89,17 +140,21 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
         }
 
         // Build a specific DDL job by subclass.
-        DdlJob ddlJob = returnImmediately?
-            new TransientDdlJob():
+        DdlJob ddlJob = returnImmediately ?
+            new TransientDdlJob() :
             buildDdlJob(logicalDdlPlan, executionContext);
 
         // Validate the DDL job before request.
         validateJob(logicalDdlPlan, ddlJob, executionContext);
 
+        if (executionContext.getDdlContext().getExplain()) {
+            return buildExplainResultCursor(logicalDdlPlan, ddlJob, executionContext);
+        }
+
         // Handle the client DDL request on the worker side.
         handleDdlRequest(ddlJob, executionContext);
 
-        if (executionContext.getDdlContext().isSubJob()){
+        if (executionContext.getDdlContext().isSubJob()) {
             return buildSubJobResultCursor(ddlJob, executionContext);
         }
         return buildResultCursor(logicalDdlPlan, ddlJob, executionContext);
@@ -120,10 +175,20 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
         return new AffectRowCursor(new int[] {0});
     }
 
+    protected Cursor buildExplainResultCursor(BaseDdlOperation baseDdl, DdlJob ddlJob, ExecutionContext ec) {
+        ArrayResultCursor result = new ArrayResultCursor("Logical ExecutionPlan");
+        result.addColumn("Execution Plan", DataTypes.StringType);
+        result.initMeta();
+        for (String row : ddlJob.getExplainInfo()) {
+            result.addRow(new String[] {row});
+        }
+        return result;
+    }
+
     protected Cursor buildSubJobResultCursor(DdlJob ddlJob, ExecutionContext executionContext) {
         long taskId = executionContext.getDdlContext().getParentTaskId();
         long subJobId = executionContext.getDdlContext().getJobId();
-        if((ddlJob instanceof TransientDdlJob) && subJobId == 0L){
+        if ((ddlJob instanceof TransientDdlJob) && subJobId == 0L) {
             // -1 means no need to run
             subJobId = -1L;
         }
@@ -140,7 +205,6 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
      * @return Indicate if need to return immediately
      */
     protected boolean validatePlan(BaseDdlOperation logicalDdlPlan, ExecutionContext executionContext) {
-        TableValidator.validateTableEngine(logicalDdlPlan, executionContext);
         return false;
     }
 
@@ -151,7 +215,7 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
         CommonValidator.validateDdlJob(logicalDdlPlan.getSchemaName(), logicalDdlPlan.getTableName(), ddlJob, LOGGER,
             executionContext);
 
-        checkTaskName(ddlJob.createTaskIterator().getAllTasks());
+        checkTaskName(ddlJob.getAllTasks());
     }
 
     protected void initDdlContext(BaseDdlOperation logicalDdlPlan, ExecutionContext executionContext) {
@@ -167,6 +231,10 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
             DdlContext.create(schemaName, objectName, ddlType, executionContext);
 
         executionContext.setDdlContext(ddlContext);
+
+        ForeignKeyUtils.rewriteOriginSqlWithForeignKey(logicalDdlPlan, executionContext, schemaName, objectName);
+
+        rewriteOriginSqlToCdcMarkSql(logicalDdlPlan, executionContext, schemaName, objectName);
     }
 
     protected void handleDdlRequest(DdlJob ddlJob, ExecutionContext executionContext) {
@@ -174,7 +242,7 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
             return;
         }
         DdlContext ddlContext = executionContext.getDdlContext();
-        if (ddlContext.isSubJob()){
+        if (ddlContext.isSubJob()) {
             DdlEngineRequester.create(ddlJob, executionContext).executeSubJob(
                 ddlContext.getParentJobId(), ddlContext.getParentTaskId(), ddlContext.isForRollback());
         } else {
@@ -224,7 +292,8 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
         if (null != logicalDdlPlan.getTableNameNode()) {
             final PartitionInfo partitionInfo = partitionInfoManager.getPartitionInfo(phyTable);
             if (partitionInfo != null) {
-                PartitionLocation location = partitionInfo.getPartitionBy().getPartitions().get(0).getLocation();
+                PartitionLocation location =
+                    partitionInfo.getPartitionBy().getPhysicalPartitions().get(0).getLocation();
                 phyTable = location.getPhyTableName();
                 dbIndex = location.getGroupKey();
             }
@@ -250,9 +319,12 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
             Row row;
             if ((row = cursor.next()) != null) {
                 final String primaryTableDefinition = row.getString(1);
+                // reorder column
+                String sql = reorgLogicalColumnOrder(logicalDdlPlan.getSchemaName(), logicalDdlPlan.getTableName(),
+                    primaryTableDefinition);
                 final SqlCreateTable primaryTableNode =
-                    (SqlCreateTable) new FastsqlParser().parse(primaryTableDefinition, executionContext).get(0);
-                return new Pair<>(primaryTableDefinition, primaryTableNode);
+                    (SqlCreateTable) new FastsqlParser().parse(sql, executionContext).get(0);
+                return new Pair<>(sql, primaryTableNode);
             }
 
             return null;
@@ -271,4 +343,171 @@ public abstract class LogicalCommonDdlHandler extends HandlerCommon {
             recycleBin != null && !recycleBin.hasForeignConstraint(appName, tableName);
     }
 
+    // rewrite sql for cdc, @see com.alibaba.polardbx.cdc.ImplicitTableGroupUtil
+    // rewrite reason : adding a name for anonymous indexes, then we can add implicit table-group for the indexes
+    protected void rewriteOriginSqlToCdcMarkSql(BaseDdlOperation logicalDdlPlan, ExecutionContext ec,
+                                                String schemaName, String tableName) {
+        // some sql has no schema name.
+        // e.g. rebalance database policy='partition_balance'
+        if (StringUtils.isEmpty(logicalDdlPlan.getSchemaName())) {
+            return;
+        }
+
+        boolean isNewPartDb = DbInfoManager.getInstance().isNewPartitionDb(logicalDdlPlan.getSchemaName());
+
+        // only auto mode database support rewrite, because drds mode do not support table group and do not support using same GSI name in different table
+        // rewrite create like to actual create sql for adding implicit table group
+        // because target table`s table-group may be different from the base table`s table-group
+        if (logicalDdlPlan instanceof LogicalCreateTable) {
+            LogicalCreateTable logicalCreateTable = (LogicalCreateTable) logicalDdlPlan;
+            SqlCreateTable sqlCreateTable = (SqlCreateTable) logicalCreateTable.relDdl.sqlNode;
+            if (sqlCreateTable.getLikeTableName() != null) {
+                if (isNewPartDb) {
+                    final String sourceCreateTableSql = generateCreateTableSqlForLike(sqlCreateTable, ec);
+                    MySqlCreateTableStatement stmt =
+                        (MySqlCreateTableStatement) FastsqlUtils.parseSql(sourceCreateTableSql).get(0);
+                    stmt.getTableSource()
+                        .setSimpleName(SqlIdentifier.surroundWithBacktick(logicalCreateTable.getTableName()));
+                    ec.getDdlContext().setCdcRewriteDdlStmt(stmt.toString(VisitorFeature.OutputHashPartitionsByRange));
+                }
+                return;
+            }
+        }
+
+        String originSql = ec.getOriginSql();
+        final List<SQLStatement> statementList =
+            SQLParserUtils.createSQLStatementParser(originSql, DbType.mysql, SQL_PARSE_FEATURES).parseStatementList();
+        if (statementList.isEmpty()) {
+            return;
+        }
+
+        if (logicalDdlPlan.getDdlType() == DdlType.CREATE_TABLE &&
+            statementList.get(0) instanceof MySqlCreateTableStatement) {
+            // MySqlExplainStatement also  belongs to CREATE_TABLE
+            final MySqlCreateTableStatement stmt = (MySqlCreateTableStatement) statementList.get(0);
+
+            Set<String> indexNamesSet = new HashSet<>();
+            for (final SQLTableElement tableElement : stmt.getTableElementList()) {
+                if (tableElement instanceof SQLConstraintImpl) {
+                    final SQLConstraintImpl constraint = (SQLConstraintImpl) tableElement;
+                    final SQLName indexName = constraint.getName();
+                    if (indexName != null && indexName.getSimpleName() != null
+                        && !indexName.getSimpleName().isEmpty()) {
+                        indexNamesSet.add(indexName.getSimpleName());
+                    }
+                }
+            }
+
+            for (final SQLTableElement tableElement : stmt.getTableElementList()) {
+                if (tableElement instanceof SQLConstraintImpl) {
+                    final SQLConstraintImpl constraint = (SQLConstraintImpl) tableElement;
+
+                    // Assign name if no name.
+                    if (!(tableElement instanceof MySqlPrimaryKey) &&
+                        (null == constraint.getName() || constraint.getName().getSimpleName().isEmpty())) {
+                        String baseName = null;
+                        int prob = 0;
+                        if (tableElement instanceof MySqlKey) {
+                            baseName = ((MySqlKey) tableElement).getColumns().get(0).getExpr().toString();
+                        } else if (tableElement instanceof MySqlTableIndex) {
+                            SQLExpr expr = ((MySqlTableIndex) tableElement).getColumns().get(0).getExpr();
+                            if (expr instanceof SQLMethodInvokeExpr) {
+                                baseName = ((SQLMethodInvokeExpr) expr).getMethodName();
+                            } else {
+                                baseName = expr.toString();
+                            }
+                        }
+                        if (baseName != null) {
+                            baseName = SQLUtils.normalizeNoTrim(baseName);
+                            if (!indexNamesSet.contains(baseName)) {
+                                constraint.setName(baseName);
+                                indexNamesSet.add(baseName);
+                            } else {
+                                prob = 2;
+                                baseName = baseName + "_";
+                                while (indexNamesSet.contains(baseName + prob)) {
+                                    ++prob;
+                                }
+                                constraint.setName(baseName + prob);
+                                indexNamesSet.add(baseName + prob);
+                            }
+                        } else {
+                            if (tableElement instanceof MysqlForeignKey) {
+                                baseName = tableName.toLowerCase() + "_ibfk_";
+                                prob++;
+                            } else {
+                                baseName = "i_";
+                            }
+                            while (indexNamesSet.contains(baseName + prob)) {
+                                ++prob;
+                            }
+                            constraint.setName(baseName + prob);
+                            indexNamesSet.add(baseName + prob);
+                        }
+                    }
+                }
+            }
+            ec.getDdlContext().setCdcRewriteDdlStmt(stmt.toString(VisitorFeature.OutputHashPartitionsByRange));
+        } else if (logicalDdlPlan.getDdlType() == DdlType.ALTER_TABLE &&
+            statementList.get(0) instanceof SQLAlterTableStatement) {
+            final SQLAlterTableStatement stmt = (SQLAlterTableStatement) statementList.get(0);
+
+            final Set<String> existsNames = new TreeSet<>(CaseInsensitive.CASE_INSENSITIVE_ORDER);
+            TableMeta tableMeta = OptimizerContext.getContext(schemaName).getLatestSchemaManager().getTable(tableName);
+            tableMeta.getSecondaryIndexes().forEach(meta -> existsNames.add(meta.getPhysicalIndexName()));
+            if (tableMeta.getGsiTableMetaBean() != null && tableMeta.getGsiTableMetaBean().indexMap != null) {
+                tableMeta.getGsiTableMetaBean().indexMap.forEach((k, v) -> existsNames.add(unwrapGsiName(k)));
+            }
+
+            for (final SQLAlterTableItem item : stmt.getItems()) {
+                if (item instanceof SQLAlterTableAddIndex) {
+                    SQLName indexName = ((SQLAlterTableAddIndex) item).getName();
+
+                    if (null == indexName || null == indexName.getSimpleName() || indexName.getSimpleName().isEmpty()) {
+                        String realName;
+                        String baseName = ((SQLAlterTableAddIndex) item).getColumns().get(0).getExpr().toString();
+                        baseName = SQLUtils.normalizeNoTrim(baseName);
+                        if (!existsNames.contains(baseName)) {
+                            realName = baseName;
+                            existsNames.add(realName);
+                        } else {
+                            baseName = baseName + "_";
+                            int prob = 2;
+                            while (existsNames.contains(baseName + prob)) {
+                                ++prob;
+                            }
+                            realName = baseName + prob;
+                            existsNames.add(realName);
+                        }
+                        ((SQLAlterTableAddIndex) item).setName(new SQLIdentifierExpr(realName));
+                    }
+                } else if (item instanceof SQLAlterTableAddConstraint) {
+                    SQLConstraint constraint = ((SQLAlterTableAddConstraint) item).getConstraint();
+                    SQLName indexName = constraint.getName();
+
+                    if (constraint instanceof MySqlUnique && (null == indexName || null == indexName.getSimpleName()
+                        || indexName.getSimpleName().isEmpty())) {
+                        String realName;
+                        String baseName = ((MySqlUnique) ((SQLAlterTableAddConstraint) item).getConstraint())
+                            .getIndexDefinition().getColumns().get(0).getExpr().toString();
+                        baseName = SQLUtils.normalizeNoTrim(baseName);
+
+                        if (!existsNames.contains(baseName)) {
+                            realName = baseName;
+                        } else {
+                            baseName = baseName + "_";
+                            int prob = 2;
+                            while (existsNames.contains(baseName + prob)) {
+                                ++prob;
+                            }
+                            realName = baseName + prob;
+                            existsNames.add(realName);
+                        }
+                        ((SQLAlterTableAddConstraint) item).getConstraint().setName(new SQLIdentifierExpr(realName));
+                    }
+                }
+            }
+            ec.getDdlContext().setCdcRewriteDdlStmt(stmt.toString(VisitorFeature.OutputHashPartitionsByRange));
+        }
+    }
 }

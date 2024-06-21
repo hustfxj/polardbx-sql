@@ -27,6 +27,7 @@ import com.alibaba.polardbx.gms.metadb.GmsSystemTables;
 import com.alibaba.polardbx.gms.metadb.accessor.AbstractAccessor;
 import com.alibaba.polardbx.gms.util.DdlMetaLogUtil;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
+import com.alibaba.polardbx.gms.util.TableGroupNameUtil;
 
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -47,9 +48,9 @@ import java.util.stream.IntStream;
 public class TableGroupAccessor extends AbstractAccessor {
     private static final Logger LOGGER = LoggerFactory.getLogger(TableGroupAccessor.class);
     private static final String ALL_COLUMNS =
-        "`id`,`gmt_create`,`gmt_modified`,`schema_name`,`tg_name`,`locality`, `primary_zone`,`inited`,`meta_version`, `manual_create`, `tg_type`, `auto_split_policy`";
+        "`id`,`gmt_create`,`gmt_modified`,`schema_name`,`tg_name`,`locality`, `primary_zone`,`inited`,`meta_version`, `manual_create`, `tg_type`, `auto_split_policy`, `partition_definition`";
 
-    private static final String ALL_VALUES = "(null,null,now(),?,?,?,?,?,?,?,?,?)";
+    private static final String ALL_VALUES = "(null,null,now(),?,?,?,?,?,?,?,?,?,?)";
 
     private static final String INSERT_IGNORE_TABLE_GROUP =
         "insert ignore into " + GmsSystemTables.TABLE_GROUP + " (" + ALL_COLUMNS + ") VALUES " + ALL_VALUES;
@@ -60,6 +61,8 @@ public class TableGroupAccessor extends AbstractAccessor {
     private static final String UPDATE_GROUP_LOCALITY_BY_SCHEMA_GROUP_NAME =
         "update " + GmsSystemTables.TABLE_GROUP + " set locality = ? where schema_name = ? and tg_name = ?";
 
+    private static final String UPDATE_GROUP_LOCALITY_BY_ID =
+        "update " + GmsSystemTables.TABLE_GROUP + " set locality = ? where id = ?";
     private static final String GET_TABLE_GROUP_BY_ID =
         "select " + ALL_COLUMNS + " from " + GmsSystemTables.TABLE_GROUP + " where id=?";
 
@@ -125,6 +128,7 @@ public class TableGroupAccessor extends AbstractAccessor {
             String sql =
                 forUpdate ? GET_TABLE_GROUP_BY_SCHEMA_GROUP_NAME_FOR_UPDATE : GET_TABLE_GROUP_BY_SCHEMA_GROUP_NAME;
 
+            DdlMetaLogUtil.logSql(sql, params);
             records =
                 MetaDbUtil.query(sql, params, TableGroupRecord.class, connection);
 
@@ -160,6 +164,15 @@ public class TableGroupAccessor extends AbstractAccessor {
             Map<Integer, ParameterContext> params = new HashMap<>();
 
             int i = 1;
+            boolean isBroadCast = tableGroupRecord.getTg_name() != null && tableGroupRecord.tg_name.equalsIgnoreCase(
+                TableGroupNameUtil.BROADCAST_TG_NAME_TEMPLATE);
+            boolean isDefaultSinle = tableGroupRecord.getTg_name() != null && tableGroupRecord.tg_name.equalsIgnoreCase(
+                TableGroupNameUtil.SINGLE_DEFAULT_TG_NAME_TEMPLATE);
+            if (isBroadCast) {
+                tableGroupRecord.tg_type = tableGroupRecord.TG_TYPE_BROADCAST_TBL_TG;
+            } else if (isDefaultSinle) {
+                tableGroupRecord.tg_type = tableGroupRecord.TG_TYPE_DEFAULT_SINGLE_TBL_TG;
+            }
             MetaDbUtil.setParameter(i++, params, ParameterMethod.setString, tableGroupRecord.schema);
             MetaDbUtil.setParameter(i++, params, ParameterMethod.setString, tableGroupRecord.tg_name);
             MetaDbUtil.setParameter(i++, params, ParameterMethod.setString, tableGroupRecord.locality);
@@ -169,11 +182,12 @@ public class TableGroupAccessor extends AbstractAccessor {
             MetaDbUtil.setParameter(i++, params, ParameterMethod.setInt, tableGroupRecord.manual_create);
             MetaDbUtil.setParameter(i++, params, ParameterMethod.setInt, tableGroupRecord.tg_type);
             MetaDbUtil.setParameter(i++, params, ParameterMethod.setInt, tableGroupRecord.auto_split_policy);
+            MetaDbUtil.setParameter(i++, params, ParameterMethod.setString, tableGroupRecord.partition_definition);
 
             paramsBatch.add(params);
             DdlMetaLogUtil.logSql(INSERT_IGNORE_TABLE_GROUP, params);
 
-            return MetaDbUtil.insertAndRetureLastInsertId(INSERT_IGNORE_TABLE_GROUP, paramsBatch, this.connection);
+            return MetaDbUtil.insertAndReturnLastInsertId(INSERT_IGNORE_TABLE_GROUP, paramsBatch, this.connection);
         } catch (Exception e) {
             LOGGER.error("Failed to insert into the system table " + GmsSystemTables.TABLE_GROUP, e);
             throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e,
@@ -192,6 +206,24 @@ public class TableGroupAccessor extends AbstractAccessor {
             DdlMetaLogUtil.logSql(UPDATE_GROUP_LOCALITY_BY_SCHEMA_GROUP_NAME, params);
 
             MetaDbUtil.update(UPDATE_GROUP_LOCALITY_BY_SCHEMA_GROUP_NAME, params, connection);
+            return;
+        } catch (Exception e) {
+            LOGGER.error("Failed to update the system table 'table_group'", e);
+            throw new TddlRuntimeException(ErrorCode.ERR_GMS_ACCESS_TO_SYSTEM_TABLE, e,
+                e.getMessage());
+        }
+    }
+
+    public void updateTableGroupLocalityById(Long groupId, String locality) {
+        try {
+
+            Map<Integer, ParameterContext> params = new HashMap<>();
+            MetaDbUtil.setParameter(1, params, ParameterMethod.setString, locality);
+            MetaDbUtil.setParameter(2, params, ParameterMethod.setLong, groupId);
+
+            DdlMetaLogUtil.logSql(UPDATE_GROUP_LOCALITY_BY_ID, params);
+
+            MetaDbUtil.update(UPDATE_GROUP_LOCALITY_BY_ID, params, connection);
             return;
         } catch (Exception e) {
             LOGGER.error("Failed to update the system table 'table_group'", e);

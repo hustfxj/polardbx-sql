@@ -16,6 +16,7 @@
 
 package com.alibaba.polardbx.common.utils;
 
+import com.alibaba.polardbx.common.properties.DynamicConfig;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang.math.NumberUtils;
 
@@ -25,7 +26,11 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 
 public class TStringUtil extends StringUtils {
@@ -685,13 +690,22 @@ public class TStringUtil extends StringUtils {
         return str;
     }
 
+    /**
+     * used for result set encoding
+     */
     public static String javaEncoding(String encoding) {
         if (encoding.equalsIgnoreCase("utf8mb4")) {
             return "utf8";
         } else if (encoding.equalsIgnoreCase("binary")) {
-            return "iso_8859_1";
+            if (DynamicConfig.getInstance().isCompatibleCharsetVariables()) {
+                // compatible with MySQL's behavior
+                // resultSet encoding is binary, which means no conversion
+                return "utf8";
+            } else {
+                // compatible with the old behavior
+                return "iso_8859_1";
+            }
         }
-
         return encoding;
     }
 
@@ -826,6 +840,10 @@ public class TStringUtil extends StringUtils {
 
         }
         return strings1;
+    }
+
+    public static String concatTableName(String schema, String table) {
+        return backQuote(schema) + "." + backQuote(table);
     }
 
 }

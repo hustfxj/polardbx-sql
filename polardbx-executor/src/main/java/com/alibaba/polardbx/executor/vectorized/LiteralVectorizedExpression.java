@@ -16,6 +16,11 @@
 
 package com.alibaba.polardbx.executor.vectorized;
 
+import com.alibaba.polardbx.common.type.MySQLStandardFieldType;
+import com.alibaba.polardbx.executor.chunk.Block;
+import com.alibaba.polardbx.executor.chunk.BlockUtils;
+import com.alibaba.polardbx.executor.chunk.IntegerBlock;
+import com.alibaba.polardbx.executor.chunk.LongBlock;
 import com.alibaba.polardbx.executor.chunk.MutableChunk;
 import com.alibaba.polardbx.executor.chunk.RandomAccessBlock;
 import com.alibaba.polardbx.optimizer.config.table.Field;
@@ -33,6 +38,9 @@ public class LiteralVectorizedExpression extends AbstractVectorizedExpression im
     private final Object value;
     private final Object convertedValue;
 
+    // for constant fold
+    private VectorizedExpression folded;
+
     public LiteralVectorizedExpression(DataType<?> dataType, Object value, int outputIndex) {
         super(dataType, outputIndex, new VectorizedExpression[0]);
         this.value = value;
@@ -48,14 +56,60 @@ public class LiteralVectorizedExpression extends AbstractVectorizedExpression im
     public void eval(EvaluationContext ctx) {
         MutableChunk chunk = ctx.getPreAllocatedChunk();
         RandomAccessBlock outputSlot = chunk.slotIn(outputIndex);
-
         int batchSize = chunk.batchSize();
+
+        // lazy allocation
+        if (outputSlot == null || ((Block) outputSlot).getPositionCount() == 0) {
+            int positionCount = batchSize;
+            if (chunk.isSelectionInUse()) {
+                positionCount = Math.max(positionCount, chunk.selection().length);
+            }
+            outputSlot = BlockUtils.createBlock(outputDataType, positionCount);
+            outputSlot.resize(positionCount);
+            chunk.setSlotAt(outputSlot, outputIndex);
+        }
 
         // if value is null, just update the valueIsNull array and hasNull field.
         if (value == null) {
             outputSlot.setHasNull(true);
             Arrays.fill(outputSlot.nulls(), true);
             return;
+        }
+
+        MySQLStandardFieldType fieldType = outputDataType.fieldType();
+        switch (fieldType) {
+        case MYSQL_TYPE_LONGLONG:
+            if (convertedValue instanceof Long && outputSlot instanceof LongBlock) {
+                long[] longArray = ((LongBlock) outputSlot).longArray();
+                long longVal = ((Long) convertedValue).longValue();
+                if (chunk.isSelectionInUse()) {
+                    int[] selection = chunk.selection();
+                    for (int i = 0; i < batchSize; i++) {
+                        longArray[selection[i]] = longVal;
+                    }
+                } else {
+                    Arrays.fill(longArray, longVal);
+                }
+                return;
+            }
+            break;
+        case MYSQL_TYPE_LONG:
+            if (convertedValue instanceof Integer && outputSlot instanceof IntegerBlock) {
+                int[] intArray = ((IntegerBlock) outputSlot).intArray();
+                int intVal = ((Integer) convertedValue).intValue();
+                if (chunk.isSelectionInUse()) {
+                    int[] selection = chunk.selection();
+                    for (int i = 0; i < batchSize; i++) {
+                        intArray[selection[i]] = intVal;
+                    }
+                } else {
+                    Arrays.fill(intArray, intVal);
+                }
+                return;
+            }
+            break;
+        default:
+            break;
         }
 
         if (chunk.isSelectionInUse()) {
@@ -82,5 +136,13 @@ public class LiteralVectorizedExpression extends AbstractVectorizedExpression im
     @Override
     public Object get() {
         return convertedValue;
+    }
+
+    public VectorizedExpression getFolded() {
+        return folded;
+    }
+
+    public void setFolded(VectorizedExpression folded) {
+        this.folded = folded;
     }
 }

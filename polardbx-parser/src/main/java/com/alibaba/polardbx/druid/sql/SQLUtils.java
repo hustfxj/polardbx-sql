@@ -48,12 +48,30 @@ import com.alibaba.polardbx.druid.sql.ast.statement.SQLTableSource;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLUnionQuery;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLUpdateSetItem;
 import com.alibaba.polardbx.druid.sql.ast.statement.SQLUpdateStatement;
+import com.alibaba.polardbx.druid.sql.ast.SQLCurrentTimeExpr;
+import com.alibaba.polardbx.druid.sql.ast.SQLDataType;
+import com.alibaba.polardbx.druid.sql.ast.SQLExpr;
+import com.alibaba.polardbx.druid.sql.ast.SQLLimit;
+import com.alibaba.polardbx.druid.sql.ast.SQLName;
+import com.alibaba.polardbx.druid.sql.ast.SQLObject;
+import com.alibaba.polardbx.druid.sql.ast.SQLReplaceable;
+import com.alibaba.polardbx.druid.sql.ast.SQLStatement;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLBinaryOpExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLBinaryOperator;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLCharExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLHexExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLIdentifierExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLInListExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLLiteralExpr;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLNullExpr;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.MySqlObject;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.clause.MySqlSelectIntoStatement;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.expr.MySqlUserName;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlInsertStatement;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.parser.MySqlExprParser;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.visitor.MySqlOutputVisitor;
 import com.alibaba.polardbx.druid.sql.dialect.mysql.visitor.MySqlSchemaStatVisitor;
+import com.alibaba.polardbx.druid.sql.parser.ByteString;
 import com.alibaba.polardbx.druid.sql.parser.Lexer;
 import com.alibaba.polardbx.druid.sql.parser.ParserException;
 import com.alibaba.polardbx.druid.sql.parser.SQLExprParser;
@@ -73,23 +91,29 @@ import com.alibaba.polardbx.druid.util.MySqlUtils;
 import com.alibaba.polardbx.druid.util.StringUtils;
 import com.alibaba.polardbx.druid.util.Utils;
 
+import java.sql.Types;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
 
+import static com.alibaba.polardbx.druid.util.FnvHash.fnv1a_64_lower;
+
 public class SQLUtils {
+    public final static SQLParserFeature[] parserFeatures = {
+        SQLParserFeature.EnableSQLBinaryOpExprGroup, SQLParserFeature.OptimizedForParameterized,
+        SQLParserFeature.TDDLHint, SQLParserFeature.EnableCurrentUserExpr, SQLParserFeature.DRDSAsyncDDL,
+        SQLParserFeature.DRDSBaseline, SQLParserFeature.DrdsMisc, SQLParserFeature.DrdsGSI, SQLParserFeature.DrdsCCL
+    };
     private final static SQLParserFeature[] FORMAT_DEFAULT_FEATURES = {
         SQLParserFeature.KeepComments,
         SQLParserFeature.EnableSQLBinaryOpExprGroup
     };
-
+    private final static Log LOG = LogFactory.getLog(SQLUtils.class);
     public static FormatOption DEFAULT_FORMAT_OPTION = new FormatOption(true, true);
     public static FormatOption DEFAULT_LCASE_FORMAT_OPTION
         = new FormatOption(false, true);
-
-    private final static Log LOG = LogFactory.getLog(SQLUtils.class);
 
     public static String toSQLString(SQLObject sqlObject, DbType dbType) {
         return toSQLString(sqlObject, dbType, null, null);
@@ -129,6 +153,10 @@ public class SQLUtils {
     }
 
     public static String toSQLString(SQLObject obj) {
+        return toSQLString(obj, false);
+    }
+
+    public static String toSQLString(SQLObject obj, boolean printIgnoreQuoteChars) {
         if (obj instanceof SQLStatement) {
             SQLStatement stmt = (SQLStatement) obj;
             return toSQLString(stmt, stmt.getDbType());
@@ -370,7 +398,6 @@ public class SQLUtils {
 
 
             return new MySqlOutputVisitor(out);
-
     }
 
     @Deprecated
@@ -406,7 +433,18 @@ public class SQLUtils {
         }
     }
 
+    public static List<SQLStatement> parseStatementsWithDefaultFeatures(String sql, DbType dbType) {
+        SQLStatementParser parser = SQLParserUtils.createSQLStatementParser(sql, dbType, parserFeatures);
+        List<SQLStatement> stmtList = new ArrayList<SQLStatement>();
+        parser.parseStatementList(stmtList, -1, null);
+        if (parser.getLexer().token() != Token.EOF) {
+            throw new ParserException("syntax error : " + sql);
+        }
+        return stmtList;
+    }
+
     public static List<SQLStatement> parseStatements(String sql, DbType dbType, SQLParserFeature... features) {
+        // using default parserFeatures
         SQLStatementParser parser = SQLParserUtils.createSQLStatementParser(sql, dbType, features);
         List<SQLStatement> stmtList = new ArrayList<SQLStatement>();
         parser.parseStatementList(stmtList, -1, null);
@@ -634,73 +672,6 @@ public class SQLUtils {
         SQLSelectItem selectItem = new SQLSelectItem(expr, alias);
         queryBlock.getSelectList().add(selectItem);
         selectItem.setParent(selectItem);
-    }
-
-    public static class FormatOption {
-        private int features = VisitorFeature.of(VisitorFeature.OutputUCase
-            , VisitorFeature.OutputPrettyFormat);
-
-        public FormatOption() {
-
-        }
-
-        public FormatOption(VisitorFeature... features) {
-            this.features = VisitorFeature.of(features);
-        }
-
-        public FormatOption(boolean ucase) {
-            this(ucase, true);
-        }
-
-        public FormatOption(boolean ucase, boolean prettyFormat) {
-            this(ucase, prettyFormat, false);
-        }
-
-        public FormatOption(boolean ucase, boolean prettyFormat, boolean parameterized) {
-            this.features = VisitorFeature.config(this.features, VisitorFeature.OutputUCase, ucase);
-            this.features = VisitorFeature.config(this.features, VisitorFeature.OutputPrettyFormat, prettyFormat);
-            this.features = VisitorFeature.config(this.features, VisitorFeature.OutputParameterized, parameterized);
-        }
-
-        public boolean isDesensitize() {
-            return isEnabled(VisitorFeature.OutputDesensitize);
-        }
-
-        public void setDesensitize(boolean val) {
-            config(VisitorFeature.OutputDesensitize, val);
-        }
-
-        public boolean isUppCase() {
-            return isEnabled(VisitorFeature.OutputUCase);
-        }
-
-        public void setUppCase(boolean val) {
-            config(VisitorFeature.OutputUCase, val);
-        }
-
-        public boolean isPrettyFormat() {
-            return isEnabled(VisitorFeature.OutputPrettyFormat);
-        }
-
-        public void setPrettyFormat(boolean prettyFormat) {
-            config(VisitorFeature.OutputPrettyFormat, prettyFormat);
-        }
-
-        public boolean isParameterized() {
-            return isEnabled(VisitorFeature.OutputParameterized);
-        }
-
-        public void setParameterized(boolean parameterized) {
-            config(VisitorFeature.OutputParameterized, parameterized);
-        }
-
-        public void config(VisitorFeature feature, boolean state) {
-            features = VisitorFeature.config(features, feature, state);
-        }
-
-        public final boolean isEnabled(VisitorFeature feature) {
-            return VisitorFeature.isEnabled(this.features, feature);
-        }
     }
 
     public static String refactor(String sql, DbType dbType, Map<String, String> tableMapping) {
@@ -1122,6 +1093,128 @@ public class SQLUtils {
         return insertLists;
     }
 
+    public static SQLPropertyExpr rewriteUdfName(SQLName name) {
+        return new SQLPropertyExpr("mysql", SQLUtils.normalize(name.getSimpleName()));
+    }
+
+    public static String getRewriteUdfName(SQLName name) {
+        return "mysql" + "." + name.getSimpleName().toLowerCase();
+    }
+
+    public static SQLName normalizeSqlName(SQLName name) {
+        if (name instanceof SQLIdentifierExpr) {
+            ((SQLIdentifierExpr) name).setName(normalize(name.getSimpleName()));
+        } else if (name instanceof SQLPropertyExpr) {
+            ((SQLPropertyExpr) name).setOwner(normalize(((SQLPropertyExpr) name).getOwnerName()));
+            ((SQLPropertyExpr) name).setName(normalize(name.getSimpleName()));
+        } else if (name instanceof MySqlUserName) {
+            ((MySqlUserName) name).setUserName(normalize(((MySqlUserName) name).getUserName()));
+            ((MySqlUserName) name).setHost(normalize(((MySqlUserName) name).getHost()));
+        }
+        return name;
+    }
+
+    public static boolean enclosedByBackTick(String str) {
+        return str != null && str.length() > 0 && str.charAt(0) == '`';
+    }
+
+    public static String encloseWithUnquote(String str) {
+        if (str == null) {
+            return null;
+        } else {
+            return "`" + normalize(str) + "`";
+        }
+    }
+
+    public static List<String> splitNamesByComma(String names) {
+        if (names == null) {
+            return null;
+        }
+        List<String> nameList = new ArrayList<>();
+        final MySqlExprParser exprParser = new MySqlExprParser(ByteString.from(names), false);
+        final Lexer lexer = exprParser.getLexer();
+        Token token = null;
+        for (; ; ) {
+            token = lexer.token();
+            if (token == Token.EOF) {
+                break;
+            }
+            // skip comma check
+            if (token == Token.IDENTIFIER) {
+                nameList.add(SQLUtils.normalizeNoTrim(lexer.stringVal()));
+            }
+            lexer.nextToken();
+        }
+        return nameList;
+    }
+
+    public static class FormatOption {
+        private int features = VisitorFeature.of(VisitorFeature.OutputUCase
+            , VisitorFeature.OutputPrettyFormat);
+
+        public FormatOption() {
+
+        }
+
+        public FormatOption(VisitorFeature... features) {
+            this.features = VisitorFeature.of(features);
+        }
+
+        public FormatOption(boolean ucase) {
+            this(ucase, true);
+        }
+
+        public FormatOption(boolean ucase, boolean prettyFormat) {
+            this(ucase, prettyFormat, false);
+        }
+
+        public FormatOption(boolean ucase, boolean prettyFormat, boolean parameterized) {
+            this.features = VisitorFeature.config(this.features, VisitorFeature.OutputUCase, ucase);
+            this.features = VisitorFeature.config(this.features, VisitorFeature.OutputPrettyFormat, prettyFormat);
+            this.features = VisitorFeature.config(this.features, VisitorFeature.OutputParameterized, parameterized);
+        }
+
+        public boolean isDesensitize() {
+            return isEnabled(VisitorFeature.OutputDesensitize);
+        }
+
+        public void setDesensitize(boolean val) {
+            config(VisitorFeature.OutputDesensitize, val);
+        }
+
+        public boolean isUppCase() {
+            return isEnabled(VisitorFeature.OutputUCase);
+        }
+
+        public void setUppCase(boolean val) {
+            config(VisitorFeature.OutputUCase, val);
+        }
+
+        public boolean isPrettyFormat() {
+            return isEnabled(VisitorFeature.OutputPrettyFormat);
+        }
+
+        public void setPrettyFormat(boolean prettyFormat) {
+            config(VisitorFeature.OutputPrettyFormat, prettyFormat);
+        }
+
+        public boolean isParameterized() {
+            return isEnabled(VisitorFeature.OutputParameterized);
+        }
+
+        public void setParameterized(boolean parameterized) {
+            config(VisitorFeature.OutputParameterized, parameterized);
+        }
+
+        public void config(VisitorFeature feature, boolean state) {
+            features = VisitorFeature.config(features, feature, state);
+        }
+
+        public final boolean isEnabled(VisitorFeature feature) {
+            return VisitorFeature.isEnabled(this.features, feature);
+        }
+    }
+
     static class TimeZoneVisitor extends SQLASTVisitorAdapter {
 
         private TimeZone from;
@@ -1144,29 +1237,60 @@ public class SQLUtils {
 
     }
 
-    public static boolean enclosedByBackTick(String str) {
-        return str != null && str.length() > 0 && str.charAt(0) == '`';
-    }
-
-    public static SQLPropertyExpr rewriteUdfName(SQLName name) {
-        return new SQLPropertyExpr("mysql", SQLUtils.normalize(name.getSimpleName()));
-    }
-
-    public static String getRewriteUdfName(SQLName name) {
-        return "mysql" + "." + name.getSimpleName().toLowerCase();
-    }
-
-    public static SQLName normalizeSqlName(SQLName name) {
-        if (name instanceof SQLIdentifierExpr) {
-            ((SQLIdentifierExpr) name).setName(normalize(name.getSimpleName()));
-        } else if (name instanceof SQLPropertyExpr) {
-            ((SQLPropertyExpr) name).setOwner(normalize(((SQLPropertyExpr) name).getOwnerName()));
-            ((SQLPropertyExpr) name).setName(normalize(name.getSimpleName()));
-        } else if (name instanceof MySqlUserName) {
-            ((MySqlUserName) name).setUserName(normalize(((MySqlUserName) name).getUserName()));
-            ((MySqlUserName) name).setHost(normalize(((MySqlUserName) name).getHost()));
+    public static SQLExpr toDefaultSQLExpr(SQLDataType dataType, String val, long flag) {
+        if ("NULL".equalsIgnoreCase(val) || val == null) {
+            return new SQLNullExpr();
         }
-        return name;
+        //return function
+        long hash_lower = fnv1a_64_lower(val);
+        if (hash_lower == FnvHash.Constants.CURRENT_TIME) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.CURRENT_TIME);
+        } else if (hash_lower == FnvHash.Constants.CURRENT_TIMESTAMP) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.CURRENT_TIMESTAMP);
+        } else if (hash_lower == FnvHash.Constants.CURRENT_DATE) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.CURRENT_DATE);
+        } else if (hash_lower == FnvHash.Constants.CURDATE) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.CURDATE);
+        } else if (hash_lower == FnvHash.Constants.LOCALTIME) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.LOCALTIME);
+        } else if (hash_lower == FnvHash.Constants.LOCALTIMESTAMP) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.LOCALTIMESTAMP);
+        } else if (hash_lower == FnvHash.Constants.UTC_DATE) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.UTC_DATE);
+        } else if (hash_lower == FnvHash.Constants.UTC_TIME) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.UTC_TIME);
+        } else if (hash_lower == FnvHash.Constants.UTC_TIMESTAMP) {
+            return new SQLCurrentTimeExpr(SQLCurrentTimeExpr.Type.UTC_TIMESTAMP);
+        }
+
+        int dbType = dataType.jdbcType();
+        switch (dbType) {
+        case Types.TINYINT:
+        case Types.SMALLINT:
+        case Types.INTEGER:
+        case Types.BIGINT:
+        case Types.DECIMAL:
+        case Types.FLOAT:
+        case Types.DOUBLE:
+        case Types.BOOLEAN:
+            return new SQLCharExpr(val, true);
+        case Types.DATE:
+        case Types.TIMESTAMP:
+        case Types.TIME:
+            return new SQLCharExpr(val);
+        case Types.VARBINARY:
+        case Types.LONGVARBINARY:
+        case Types.BINARY:
+        case Types.BIT:
+            if ((flag & 0x2) != 0) {
+                //ColumnsRecord.FLAG_BINARY_DEFAULT
+                return new SQLHexExpr(val);
+            } else {
+                return new SQLCharExpr(val);
+            }
+        default:
+            return new SQLCharExpr(val);
+        }
     }
 }
 

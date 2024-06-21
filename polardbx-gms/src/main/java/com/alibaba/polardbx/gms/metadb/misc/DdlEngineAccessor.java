@@ -121,7 +121,8 @@ public class DdlEngineAccessor extends AbstractAccessor {
 
     private static final String DELETE_BY_SCHEMA_NAME = DELETE_BASE + WHERE_SCHEMA;
 
-    private static final String SELECT_ARCHIVE_SPECIFIC = SELECT_FULL + " from " + DDL_ENGINE_TABLE_ARCHIVE + WHERE_JOB_ID;
+    private static final String SELECT_ARCHIVE_SPECIFIC =
+        SELECT_FULL + " from " + DDL_ENGINE_TABLE_ARCHIVE + WHERE_JOB_ID;
 
     private static final String DELETE_ARCHIVE_BASE = "delete from " + DDL_ENGINE_TABLE_ARCHIVE;
 
@@ -129,12 +130,19 @@ public class DdlEngineAccessor extends AbstractAccessor {
 
     private static final String DELETE_ARCHIVE_BY_SCHEMA_NAME = DELETE_ARCHIVE_BASE + WHERE_SCHEMA;
 
-    private static final String ARCHIVE_BASE = "insert into " + DDL_ENGINE_TABLE_ARCHIVE + " select * from " + DDL_ENGINE_TABLE;
+    private static final String ARCHIVE_BASE =
+        "insert into " + DDL_ENGINE_TABLE_ARCHIVE + " select * from " + DDL_ENGINE_TABLE;
 
     private static final String ARCHIVE_SPECIFIC = ARCHIVE_BASE + WHERE_JOB_ID;
 
     private static final String CLEAN_ARCHIVE_IN_MINUTS =
         "DELETE j,t FROM `ddl_engine_archive` j JOIN `ddl_engine_task_archive` t ON j.job_id=t.job_id where j.gmt_modified <= ?";
+
+    private static final String SELECT_OUTDATE_ARCHIVE_IN_MINUTS =
+        SELECT_FULL + " from " + DDL_ENGINE_TABLE_ARCHIVE + " where gmt_modified <= %d";
+
+    private static final String SELECT_ARCHIVE_SCHEMA =
+        SELECT_FULL + " from " + DDL_ENGINE_TABLE_ARCHIVE + WHERE_SCHEMA;
 
     public int insert(DdlEngineRecord record) {
         try {
@@ -178,7 +186,7 @@ public class DdlEngineAccessor extends AbstractAccessor {
 
     public List<DdlEngineRecord> query(List<Long> jobIds) {
         try {
-            if(CollectionUtils.isEmpty(jobIds)){
+            if (CollectionUtils.isEmpty(jobIds)) {
                 return new ArrayList<>();
             }
             String sql = String.format(SELECT_SPECIFIC_LIST, concatIds(jobIds));
@@ -377,6 +385,10 @@ public class DdlEngineAccessor extends AbstractAccessor {
         }
     }
 
+    public List<DdlEngineRecord> queryArchive(String schemaName) {
+        return query(SELECT_ARCHIVE_SCHEMA, DDL_ENGINE_TABLE, DdlEngineRecord.class, schemaName);
+    }
+
     public int deleteAllArchive(String schemaName) {
         try {
             final Map<Integer, ParameterContext> params =
@@ -389,7 +401,7 @@ public class DdlEngineAccessor extends AbstractAccessor {
         }
     }
 
-    public int archive(long jobId){
+    public int archive(long jobId) {
         try {
             final Map<Integer, ParameterContext> params =
                 MetaDbUtil.buildParameters(ParameterMethod.setLong, new Long[] {jobId});
@@ -400,6 +412,19 @@ public class DdlEngineAccessor extends AbstractAccessor {
         }
     }
 
+    public List<DdlEngineRecord> queryOutdateArchiveDDLEngine(long minutes) {
+        try {
+            String sql = String.format(SELECT_OUTDATE_ARCHIVE_IN_MINUTS,
+                System.currentTimeMillis() - TimeUnit.MINUTES.toMillis(minutes));
+            return MetaDbUtil.query(sql, DdlEngineRecord.class, connection);
+
+        } catch (Exception e) {
+            throw logAndThrow("Failed to query by minutes from " + DDL_ENGINE_TABLE_ARCHIVE, "query by minutes from",
+                e);
+        }
+    }
+
+    @Deprecated
     public int cleanUpArchive(long minutes) {
         try {
             LocalDateTime.now().minusMinutes(minutes);

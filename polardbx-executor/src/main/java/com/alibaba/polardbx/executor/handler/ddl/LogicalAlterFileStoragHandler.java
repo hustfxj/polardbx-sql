@@ -33,6 +33,7 @@ import org.apache.calcite.rel.ddl.AlterFileStoragePurgeBeforeTimestamp;
  * @author chenzilin
  */
 public class LogicalAlterFileStoragHandler extends LogicalCommonDdlHandler {
+
     public LogicalAlterFileStoragHandler(IRepository repo) {
         super(repo);
     }

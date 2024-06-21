@@ -68,6 +68,8 @@ public class MoveTableBackfillHandler extends HandlerCommon {
     public Cursor handle(RelNode logicalPlan, ExecutionContext executionContext) {
         MoveTableBackfill backfill = (MoveTableBackfill) logicalPlan;
         String schemaName = backfill.getSchemaName();
+        boolean useChangeSet = backfill.isUseChangeSet();
+
         String logicalTable = backfill.getLogicalTableName();
 
         BackfillExecutor backfillExecutor = new BackfillExecutor((List<RelNode> inputs,
@@ -82,7 +84,9 @@ public class MoveTableBackfillHandler extends HandlerCommon {
 
         PhyTableOperationUtil.disableIntraGroupParallelism(schemaName, executionContext);
 
-        upgradeEncoding(executionContext, schemaName, logicalTable);
+        if (!executionContext.getParamManager().getBoolean(ConnectionParams.BACKFILL_USING_BINARY)) {
+            upgradeEncoding(executionContext, schemaName, logicalTable);
+        }
 
         Map<String, Set<String>> sourcePhyTables = backfill.getSourcePhyTables();
         Map<String, Set<String>> targetPhyTables = backfill.getTargetPhyTables();
@@ -91,13 +95,15 @@ public class MoveTableBackfillHandler extends HandlerCommon {
         int affectRows = 0;
         if (!sourcePhyTables.isEmpty()) {
             affectRows = backfillExecutor
-                .backfill(schemaName, logicalTable, executionContext, sourcePhyTables, sourceTargetGroupMap);
+                .backfill(schemaName, logicalTable, executionContext, sourcePhyTables, sourceTargetGroupMap,
+                    useChangeSet);
         }
 
         // Check target table immediately after backfill by default.
         assert !targetPhyTables.isEmpty();
         final boolean check =
-            executionContext.getParamManager().getBoolean(ConnectionParams.SCALEOUT_CHECK_AFTER_BACKFILL);
+            executionContext.getParamManager().getBoolean(ConnectionParams.SCALEOUT_CHECK_AFTER_BACKFILL)
+                && !useChangeSet;
         if (check) {
             final boolean useFastChecker =
                 FastChecker.isSupported(schemaName) &&
@@ -133,54 +139,31 @@ public class MoveTableBackfillHandler extends HandlerCommon {
         String schemaName = backfill.getSchemaName();
         String logicalTable = backfill.getLogicalTableName();
 
-        SQLRecorderLogger.ddlLogger.warn(MessageFormat.format(
+        SQLRecorderLogger.ddlLogger.info(MessageFormat.format(
             "FastChecker for move table, schema [{0}] logical src table [{1}] logic dst table [{2}] start",
             schemaName, logicalTable, logicalTable));
-        final int fastCheckerParallelism =
-            executionContext.getParamManager().getInt(ConnectionParams.SCALEOUT_FASTCHECKER_PARALLELISM);
-
         FastChecker fastChecker = MoveTableFastChecker
-            .create(schemaName, backfill.getLogicalTableName(), backfill.getSourceTargetGroup(),
+            .create(schemaName, backfill.getLogicalTableName(),
                 backfill.getSourcePhyTables(),
-                backfill.getTargetPhyTables(), fastCheckerParallelism, executionContext);
+                backfill.getTargetPhyTables(), executionContext);
         boolean fastCheckResult = false;
-        final int maxRetryTimes =
-            executionContext.getParamManager().getInt(ConnectionParams.FASTCHECKER_RETRY_TIMES);
 
-        int tryTimes = 0;
-        while (tryTimes < maxRetryTimes && fastCheckResult == false) {
-            try {
-                fastCheckResult = fastChecker.check(executionContext);
-            } catch (TddlNestableRuntimeException e) {
-                if (StringUtils.containsIgnoreCase(e.getMessage(), "acquire lock timeout")) {
-                    //if acquire lock timeout, we will retry
-                    if (tryTimes < maxRetryTimes - 1) {
-                        try {
-                            TimeUnit.MILLISECONDS.sleep(2000L * (1 + tryTimes));
-                        } catch (InterruptedException ex) {
-                            throw new TddlNestableRuntimeException(ex);
-                        }
-                        continue;
-                    } else {
-                        throw new TddlRuntimeException(ErrorCode.ERR_SCALEOUT_EXECUTE,
-                            "move table fastchecker retry exceed max times", e);
-                    }
-                } else {
-                    //other exception, we simply throw out
-                    throw new TddlRuntimeException(ErrorCode.ERR_SCALEOUT_EXECUTE, e,
-                        "move table fastchecker failed to check");
-                }
-            } finally {
-                tryTimes += 1;
-                SQLRecorderLogger.ddlLogger.warn(MessageFormat.format(
-                    "FastChecker for move table, schema [{0}] logical src table [{1}] logic dst table [{2}] finish, time use [{3}], check result [{4}]",
-                    schemaName, logicalTable, logicalTable,
-                    (System.currentTimeMillis() - startTime) / 1000.0,
-                    fastCheckResult ? "pass" : "not pass")
-                );
-                if (!fastCheckResult) {
-                    EventLogger.log(EventType.DDL_WARN, "FastChecker failed");
-                }
+        try {
+            fastCheckResult = fastChecker.check(executionContext);
+        } catch (TddlNestableRuntimeException e) {
+            throw new TddlRuntimeException(ErrorCode.ERR_SCALEOUT_EXECUTE, e,
+                "move table fastchecker failed to check");
+        } finally {
+            SQLRecorderLogger.ddlLogger.info(MessageFormat.format(
+                "FastChecker for move table, schema [{0}] logical src table [{1}] logic dst table [{2}] finish, time use [{3}], check result [{4}]",
+                schemaName, logicalTable, logicalTable,
+                (System.currentTimeMillis() - startTime) / 1000.0,
+                fastCheckResult ? "pass" : "not pass")
+            );
+            if (!fastCheckResult) {
+                EventLogger.log(EventType.DDL_WARN, "FastChecker failed");
+            } else {
+                EventLogger.log(EventType.DDL_INFO, "FastChecker succeed");
             }
         }
         return fastCheckResult;
@@ -197,6 +180,7 @@ public class MoveTableBackfillHandler extends HandlerCommon {
             executionContext.getParamManager().getLong(ConnectionParams.SCALEOUT_CHECK_PARALLELISM);
         final long earlyFailNumber =
             executionContext.getParamManager().getLong(ConnectionParams.SCALEOUT_EARLY_FAIL_NUMBER);
+        final boolean useBinary = executionContext.getParamManager().getBoolean(ConnectionParams.BACKFILL_USING_BINARY);
 
         String schemaName = backfill.getSchemaName();
         String logicalTable = backfill.getLogicalTableName();
@@ -211,6 +195,7 @@ public class MoveTableBackfillHandler extends HandlerCommon {
             speedMin,
             speedLimit,
             parallelism,
+            useBinary,
             SqlSelect.LockMode.UNDEF,
             SqlSelect.LockMode.UNDEF,
             executionContext,

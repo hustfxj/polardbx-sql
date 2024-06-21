@@ -39,6 +39,8 @@ import org.apache.calcite.rel.RelDistribution;
 import org.apache.calcite.rel.RelDistributions;
 import org.apache.calcite.rel.RelInput;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.RelPartitionWise;
+import org.apache.calcite.rel.RelPartitionWises;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.core.CorrelationId;
 import org.apache.calcite.rel.core.GroupConcatAggregateCall;
@@ -98,7 +100,19 @@ public class DRDSRelJson extends RelJson {
     public RelDistribution toDistribution(Map<String, Object> map) {
         List<Integer> keys = (List<Integer>) map.get("keys");
         RelDistribution.Type type = RelDistribution.Type.valueOf(map.get("type").toString());
-        return new RelDistributions.RelDistributionImpl(type, ImmutableIntList.copyOf(keys));
+        Integer shardCnt = (Integer) map.get("shardcnt");
+        return new RelDistributions.RelDistributionImpl(type, ImmutableIntList.copyOf(keys), shardCnt);
+    }
+
+    public RelPartitionWise toPartitionWise(Map<String, Object> map) {
+        if (map == null) {
+            return RelPartitionWises.ANY;
+        }
+        Boolean localPartition = (Boolean) map.get("local");
+        localPartition = localPartition != null && localPartition;
+        Boolean remotePartition = (Boolean) map.get("remote");
+        remotePartition = remotePartition != null && remotePartition;
+        return new RelPartitionWises.RelPartitionWiseImpl(localPartition, remotePartition);
     }
 
     @Override
@@ -164,6 +178,8 @@ public class DRDSRelJson extends RelJson {
             return toJson((Comparative) value);
         } else if (value instanceof RelDistribution) {
             return toJson((RelDistribution) value);
+        } else if (value instanceof RelPartitionWise) {
+            return toJson((RelPartitionWise) value);
         } else if (value instanceof SqlOperator) {
             return toJson((SqlOperator) value);
         } else if (value instanceof Window.Group) {
@@ -208,6 +224,14 @@ public class DRDSRelJson extends RelJson {
         final Map<String, Object> map = jsonBuilder.map();
         map.put("type", toJson(node.getType().name()));
         map.put("keys", toJson(node.getKeys()));
+        map.put("shardcnt", toJson(node.getShardCnt()));
+        return map;
+    }
+
+    private Object toJson(RelPartitionWise node) {
+        final Map<String, Object> map = jsonBuilder.map();
+        map.put("local", toJson(node.isLocalPartition()));
+        map.put("remote", toJson(node.isRemotePartition()));
         return map;
     }
 
@@ -381,6 +405,8 @@ public class DRDSRelJson extends RelJson {
         case DYNAMIC_PARAM:
             map = jsonBuilder.map();
             map.put("index", ((RexDynamicParam) node).getIndex());
+            map.put("skindex", ((RexDynamicParam) node).getSkIndex());
+            map.put("subindex", ((RexDynamicParam) node).getSubIndex());
             map.put("reltype", toJson(node.getType()));
             map.put("type", "DYNAMIC");
             if (((RexDynamicParam) node).getSemiType() != null) {
@@ -593,8 +619,25 @@ public class DRDSRelJson extends RelJson {
                     rexDynamicParam.setMaxOnerow(maxonerow);
                     return rexDynamicParam;
                 }
+                int subindex = -1;
+                int skindex = -1;
+                Object tmp = map.get("subindex");
+                if (tmp instanceof Integer) {
+                    subindex = (int) tmp;
+                } else if (tmp instanceof String) {
+                    subindex = Integer.parseInt((String) tmp);
+                }
+
+                tmp = map.get("skindex");
+                if (tmp instanceof Integer) {
+                    skindex = (int) tmp;
+                } else if (tmp instanceof String) {
+                    skindex = Integer.parseInt((String) tmp);
+                }
                 RexDynamicParam rexDynamicParam = new RexDynamicParam(toType(typeFactory, map.get("reltype")),
                     (Integer) map.get("index"));
+                rexDynamicParam.setSubIndex(subindex);
+                rexDynamicParam.setSkIndex(skindex);
                 return rexDynamicParam;
             }
 

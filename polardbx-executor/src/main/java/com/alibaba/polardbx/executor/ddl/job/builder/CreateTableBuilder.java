@@ -17,15 +17,27 @@
 package com.alibaba.polardbx.executor.ddl.job.builder;
 
 import com.alibaba.polardbx.common.Engine;
+import com.alibaba.polardbx.common.ddl.foreignkey.ForeignKeyData;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
+import com.alibaba.polardbx.common.properties.DynamicConfig;
+import com.alibaba.polardbx.common.utils.GeneralUtil;
 import com.alibaba.polardbx.config.ConfigDataMode;
+import com.alibaba.polardbx.druid.sql.ast.expr.SQLCharExpr;
+import com.alibaba.polardbx.druid.sql.dialect.mysql.ast.statement.MySqlCreateTableStatement;
 import com.alibaba.polardbx.executor.ddl.job.converter.PhysicalPlanData;
+import com.alibaba.polardbx.gms.topology.DbInfoManager;
+import com.alibaba.polardbx.gms.topology.DbInfoRecord;
+import com.alibaba.polardbx.optimizer.OptimizerContext;
+import com.alibaba.polardbx.optimizer.config.table.IndexMeta;
+import com.alibaba.polardbx.optimizer.config.table.TableMeta;
 import com.alibaba.polardbx.optimizer.context.ExecutionContext;
 import com.alibaba.polardbx.optimizer.core.rel.ddl.data.CreateTablePreparedData;
 import com.alibaba.polardbx.optimizer.index.TableRuleBuilder;
+import com.alibaba.polardbx.optimizer.sharding.DataNodeChooser;
 import com.alibaba.polardbx.rule.TableRule;
 import com.alibaba.polardbx.rule.TddlRule;
+import com.alibaba.polardbx.rule.model.TargetDB;
 import org.apache.calcite.rel.core.DDL;
 import org.apache.calcite.sql.SqlCreateTable;
 import org.apache.calcite.sql.SqlDdlNodes;
@@ -39,6 +51,10 @@ import org.apache.commons.collections.CollectionUtils;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 public class CreateTableBuilder extends DdlPhyPlanBuilder {
@@ -54,6 +70,7 @@ public class CreateTableBuilder extends DdlPhyPlanBuilder {
     public void buildTableRuleAndTopology() {
         buildNewTableRule();
         buildNewTableTopology(preparedData.getSchemaName(), preparedData.getTableName());
+        buildCreateReferenceTableTopology();
     }
 
     @Override
@@ -143,7 +160,7 @@ public class CreateTableBuilder extends DdlPhyPlanBuilder {
             || (preparedData.getDbPartitions() != null && dbCount == 1);
         boolean multiTbs = preparedData.getTbPartitionBy() != null && tbCount > 1;
 
-        return ConfigDataMode.isSupportSingleDbMultiTbs() || !(singleDb && multiTbs);
+        return DynamicConfig.getInstance().isSupportSingleDbMultiTbs() || !(singleDb && multiTbs);
     }
 
     @Override
@@ -152,6 +169,14 @@ public class CreateTableBuilder extends DdlPhyPlanBuilder {
 
         final SqlCreateTable sqlTemplate = (SqlCreateTable) this.sqlTemplate;
         Engine engine = sqlTemplate.getEngine();
+
+        sqlTemplate.setIsAddLogicalForeignKeyOnly(isAddLogicalForeignKeyOnly());
+
+        MySqlCreateTableStatement stmt = (MySqlCreateTableStatement) sqlTemplate.rewrite();
+        if (sqlTemplate.getEncryption() == null
+            && checkDatabaseEncryption(preparedData.getSchemaName())) {
+            stmt.addOption("ENCRYPTION", new SQLCharExpr("Y"));
+        }
 
         this.sqlTemplate = SqlDdlNodes.createTable(
             sqlTemplate.getParserPosition(),
@@ -165,7 +190,7 @@ public class CreateTableBuilder extends DdlPhyPlanBuilder {
             null,
             null,
             null,
-            sqlTemplate.rewrite().toString(),
+            stmt.toString(),
             false,
             sqlTemplate.getAutoIncrement(),
             null,
@@ -176,17 +201,35 @@ public class CreateTableBuilder extends DdlPhyPlanBuilder {
         );
 
         ((SqlCreateTable) this.sqlTemplate).setEngine(engine);
+        ((SqlCreateTable) this.sqlTemplate).setLogicalReferencedTables(sqlTemplate.getLogicalReferencedTables());
         ((SqlCreateTable) this.sqlTemplate).setTemporary(sqlTemplate.isTemporary());
         validatePartitionColumnInUkForLocalPartition(sqlTemplate);
 
         sequenceBean = sqlTemplate.getAutoIncrement();
     }
 
+    /**
+     * check database encryption option for creating table
+     */
+    private boolean checkDatabaseEncryption(String schemaName) {
+        DbInfoRecord dbInfo = DbInfoManager.getInstance().getDbInfo(schemaName);
+        if (dbInfo != null) {
+            return Optional.ofNullable(dbInfo.isEncryption()).orElse(false);
+        }
+        return false;
+    }
+
     @Override
     public PhysicalPlanData genPhysicalPlanData(boolean autoPartition) {
         PhysicalPlanData data = super.genPhysicalPlanData(autoPartition);
-        if (data.getLocalityDesc() == null || data.getLocalityDesc().holdEmptyDnList()) {
+        if (data.getLocalityDesc() == null || data.getLocalityDesc().isEmpty()) {
             data.setLocalityDesc(preparedData.getLocality());
+        }
+        if (data.getTableESA() == null) {
+            data.setTableESA(preparedData.getTableEAS());
+        }
+        if (data.getColEsaList() == null || data.getColEsaList().isEmpty()) {
+            data.setColEsaList(preparedData.getColEASList());
         }
         return data;
     }
@@ -234,5 +277,66 @@ public class CreateTableBuilder extends DdlPhyPlanBuilder {
                     String.format("Primary/Unique Key must contain local partition column: %s", localPartitionColumn));
             }
         }
+    }
+
+    public void buildCreateReferenceTableTopology() {
+        if (preparedData.getReferencedTables() != null) {
+            for (String referencedTable : preparedData.getReferencedTables()) {
+                List<List<TargetDB>> targetDBs;
+                if (referencedTable.equals(preparedData.getTableName())) {
+                    targetDBs = DataNodeChooser.shardCreateTable(preparedData.getSchemaName(), referencedTable, relDdl,
+                        tableRule);
+                } else {
+                    targetDBs =
+                        DataNodeChooser.shardChangeTable(preparedData.getSchemaName(), referencedTable,
+                            executionContext);
+                }
+                if (OptimizerContext.getContext(preparedData.getSchemaName()).getRuleManager()
+                    .isBroadCast(referencedTable)) {
+                    final String tableName = targetDBs.get(0).get(0).getTableNames().stream().findFirst().orElse(null);
+                    assert tableName != null;
+                    for (Map.Entry<String, List<List<String>>> entry : tableTopology.entrySet()) {
+                        for (List<String> l : entry.getValue()) {
+                            l.add(tableName);
+                        }
+                    }
+                } else {
+                    final Map<String, List<List<String>>> refTopo =
+                        convertTargetDBs(preparedData.getSchemaName(), targetDBs);
+                    assert refTopo.size() == tableTopology.size();
+                    for (Map.Entry<String, List<List<String>>> entry : refTopo.entrySet()) {
+                        final List<List<String>> match = tableTopology.get(entry.getKey());
+                        if (match == null) {
+                            throw new TddlRuntimeException(ErrorCode.ERR_EXECUTOR,
+                                "Does not match any reference table topology");
+                        }
+                        assert match.size() == entry.getValue().size();
+                        // Concat one by one.
+                        for (int i = 0; i < match.size(); ++i) {
+                            match.get(i).addAll(entry.getValue().get(i));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public List<Boolean> isAddLogicalForeignKeyOnly() {
+        List<Boolean> isAddLogicalForeignKeyOnly = new ArrayList<>();
+        TableMeta tableMeta = preparedData.getTableMeta();
+
+        Set<String> indexes = new TreeSet<>(String.CASE_INSENSITIVE_ORDER);
+        indexes.addAll(
+            tableMeta.getAllIndexes().stream().map(IndexMeta::getPhysicalIndexName).collect(Collectors.toList()));
+        if (GeneralUtil.isNotEmpty(preparedData.getAddedForeignKeys())) {
+            for (ForeignKeyData fk : preparedData.getAddedForeignKeys()) {
+                if (indexes.contains(fk.constraint)) {
+                    isAddLogicalForeignKeyOnly.add(true);
+                } else {
+                    isAddLogicalForeignKeyOnly.add(false);
+                }
+            }
+        }
+        return isAddLogicalForeignKeyOnly;
     }
 }

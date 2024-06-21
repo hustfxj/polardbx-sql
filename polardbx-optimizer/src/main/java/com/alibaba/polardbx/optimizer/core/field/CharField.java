@@ -19,6 +19,7 @@ package com.alibaba.polardbx.optimizer.core.field;
 import com.alibaba.polardbx.common.SQLMode;
 import com.alibaba.polardbx.common.SQLModeFlags;
 import com.alibaba.polardbx.common.charset.CharsetName;
+import com.alibaba.polardbx.common.charset.CollationName;
 import com.alibaba.polardbx.common.charset.SortKey;
 import com.alibaba.polardbx.common.type.MySQLStandardFieldType;
 import com.alibaba.polardbx.common.utils.Pair;
@@ -27,11 +28,12 @@ import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
 import com.alibaba.polardbx.common.utils.time.MySQLTimeTypeUtil;
 import com.alibaba.polardbx.common.utils.time.core.MysqlDateTime;
 import com.alibaba.polardbx.common.utils.time.core.OriginalTemporalValue;
+import com.alibaba.polardbx.common.utils.time.core.OriginalTimestamp;
 import com.alibaba.polardbx.common.utils.time.parser.StringNumericParser;
 import com.alibaba.polardbx.common.utils.time.parser.StringTimeParser;
-import com.alibaba.polardbx.common.charset.CharsetFactory;
-import com.alibaba.polardbx.common.charset.CharsetHandler;
-import com.alibaba.polardbx.common.collation.CollationHandler;
+import com.alibaba.polardbx.optimizer.config.table.charset.CharsetFactory;
+import com.alibaba.polardbx.optimizer.config.table.charset.CharsetHandler;
+import com.alibaba.polardbx.optimizer.config.table.collation.CollationHandler;
 import com.alibaba.polardbx.optimizer.core.datatype.DataType;
 import com.alibaba.polardbx.optimizer.core.datatype.DataTypeUtil;
 import com.alibaba.polardbx.optimizer.core.datatype.SliceType;
@@ -40,14 +42,20 @@ import com.alibaba.polardbx.rpc.result.XResultUtil;
 import com.google.common.base.Preconditions;
 import com.google.protobuf.ByteString;
 import com.mysql.cj.polarx.protobuf.PolarxResultset;
+import io.airlift.slice.DynamicSliceOutput;
 import io.airlift.slice.Slice;
 import io.airlift.slice.SliceInput;
+import io.airlift.slice.SliceOutput;
 import io.airlift.slice.Slices;
+import io.airlift.slice.XxHash64;
 
 import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
 import java.sql.Types;
 import java.util.Arrays;
+
+import static com.alibaba.polardbx.common.charset.MySQLUnicodeUtils.LATIN1_TO_UTF8_BYTES;
 
 /**
  * MySQL char(n) data type.
@@ -58,6 +66,8 @@ public class CharField extends AbstractStorageField {
     protected static final int MAX_ERROR_STRING_SIZE = 1 << 4;
 
     protected byte[] packedBinary;
+
+    private int realLength;
 
     public CharField(DataType<?> fieldType) {
         super(fieldType);
@@ -134,7 +144,19 @@ public class CharField extends AbstractStorageField {
             if (value instanceof OriginalTemporalValue) {
                 // store value from chunk executor as mysql datetime.
                 OriginalTemporalValue temporalValue = (OriginalTemporalValue) value;
-                String timeStr = (String) DataTypeUtil.convert(resultType, fieldType, temporalValue);
+                Object converted = DataTypeUtil.convert(resultType, fieldType, temporalValue);
+                String timeStr;
+                if (converted instanceof Slice) {
+                    timeStr = ((Slice) converted).toStringUtf8();
+                } else if (converted instanceof String) {
+                    timeStr = (String) converted;
+                } else if (converted instanceof byte[]) {
+                    timeStr = new String((byte[]) converted);
+                } else {
+                    // don't accept null value because it's the failed result from implicit cast.
+                    return TypeConversionStatus.TYPE_ERR_UNSUPPORTED_IMPLICIT_CAST;
+                }
+
                 return storeUTF8(timeStr.getBytes(), sessionProperties);
             } else if (value == null) {
                 setNull();
@@ -205,6 +227,35 @@ public class CharField extends AbstractStorageField {
             CollationHandler collationHandler = getCollationHandler();
             collationHandler.hashcode(packedBinary, length, numbers);
         }
+    }
+
+    @Override
+    public long xxHashCode() {
+        if (isNull()) {
+            return NULL_HASH_CODE;
+        }
+        if (isLatin1CharSet() && !isBinaryCollation()) {
+            return getCollationHandler().hashcode(convertLatin1ToUtf8(packedBinary, 0, realLength));
+        } else {
+            return getCollationHandler().hashcode(Slices.wrappedBuffer(packedBinary, 0, realLength));
+        }
+    }
+
+    protected boolean isLatin1CharSet() {
+        return getCharsetHandler().getName() == CharsetName.LATIN1;
+    }
+
+    protected boolean isBinaryCollation() {
+        return getCollationHandler().getName() == CollationName.BINARY || getCollationHandler().getName().name()
+            .endsWith("_BIN");
+    }
+
+    protected Slice convertLatin1ToUtf8(byte[] packedBinary, int startPos, int length) {
+        SliceOutput sliceOutput = new DynamicSliceOutput(length);
+        for (int i = 0; i < length; ++i) {
+            sliceOutput.writeBytes(LATIN1_TO_UTF8_BYTES[((int) packedBinary[i + startPos]) & 0xFF]);
+        }
+        return sliceOutput.slice();
     }
 
     @Override
@@ -394,7 +445,10 @@ public class CharField extends AbstractStorageField {
     protected void postHandle(int lengthOfCopy) {
         // Append spaces if the string was shorter than the field
         if (lengthOfCopy < packetLength()) {
+            realLength = lengthOfCopy;
             Arrays.fill(packedBinary, lengthOfCopy, packedBinary.length, getCollationHandler().padChar());
+        } else {
+            realLength = packetLength();
         }
     }
 
@@ -609,11 +663,16 @@ public class CharField extends AbstractStorageField {
     private int scanChar(byte[] fromBytes, CharsetHandler charsetHandler, int fromLen, int charNumbers,
                          int fromOffset) throws WellFormException {
         int lengthOfCopy;
-        if (fromLen > packetLength()) {
+
+        // We suppose that the min-bytes of any character set is 1, so we use fromLen/1 as the max character number.
+        if (fromLen > packetLength() || fromLen / 1 > charNumbers) {
             // For utf-8 field, calculate the well-formed multi-bytes len
             SliceInput sliceInput = Slices.wrappedBuffer(fromBytes, 0, fromLen).getInput();
             int charLenToCheck = charNumbers;
-            while (charLenToCheck > 0) {
+
+            // Bugfix: when the character number is less than varchar number in column definition,
+            // but the length of byte array is more than varchar number in column definition.
+            while (sliceInput.isReadable() && charLenToCheck > 0) {
                 if (charsetHandler.nextChar(sliceInput) == CharsetHandler.INVALID_CODE) {
                     // handle well-form error
                     LOGGER.warn("un-mappable characters: " + showErrorBytes(fromBytes) + ", for character set: "

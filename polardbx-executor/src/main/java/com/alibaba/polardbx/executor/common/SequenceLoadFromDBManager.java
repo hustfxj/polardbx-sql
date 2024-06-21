@@ -17,6 +17,7 @@
 package com.alibaba.polardbx.executor.common;
 
 import com.alibaba.polardbx.common.IdGenerator;
+import com.alibaba.polardbx.common.constants.SequenceAttribute;
 import com.alibaba.polardbx.common.exception.TddlRuntimeException;
 import com.alibaba.polardbx.common.exception.code.ErrorCode;
 import com.alibaba.polardbx.common.properties.ConnectionParams;
@@ -31,6 +32,7 @@ import com.alibaba.polardbx.executor.sync.InspectGroupSeqMinValueSyncAction;
 import com.alibaba.polardbx.executor.sync.SequenceSyncAction;
 import com.alibaba.polardbx.executor.sync.SyncManagerHelper;
 import com.alibaba.polardbx.executor.utils.ExecUtils;
+import com.alibaba.polardbx.gms.sync.SyncScope;
 import com.alibaba.polardbx.gms.util.MetaDbUtil;
 import com.alibaba.polardbx.gms.util.SeqTypeUtil;
 import com.alibaba.polardbx.optimizer.OptimizerContext;
@@ -45,6 +47,7 @@ import com.alibaba.polardbx.sequence.impl.GroupSequenceDao;
 import com.alibaba.polardbx.sequence.impl.NewSequence;
 import com.alibaba.polardbx.sequence.impl.NewSequenceDao;
 import com.alibaba.polardbx.sequence.impl.NewSequenceScheduler;
+import com.alibaba.polardbx.sequence.impl.NewSequenceWithCache;
 import com.alibaba.polardbx.sequence.impl.SimpleSequence;
 import com.alibaba.polardbx.sequence.impl.SimpleSequenceDao;
 import com.alibaba.polardbx.sequence.impl.TimeBasedSequence;
@@ -57,7 +60,6 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -95,6 +97,10 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
     private SimpleSequenceDao simpleSeqDao;
 
     private NewSequenceScheduler newSeqScheduler;
+
+    private volatile boolean currentNewSeqCacheEnabledOnCN = false;
+    private volatile int currentNewSeqCacheSizeOnCN = (int) SequenceAttribute.NEW_SEQ_CACHE_SIZE;
+    private volatile boolean newSeqCacheChangedOnCN = false;
 
     private int unitCount;
     private int unitIndex;
@@ -144,7 +150,7 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
             }
         });
 
-        if (!ConfigDataMode.isMasterMode()) {
+        if (!ConfigDataMode.needInitMasterModeResource()) {
             return;
         }
 
@@ -243,6 +249,9 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
 
     @Override
     public int invalidateAll(String schemaName) {
+        if (cache == null) {
+            return 0;
+        }
         int size = (int) cache.size();
 
         Collection<Sequence> seqs = cache.asMap().values();
@@ -292,8 +301,17 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
 
         Sequence seq = getSequence(schemaName, seqName);
 
-        if (seq != null && seq != NULL_OBJ && seq instanceof GroupSequence) {
-            long[] currentAndMax = ((GroupSequence) seq).getCurrentAndMax();
+        if (seq != null && seq != NULL_OBJ) {
+            long[] currentAndMax;
+
+            if (seq instanceof GroupSequence) {
+                currentAndMax = ((GroupSequence) seq).getCurrentAndMax();
+            } else if (seq instanceof NewSequenceWithCache) {
+                currentAndMax = ((NewSequenceWithCache) seq).getCurrentAndMax();
+            } else {
+                currentAndMax = new long[] {-1, -1};
+            }
+
             currentRange = "[ " + currentAndMax[0] + ", " + currentAndMax[1] + " ]";
         }
 
@@ -436,10 +454,14 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
         if (!SeqTypeUtil.isNewSeqSupported(schemaName)) {
             return null;
         }
-        NewSequence seq = new NewSequence(name, newSeqDao, newSeqScheduler);
+
+        NewSequence seq = currentNewSeqCacheEnabledOnCN ?
+            new NewSequenceWithCache(name, currentNewSeqCacheSizeOnCN, newSeqDao, newSeqScheduler) :
+            new NewSequence(name, newSeqDao, newSeqScheduler);
+
         try {
             seq.setGroupingEnabled(isNewSeqGroupingEnabled());
-            if (ConfigDataMode.isSlaveMode()) {
+            if (!ConfigDataMode.needInitMasterModeResource()) {
                 // DO NOT initialize to avoid write operations
                 // in Read-Only instance.
                 seq.setType(Type.NEW);
@@ -462,7 +484,7 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
         try {
             seq.setName(name);
             seq.setGroupSequenceDao(groupSeqDao);
-            if (ConfigDataMode.isSlaveMode()) {
+            if (!ConfigDataMode.needInitMasterModeResource()) {
                 // DO NOT initialize to avoid write operations
                 // in Read-Only instance.
                 seq.setType(Type.GROUP);
@@ -481,7 +503,7 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
         try {
             seq.setName(name);
             seq.setSimpleSequenceDao(simpleSeqDao);
-            if (ConfigDataMode.isSlaveMode()) {
+            if (!ConfigDataMode.needInitMasterModeResource()) {
                 // DO NOT initialize to avoid write operations
                 // in Read-Only instance.
                 seq.setType(Type.SIMPLE);
@@ -504,61 +526,58 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
     }
 
     @Override
-    public boolean areAllSequencesSameType(String schemaName, Type seqType) {
+    public boolean areAllSequencesSameType(String schemaName, Type[] seqTypes) {
         if (ConfigDataMode.isFastMock()) {
             return true;
         }
 
+        Collection<Sequence> cachedSequences = cache.asMap().values();
+
         int countNew = 0, countGroup = 0, countSimple = 0, countTime = 0;
+        boolean allNew = false, allGroup = false, allSimple = false, allTime = false;
 
-        // Check for group sequences.
-        try (Connection metaDbConn = MetaDbUtil.getConnection();
-            Statement stmt = metaDbConn.createStatement();
-            ResultSet rs = stmt.executeQuery("select count(*) from " + SEQUENCE)) {
-            if (rs.next()) {
-                countGroup = rs.getInt(1);
+        for (Sequence seq : cachedSequences) {
+            if (seq instanceof NewSequence) {
+                countNew++;
+            } else if (seq instanceof GroupSequence) {
+                countGroup++;
+            } else if (seq instanceof SimpleSequence) {
+                countSimple++;
+            } else if (seq instanceof TimeBasedSequence) {
+                countTime++;
             }
-        } catch (SQLException e) {
-            throw new SequenceException(e, "Failed to query '" + SEQUENCE + "'. Caused by: " + e.getMessage());
-        }
-
-        // Check for simple and time-based sequences.
-        try (Connection metaDbConn = MetaDbUtil.getConnection();
-            Statement stmt = metaDbConn.createStatement();
-            ResultSet rs = stmt.executeQuery("select cycle from " + SEQUENCE_OPT)) {
-
-            while (rs.next()) {
-                int flag = rs.getInt(1);
-
-                if ((flag & NEW_SEQ) == NEW_SEQ) {
-                    countNew++;
-                } else if ((flag & TIME_BASED) == TIME_BASED) {
-                    countTime++;
-                } else {
-                    countSimple++;
-                }
-            }
-        } catch (SQLException e) {
-            throw new SequenceException(e, "Failed to query '" + SEQUENCE + "'. Caused by: " + e.getMessage());
         }
 
         if (countNew == 0 && countGroup == 0 && countSimple == 0 && countTime == 0) {
-            // No sequence.
             return true;
         }
 
-        switch (seqType) {
-        case NEW:
-            return countNew > 0 && countGroup == 0 && countSimple == 0 && countTime == 0;
-        case GROUP:
-            return countNew == 0 && countGroup > 0 && countSimple == 0 && countTime == 0;
-        case SIMPLE:
-            return countNew == 0 && countGroup == 0 && countSimple > 0 && countTime == 0;
-        case TIME:
-            return countNew == 0 && countGroup == 0 && countSimple == 0 && countTime > 0;
-        default:
-            return false;
+        if (countNew > 0 && countGroup == 0 && countSimple == 0 && countTime == 0) {
+            allNew = true;
+        } else if (countNew == 0 && countGroup > 0 && countSimple == 0 && countTime == 0) {
+            allGroup = true;
+        } else if (countNew == 0 && countGroup == 0 && countSimple > 0 && countTime == 0) {
+            allSimple = true;
+        } else if (countNew == 0 && countGroup == 0 && countSimple == 0 && countTime > 0) {
+            allTime = true;
         }
+
+        boolean matchedAtLeast = false;
+
+        for (Type seqType : seqTypes) {
+            switch (seqType) {
+            case NEW:
+                matchedAtLeast |= allNew;
+            case GROUP:
+                matchedAtLeast |= allGroup;
+            case SIMPLE:
+                matchedAtLeast |= allSimple;
+            case TIME:
+                matchedAtLeast |= allTime;
+            }
+        }
+
+        return matchedAtLeast;
     }
 
     private void updateGroupSeqValue(GroupSequence groupSeq) {
@@ -568,7 +587,8 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
                 long minValueInAllRanges = getMinValueFromAllRanges(seqName);
                 boolean needSync = groupSeq.updateValueRegularly(minValueInAllRanges);
                 if (needSync) {
-                    SyncManagerHelper.sync(new SequenceSyncAction(schemaName, seqName), schemaName);
+                    SyncManagerHelper.sync(new SequenceSyncAction(schemaName, seqName), schemaName,
+                        SyncScope.ALL);
                 }
             }
         } catch (Throwable t) {
@@ -580,7 +600,8 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
         long minValue = DEFAULT_INNER_STEP;
         try {
             List<List<Map<String, Object>>> resultSets =
-                SyncManagerHelper.sync(new InspectGroupSeqMinValueSyncAction(schemaName, seqName), schemaName);
+                SyncManagerHelper.sync(new InspectGroupSeqMinValueSyncAction(schemaName, seqName), schemaName,
+                    SyncScope.ALL);
             if (resultSets != null && resultSets.size() > 0) {
                 for (List<Map<String, Object>> resultSet : resultSets) {
                     if (resultSet != null && resultSet.size() > 0) {
@@ -613,6 +634,7 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
             newSeqScheduler.resetRequestMergingEnabled(isNewSeqRequestMergingEnabled());
             newSeqScheduler.resetValueHandlerKeepAliveTime(getNewSeqValueHandlerKeepAliveTime());
         }
+        resetNewSeqCacheOnCN();
     }
 
     @Override
@@ -648,6 +670,45 @@ public class SequenceLoadFromDBManager extends AbstractSequenceManager {
 
     private long getGroupSeqCheckInterval() {
         return this.paramManager.getLong(ConnectionParams.GROUP_SEQ_CHECK_INTERVAL);
+    }
+
+    private void resetNewSeqCacheOnCN() {
+        resetNewSeqCacheEnabledOnCN();
+        resetNewSeqCacheSizeOnCN();
+        if (this.newSeqCacheChangedOnCN) {
+            invalidateNewSeqObjects();
+            this.newSeqCacheChangedOnCN = false;
+        }
+    }
+
+    private void resetNewSeqCacheEnabledOnCN() {
+        boolean newSeqCacheEnabledOnCN = this.paramManager.getBoolean(ConnectionParams.ENABLE_NEW_SEQ_CACHE_ON_CN);
+        if (this.currentNewSeqCacheEnabledOnCN != newSeqCacheEnabledOnCN) {
+            this.currentNewSeqCacheEnabledOnCN = newSeqCacheEnabledOnCN;
+            this.newSeqCacheChangedOnCN = true;
+            logger.warn(String.format("Reset New Seq Cache Enabled On CN from %s to %s",
+                this.currentNewSeqCacheEnabledOnCN, newSeqCacheEnabledOnCN));
+        }
+    }
+
+    private void resetNewSeqCacheSizeOnCN() {
+        int newSeqCacheSizeOnCN = (int) this.paramManager.getLong(ConnectionParams.NEW_SEQ_CACHE_SIZE_ON_CN);
+        if (newSeqCacheSizeOnCN > 0 && this.currentNewSeqCacheSizeOnCN != newSeqCacheSizeOnCN) {
+            this.currentNewSeqCacheSizeOnCN = newSeqCacheSizeOnCN;
+            this.newSeqCacheChangedOnCN = true;
+            logger.warn(String.format("Reset New Seq Cache Size On CN from %s to %s", this.currentNewSeqCacheSizeOnCN,
+                newSeqCacheSizeOnCN));
+        }
+    }
+
+    private void invalidateNewSeqObjects() {
+        Collection<Sequence> cachedSequences = cache.asMap().values();
+        for (Sequence seq : cachedSequences) {
+            if (seq instanceof NewSequence) {
+                StringIgnoreCase seqName = new StringIgnoreCase(((NewSequence) seq).getName());
+                cache.invalidate(seqName);
+            }
+        }
     }
 
     @Override

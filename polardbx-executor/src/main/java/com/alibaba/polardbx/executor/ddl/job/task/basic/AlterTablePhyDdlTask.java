@@ -49,6 +49,8 @@ import org.apache.commons.lang.StringUtils;
 import java.util.ArrayList;
 import java.util.List;
 
+import static com.alibaba.polardbx.common.properties.ConnectionParams.PHYSICAL_DDL_TASK_RETRY;
+
 @Getter
 @TaskName(name = "AlterTablePhyDdlTask")
 public class AlterTablePhyDdlTask extends BasePhyDdlTask {
@@ -60,6 +62,12 @@ public class AlterTablePhyDdlTask extends BasePhyDdlTask {
     private String rollbackSql;
 
     private String rollbackSqlTemplate;
+
+    private Long shadowTableId;
+
+    private String shadowTableName;
+
+    private Boolean shadowTableAltered;
 
     public void setSourceSql(String sourceSql) {
         this.sourceSql = sourceSql;
@@ -81,8 +89,16 @@ public class AlterTablePhyDdlTask extends BasePhyDdlTask {
 
     @Override
     public void executeImpl(ExecutionContext executionContext) {
+        if (!executionContext.getParamManager().getBoolean(PHYSICAL_DDL_TASK_RETRY)) {
+            onExceptionTryRollback();
+        }
+        String origSql = StringUtils.isNotEmpty(sourceSql) ? sourceSql : executionContext.getDdlContext().getDdlStmt();
+
         try {
             super.executeImpl(executionContext);
+            if (!AlterTableRollbacker.checkIfRollbackable(origSql)) {
+                updateSupportedCommands(true, false, null);
+            }
         } catch (PhysicalDdlException e) {
             int successCount = e.getSuccessCount();
             if (successCount == 0) {
@@ -90,7 +106,7 @@ public class AlterTablePhyDdlTask extends BasePhyDdlTask {
             } else {
                 // Some physical DDLs failed && they do not support rollback,
                 // so we forbid CANCEL DDL command here.
-                if (!AlterTableRollbacker.checkIfRollbackable(executionContext.getDdlContext().getDdlStmt())) {
+                if (!AlterTableRollbacker.checkIfRollbackable(origSql)) {
                     updateSupportedCommands(true, false, null);
                 }
             }
@@ -171,5 +187,4 @@ public class AlterTablePhyDdlTask extends BasePhyDdlTask {
         // ALTER TABLE XXX ADD COLUMN (ca INT, cb INT, cc INT)
         return AlterTableRollbacker.reverse(schemaName, logicalTableName, origAlterItem);
     }
-
 }

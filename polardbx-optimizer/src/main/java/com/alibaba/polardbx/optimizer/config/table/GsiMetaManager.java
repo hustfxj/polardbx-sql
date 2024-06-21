@@ -27,19 +27,16 @@ import com.alibaba.polardbx.common.utils.TStringUtil;
 import com.alibaba.polardbx.common.utils.TreeMaps;
 import com.alibaba.polardbx.common.utils.logger.Logger;
 import com.alibaba.polardbx.common.utils.logger.LoggerFactory;
+import com.alibaba.polardbx.config.ConfigDataMode;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbConfigManager;
 import com.alibaba.polardbx.gms.listener.impl.MetaDbDataIdBuilder;
 import com.alibaba.polardbx.gms.metadb.GmsSystemTables;
 import com.alibaba.polardbx.gms.metadb.table.IndexStatus;
+import com.alibaba.polardbx.gms.metadb.table.IndexVisibility;
 import com.alibaba.polardbx.gms.metadb.table.IndexesRecord;
 import com.alibaba.polardbx.gms.metadb.table.TableInfoManager;
 import com.alibaba.polardbx.gms.partition.TablePartitionAccessor;
 import com.alibaba.polardbx.gms.topology.DbInfoManager;
-import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableMap.Builder;
-import com.google.common.collect.ImmutableSortedMap;
-import com.google.common.collect.Maps;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.ImmutableList;
@@ -47,6 +44,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableMap.Builder;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Maps;
+import lombok.Getter;
 import org.apache.calcite.linq4j.Ord;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlIndexDefinition.SqlIndexResiding;
@@ -70,10 +68,13 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static com.alibaba.polardbx.optimizer.config.table.GsiUtils.getConnectionForWrite;
+import static com.alibaba.polardbx.optimizer.config.table.GsiUtils.wrapWithTransaction;
 
 /**
  * @author chenmo.cm
@@ -82,8 +83,70 @@ public class GsiMetaManager extends AbstractLifecycle {
 
     private static final Logger logger = LoggerFactory.getLogger(GsiMetaManager.class);
 
+    public static final String __DRDS__SYSTABLE__TABLES__TABLE_NAME = ConfigDataMode.isPolarDbX()
+        ? GmsSystemTables.TABLES_EXT : SystemTables.DRDS_SYSTABLE_TABLES;
+    public static final String __DRDS__SYSTABLE__INDEXES__TABLE_NAME = ConfigDataMode.isPolarDbX()
+        ? GmsSystemTables.INDEXES : SystemTables.DRDS_SYSTABLE_INDEXES;
+
+    private static final String __DRDS__SYSTABLE__INDEXES__UK_NAME = "uk_schema_table_index_column";
+    private static final String __DRDS__SYSTABLE__TABLES__UK_NAME = "uk_schema_table";
+
+    private static final String __DRDS__SYSTABLE__TABLES__ = "CREATE TABLE IF NOT EXISTS `{0}` ("
+        + "  `ID` BIGINT(21) UNSIGNED NOT NULL AUTO_INCREMENT,"
+        + "  `TABLE_CATALOG` VARCHAR(512) DEFAULT ''def'',"
+        + "  `TABLE_SCHEMA` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `TABLE_NAME` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `TABLE_TYPE` BIGINT(10) NOT NULL DEFAULT 0 COMMENT ''0:SINGLE,1:SHARDING,2:BROADCAST,3:GSI'',"
+        + "  `DB_PARTITION_KEY` VARCHAR(64) DEFAULT NULL,"
+        + "  `DB_PARTITION_POLICY` VARCHAR(64) DEFAULT NULL,"
+        + "  `DB_PARTITION_COUNT` BIGINT(4) NOT NULL DEFAULT 1,"
+        + "  `TB_PARTITION_KEY` VARCHAR(64) DEFAULT NULL,"
+        + "  `TB_PARTITION_POLICY` VARCHAR(64) DEFAULT NULL,"
+        + "  `TB_PARTITION_COUNT` BIGINT(4) NOT NULL DEFAULT 1,"
+        + "  `COMMENT` VARCHAR(2048) DEFAULT NULL,"
+        + "  PRIMARY KEY(`ID`)"
+        + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+
+    private static final String __DRDS__SYSTABLE__INDEXES__ = "CREATE TABLE IF NOT EXISTS `{0}` ("
+        + "  `ID` BIGINT(21) UNSIGNED NOT NULL AUTO_INCREMENT,"
+        + "  `TABLE_CATALOG` VARCHAR(512) NOT NULL DEFAULT ''def'',"
+        + "  `TABLE_SCHEMA` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `TABLE_NAME` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `NON_UNIQUE` BIGINT(1) NOT NULL DEFAULT 0,"
+        + "  `INDEX_SCHEMA` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `INDEX_NAME` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `SEQ_IN_INDEX` BIGINT(10) NOT NULL DEFAULT 0,"
+        + "  `COLUMN_NAME` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `COLLATION` VARCHAR(3) DEFAULT NULL,"
+        + "  `CARDINALITY` BIGINT(21) DEFAULT NULL,"
+        + "  `SUB_PART` BIGINT(3) DEFAULT NULL,"
+        + "  `PACKED` VARCHAR(10) DEFAULT NULL,"
+        + "  `NULLABLE` VARCHAR(3) NOT NULL DEFAULT '''',"
+        + "  `INDEX_TYPE` VARCHAR(16) NULL DEFAULT NULL COMMENT ''BTREE, FULLTEXT, HASH, RTREE, GLOBAL'',"
+        + "  `COMMENT` VARCHAR(16) DEFAULT NULL COMMENT ''INDEX, COVERING'',"
+        + "  `INDEX_COMMENT` VARCHAR(1024) NOT NULL DEFAULT '''',"
+        + "  `INDEX_COLUMN_TYPE` BIGINT(10) DEFAULT 0 COMMENT ''0:INDEX,1:COVERING'',"
+        + "  `INDEX_LOCATION` BIGINT(10) NOT NULL DEFAULT 1 COMMENT ''0:LOCAL,1:GLOBAL'',"
+        + "  `INDEX_TABLE_NAME` VARCHAR(64) NOT NULL DEFAULT '''',"
+        + "  `INDEX_STATUS` BIGINT(10) NOT NULL DEFAULT 0 COMMENT ''0:CREATING,1:DELETE_ONLY,2:WRITE_ONLY,3:WRITE_REORG,4:PUBLIC,5:DELETE_REORG,6:REMOVING,7:ABSENT'',"
+        + "  `VERSION` BIGINT(21) NOT NULL COMMENT ''index meta version'',"
+        + "  PRIMARY KEY(`ID`),"
+        + "  KEY `i_index_name_version`(`INDEX_NAME`, `VERSION`)"
+        + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+
+    private static final String __DRSD__SYSTABLE__INDEXES__INDEX_STATUS__ =
+        "ALTER TABLE `{0}` MODIFY COLUMN `INDEX_STATUS` BIGINT(10) NOT NULL DEFAULT 0 COMMENT ''0:CREATING,1:DELETE_ONLY,2:WRITE_ONLY,3:WRITE_REORG,4:PUBLIC,5:DELETE_REORG,6:REMOVING,7:ABSENT''";
+
+    private static final String __DRSD__SYSTABLE__TABLES__ADD_UK__ =
+        "ALTER TABLE `{0}` ADD UNIQUE KEY " + __DRDS__SYSTABLE__TABLES__UK_NAME
+            + "(TABLE_CATALOG(64), TABLE_SCHEMA, TABLE_NAME)";
+
+    private static final String __DRSD__SYSTABLE__TABLES__CHECK_UK__ =
+        "SELECT COUNT(1) IndexIsThere FROM INFORMATION_SCHEMA.STATISTICS WHERE table_schema = DATABASE() AND table_name = ''{0}'' AND index_name=''"
+            + __DRDS__SYSTABLE__TABLES__UK_NAME + "''";
+
     private static final String SELECT_PARTITIONED_TABLE_INFO =
-        "select id, '''' as table_catalog, table_schema, table_name, (case tbl_type when 0 then 1 when 1 then 3 when 2 then 0 when 3 then 2 when 4 then 3 when 5 then 3 else -1 end ) as table_type, '' as db_partition_key, '' as db_partition_policy, "
+        "select id, '''' as table_catalog, table_schema, table_name, (case tbl_type when 0 then 1 when 1 then 3 when 2 then 0 when 3 then 2 when 4 then 3 when 5 then 3 when 7 then 4 else -1 end ) as table_type, '' as db_partition_key, '' as db_partition_policy, "
             + "null as db_partition_count, '' as tb_partition_key, '' as tb_partition_policy, null as tb_partition_count, part_comment as comment from table_partitions";
 
     private static final String SELECT_PARTITIONED_TABLE_INFO_BY_SCHEMA_TABLE =
@@ -99,6 +162,13 @@ public class GsiMetaManager extends AbstractLifecycle {
         "select id, table_catalog, table_schema, table_name, table_type, db_partition_key, db_partition_policy, db_partition_count, tb_partition_key, tb_partition_policy, tb_partition_count,"
             + " '''' as comment from " ;
 
+    /**
+     * check system table exists
+     */
+    private final static Cache<String, Boolean> APPNAME_GSI_ENABLED = CacheBuilder.newBuilder()
+        .expireAfterWrite(1, TimeUnit.HOURS)
+        .build();
+
     private final String schema;
     private DataSource dataSource;
 
@@ -108,6 +178,13 @@ public class GsiMetaManager extends AbstractLifecycle {
     public GsiMetaManager(DataSource dataSource, String schema) {
         this.dataSource = dataSource;
         this.schema = schema;
+    }
+
+    public static void invalidateCache(String appname) {
+        if (TStringUtil.isBlank(appname)) {
+            return;
+        }
+        APPNAME_GSI_ENABLED.invalidate(appname);
     }
 
     public GsiMetaBean getAllGsiMetaBean(String schema) {
@@ -214,6 +291,7 @@ public class GsiMetaManager extends AbstractLifecycle {
      * for CREATE TABLE / CREATE INDEX / ALTER TABLE ADD INDEX
      */
     public void insertIndexMetaForPolarX(Connection connection, List<IndexRecord> indexRecords) {
+
         try {
 //            Collections.sort(indexRecords, Comparator.comparing(IndexRecord::getColumnName));
 //            Collections.reverse(indexRecords);
@@ -298,6 +376,88 @@ public class GsiMetaManager extends AbstractLifecycle {
     }
 
     /**
+     * Alter gsi visibility from before -> after.
+     */
+    public long updateIndexVisibility(Connection connection, String schemaName, String tableName, String indexName,
+                                      IndexVisibility beforeVisibility, IndexVisibility afterVisibility) {
+        try {
+            String sql = getSqlUpdateIndexVisibility();
+            List params = ImmutableList.of(
+                stringParamRow(String
+                        .valueOf(afterVisibility.getValue()), schemaName, tableName, indexName,
+                    String.valueOf(beforeVisibility.getValue())
+                ));
+            doExecuteUpdate(sql,
+                params,
+                connection);
+
+            return 0;
+        } catch (SQLException e) {
+            throw new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_EXECUTE,
+                e,
+                "update Global Secondary Index visibility failed!");
+        }
+    }
+
+    /**
+     * Remove index meta of specified status, and remove table meta if no index after removing.
+     * Typical: Removing index with creating status for rollback.
+     */
+    public void removeIndexMetaWithStatus(String schemaName, String tableName, IndexStatus status) {
+
+        wrapWithTransaction(dataSource, connection -> {
+            List<IndexRecord> indexRecords = doExecuteQuery(getSqlGetIndexInfoByPrimaryTableAndStatus(),
+                stringParamRow(schemaName, tableName, String.valueOf(status.getValue())),
+                connection,
+                IndexRecord.ORM);
+            if (indexRecords.size() > 0) {
+                // Remove index meta.
+                doExecuteUpdate(getSqlRemoveIndexMetaWithStatus(),
+                    ImmutableList.of(stringParamRow(schemaName, tableName, String.valueOf(status.getValue()))),
+                    connection);
+                // Remove table meta.
+                Set<String> indexNameSet = new HashSet<>();
+                for (IndexRecord indexRecord : indexRecords) {
+                    indexNameSet.add(indexRecord.getIndexName());
+                }
+                boolean isNewPartDb = DbInfoManager.getInstance().isNewPartitionDb(schemaName);
+                if (!isNewPartDb) {
+                    for (String indexName : indexNameSet) {
+                        doExecuteUpdate(getSqlRemoveTableMeta(),
+                            ImmutableList.of(stringParamRow(schemaName, indexName)),
+                            connection);
+                    }
+                } else {
+                    for (String indexName : indexNameSet) {
+                        removePartitionTableMeta(schemaName, indexName, connection);
+                    }
+                }
+            }
+        }, (e) -> new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_EXECUTE, e,
+            "update Global Secondary Index status failed!"));
+    }
+
+    /**
+     * for ALTER DROP INDEX
+     */
+    public void removeIndexMeta(String schemaName, String tableName, String indexName) {
+        boolean isNewPartDb = DbInfoManager.getInstance().isNewPartitionDb(schemaName);
+
+        wrapWithTransaction(dataSource, connection -> {
+            doExecuteUpdate(getSqlRemoveIndexMeta(),
+                ImmutableList.of(stringParamRow(schemaName, tableName, indexName)),
+                connection);
+            if (!isNewPartDb) {
+                doExecuteUpdate(getSqlRemoveTableMeta(), ImmutableList.of(stringParamRow(schemaName, indexName)),
+                    connection);
+            } else {
+                removePartitionTableMeta(schemaName, indexName, connection);
+            }
+        }, (e) -> new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_EXECUTE, e,
+            "remove Global Secondary Index meta failed!"));
+    }
+
+    /**
      * for ALTER DROP INDEX
      */
     public void removeIndexMeta(Connection connection, String schemaName, String tableName, String indexName) {
@@ -351,12 +511,35 @@ public class GsiMetaManager extends AbstractLifecycle {
         }
     }
 
+    /**
+     * for ALTER CHANGE COLUMN
+     */
+    public void changeColumnMetaNotAddVersion(Connection connection, String schemaName, String tableName,
+                                              String indexName, String oldColumnName, String newColumnName,
+                                              String nullable) {
+
+        try {
+            doExecuteUpdate(getSqlChangeColumnMeta(),
+                ImmutableList
+                    .of(stringParamRow(newColumnName, nullable, schemaName, tableName, indexName, oldColumnName)),
+                connection);
+        } catch (SQLException e) {
+            throw new TddlRuntimeException(ErrorCode.ERR_GLOBAL_SECONDARY_INDEX_EXECUTE,
+                e,
+                "update Global Secondary Index meta failed!");
+        }
+    }
+
     // ~ Native methods
     // -----------------------------------------------------------------------------------------------------
 
     @Override
     protected void doInit() {
         // PolarDB-X has its own schema change.
+    }
+
+    private boolean check() {
+        return true;
     }
 
     private List<TableRecord> getAllTableRecords(String schema) {
@@ -465,7 +648,7 @@ public class GsiMetaManager extends AbstractLifecycle {
         }
     }
 
-    private List<TableRecord> getTableRecords(String schema, String tableName) {
+    public List<TableRecord> getTableRecords(String schema, String tableName) {
         try {
             String queryTblInfoSql;
             if (DbInfoManager.getInstance().isNewPartitionDb(schema)) {
@@ -825,12 +1008,19 @@ public class GsiMetaManager extends AbstractLifecycle {
     private static final String SQL_UPDATE_INDEX_STATUS_ANY_CURRENT_STATUS =
         "UPDATE {0} SET INDEX_STATUS = ? WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? AND INDEX_LOCATION = 1";
 
+    private static final String SQL_UPDATE_INDEX_VISIBILITY =
+        "UPDATE {0} SET VISIBLE = ? WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? AND VISIBLE = ? AND INDEX_LOCATION = 1";
+
     private String getSqlUpdateIndexStatus() {
         return MessageFormat.format(SQL_UPDATE_INDEX_STATUS, GmsSystemTables.INDEXES);
     }
 
     private String getSqlUpdateIndexStatusAnyCurrentStatus() {
         return MessageFormat.format(SQL_UPDATE_INDEX_STATUS_ANY_CURRENT_STATUS, GmsSystemTables.INDEXES);
+    }
+
+    private String getSqlUpdateIndexVisibility() {
+        return MessageFormat.format(SQL_UPDATE_INDEX_VISIBILITY, GmsSystemTables.INDEXES);
     }
 
     private static final String SQL_REMOVE_INDEX_META_WITH_STATUS =
@@ -1022,7 +1212,7 @@ public class GsiMetaManager extends AbstractLifecycle {
     }
 
     public enum TableType {
-        SINGLE(0), SHARDING(1), BROADCAST(2), GSI(3);
+        SINGLE(0), SHARDING(1), BROADCAST(2), GSI(3), COLUMNAR(4);
 
         private final int value;
 
@@ -1040,6 +1230,8 @@ public class GsiMetaManager extends AbstractLifecycle {
                 return BROADCAST;
             case 3:
                 return GSI;
+            case 4:
+                return COLUMNAR;
             default:
                 return null;
             }
@@ -1081,6 +1273,24 @@ public class GsiMetaManager extends AbstractLifecycle {
         public boolean isGsi(String tableName) {
             return !isEmpty() && tableMeta.containsKey(tableName)
                 && tableMeta.get(tableName).tableType == TableType.GSI;
+        }
+
+        public boolean isColumnar(String tableName) {
+            return !isEmpty() && tableMeta.containsKey(tableName)
+                && tableMeta.get(tableName).tableType == TableType.COLUMNAR;
+        }
+
+        public boolean withColumnar(String tableName) {
+            return !isEmpty() && tableMeta.containsKey(tableName)
+                && tableMeta.get(tableName).tableType != TableType.COLUMNAR
+                && GeneralUtil.isNotEmpty(tableMeta.get(tableName).indexMap);
+        }
+
+        public boolean isGsiOrCci(String tableName) {
+            return !isEmpty()
+                && tableMeta.containsKey(tableName)
+                && (tableMeta.get(tableName).tableType == TableType.GSI
+                || tableMeta.get(tableName).tableType == TableType.COLUMNAR);
         }
 
         public boolean isEmpty() {
@@ -1269,7 +1479,8 @@ public class GsiMetaManager extends AbstractLifecycle {
             // index tables in __DRDS__SYSTABLE__TABLES__
             final Set<String> tableNameSet = new HashSet<>();
             for (final TableRecord tableRecord : allTableRecords) {
-                if (tableRecord.tableType != TableType.GSI.getValue()) {
+                if (tableRecord.tableType != TableType.GSI.getValue()
+                    && tableRecord.tableType != TableType.COLUMNAR.getValue()) {
                     continue;
                 }
 
@@ -1293,7 +1504,8 @@ public class GsiMetaManager extends AbstractLifecycle {
                     tableRecord.tbPartitionKey,
                     tableRecord.tbPartitionPolicy,
                     tableRecord.tbPartitionCount,
-                    tableType == TableType.GSI ? TreeMaps.caseInsensitiveMap() :
+                    (tableType == TableType.GSI || tableType == TableType.COLUMNAR) ?
+                        TreeMaps.caseInsensitiveMap() :
                         tmpTableIndexMap.get(fullName ?
                             SqlIdentifier.surroundWithBacktick(tableRecord.tableSchema) + "." + SqlIdentifier
                                 .surroundWithBacktick(tableRecord.tableName) : tableRecord.tableName),
@@ -1381,7 +1593,10 @@ public class GsiMetaManager extends AbstractLifecycle {
                         indexRecord.indexTableName,
                         IndexStatus.from((int) indexRecord.indexStatus),
                         indexRecord.version,
-                        (indexRecord.flag & IndexesRecord.FLAG_CLUSTERED) != 0L));
+                        (indexRecord.flag & IndexesRecord.FLAG_CLUSTERED) != 0L,
+                        (indexRecord.flag & IndexesRecord.FLAG_COLUMNAR) != 0L,
+                        IndexVisibility.convert(indexRecord.visible))
+                );
 
                 tmpIndexColumnMap.computeIfAbsent(
                     fullName ? SqlIdentifier.surroundWithBacktick(indexRecord.indexSchema) + "."
@@ -1564,6 +1779,7 @@ public class GsiMetaManager extends AbstractLifecycle {
         public final boolean nonUnique;
         public final String indexSchema;
         public final String indexName;
+
         public final List<GsiIndexColumnMetaBean> indexColumns;
         public final List<GsiIndexColumnMetaBean> coveringColumns;
         public final String indexType;
@@ -1574,12 +1790,15 @@ public class GsiMetaManager extends AbstractLifecycle {
         public final IndexStatus indexStatus;
         public final long version;
         public final boolean clusteredIndex;
+        public final boolean columnarIndex;
+        public final IndexVisibility visibility;
 
         public GsiIndexMetaBean(String tableCatalog, String tableSchema, String tableName, boolean nonUnique,
                                 String indexSchema, String indexName, List<GsiIndexColumnMetaBean> indexColumns,
                                 List<GsiIndexColumnMetaBean> coveringColumns, String indexType, String comment,
                                 String indexComment, SqlIndexResiding indexLocation, String indexTableName,
-                                IndexStatus indexStatus, long version, boolean clusteredIndex) {
+                                IndexStatus indexStatus, long version, boolean clusteredIndex, boolean columnarIndex,
+                                IndexVisibility visibility) {
             this.tableCatalog = tableCatalog;
             this.tableSchema = tableSchema;
             this.tableName = tableName;
@@ -1596,6 +1815,16 @@ public class GsiMetaManager extends AbstractLifecycle {
             this.indexStatus = indexStatus;
             this.version = version;
             this.clusteredIndex = clusteredIndex;
+            this.columnarIndex = columnarIndex;
+            this.visibility = visibility;
+        }
+
+        public List<GsiIndexColumnMetaBean> getIndexColumns() {
+            return indexColumns;
+        }
+
+        public List<GsiIndexColumnMetaBean> getCoveringColumns() {
+            return coveringColumns;
         }
 
         public GsiIndexMetaBean clone() {
@@ -1605,9 +1834,9 @@ public class GsiMetaManager extends AbstractLifecycle {
             newCoveringColumns.addAll(coveringColumns);
             return new GsiIndexMetaBean(tableCatalog, tableSchema, tableName, nonUnique,
                 indexSchema, indexName, newIndexColumns,
-                newCoveringColumns , indexType, comment,
+                newCoveringColumns, indexType, comment,
                 indexComment, indexLocation, indexTableName,
-                indexStatus, version, clusteredIndex);
+                indexStatus, version, clusteredIndex, columnarIndex, visibility);
         }
 
         @Override
@@ -1624,6 +1853,9 @@ public class GsiMetaManager extends AbstractLifecycle {
             hashcode += indexStatus.getValue();
             if (clusteredIndex) {
                 hashcode += 0xA55A; // Magic number.
+            }
+            if (columnarIndex) {
+                hashcode += 0xB66B; // Magic number.
             }
             return hashcode;
         }
@@ -1642,6 +1874,7 @@ public class GsiMetaManager extends AbstractLifecycle {
         }
     }
 
+    @Getter
     public static class TableRecord extends GsiMeta implements Orm<TableRecord> {
 
         public static TableRecord ORM = new TableRecord();
@@ -1757,12 +1990,18 @@ public class GsiMetaManager extends AbstractLifecycle {
         private final long indexStatus;
         private final long version;
         public final long flag;
+        /**
+         * visible字段的处理:
+         * 1. 读取时使用orm读出
+         * 2. 写入时不带visible字段，直接使用default值
+         */
+        public final long visible;
 
         public IndexRecord(long id, String tableCatalog, String tableSchema, String tableName, boolean nonUnique,
                            String indexSchema, String indexName, long seqInIndex, String columnName, String collation,
                            long cardinality, Long subPart, String packed, String nullable, String indexType,
                            String comment, String indexComment, long indexColumnType, long indexLocation,
-                           String indexTableName, long indexStatus, long version, long flag) {
+                           String indexTableName, long indexStatus, long version, long flag, long visibility) {
             this.id = id;
             this.tableCatalog = tableCatalog;
             this.tableSchema = tableSchema;
@@ -1786,6 +2025,7 @@ public class GsiMetaManager extends AbstractLifecycle {
             this.indexStatus = indexStatus;
             this.version = version;
             this.flag = flag;
+            this.visible = visibility;
         }
 
         private IndexRecord() {
@@ -1812,33 +2052,62 @@ public class GsiMetaManager extends AbstractLifecycle {
             this.indexStatus = -1;
             this.version = -1;
             this.flag = 0;
+            this.visible = IndexVisibility.VISIBLE.getValue();
         }
 
         @Override
         public IndexRecord convert(ResultSet resultSet) throws SQLException {
-            return new IndexRecord(resultSet.getLong("id"),
-                resultSet.getString("table_catalog"),
-                resultSet.getString("table_schema"),
-                resultSet.getString("table_name"),
-                resultSet.getInt("non_unique") != 0,
-                resultSet.getString("index_schema"),
-                resultSet.getString("index_name"),
-                resultSet.getLong("seq_in_index"),
-                resultSet.getString("column_name"),
-                resultSet.getString("collation"),
-                resultSet.getLong("cardinality"),
-                resultSet.getLong("sub_part") == 0 ? null : resultSet.getLong("sub_part"),
-                resultSet.getString("packed"),
-                resultSet.getString("nullable"),
-                resultSet.getString("index_type"),
-                resultSet.getString("comment"),
-                resultSet.getString("index_comment"),
-                resultSet.getLong("index_column_type"),
-                resultSet.getLong("index_location"),
-                resultSet.getString("index_table_name"),
-                resultSet.getLong("index_status"),
-                resultSet.getLong("version"),
-                resultSet.getLong("flag"));
+            if (ConfigDataMode.isPolarDbX()) {
+                return new IndexRecord(resultSet.getLong("id"),
+                    resultSet.getString("table_catalog"),
+                    resultSet.getString("table_schema"),
+                    resultSet.getString("table_name"),
+                    resultSet.getInt("non_unique") != 0,
+                    resultSet.getString("index_schema"),
+                    resultSet.getString("index_name"),
+                    resultSet.getLong("seq_in_index"),
+                    resultSet.getString("column_name"),
+                    resultSet.getString("collation"),
+                    resultSet.getLong("cardinality"),
+                    resultSet.getLong("sub_part") == 0 ? null : resultSet.getLong("sub_part"),
+                    resultSet.getString("packed"),
+                    resultSet.getString("nullable"),
+                    resultSet.getString("index_type"),
+                    resultSet.getString("comment"),
+                    resultSet.getString("index_comment"),
+                    resultSet.getLong("index_column_type"),
+                    resultSet.getLong("index_location"),
+                    resultSet.getString("index_table_name"),
+                    resultSet.getLong("index_status"),
+                    resultSet.getLong("version"),
+                    resultSet.getLong("flag"),
+                    resultSet.getLong("visible"));
+            } else {
+                return new IndexRecord(resultSet.getLong("id"),
+                    resultSet.getString("table_catalog"),
+                    resultSet.getString("table_schema"),
+                    resultSet.getString("table_name"),
+                    resultSet.getInt("non_unique") != 0,
+                    resultSet.getString("index_schema"),
+                    resultSet.getString("index_name"),
+                    resultSet.getLong("seq_in_index"),
+                    resultSet.getString("column_name"),
+                    resultSet.getString("collation"),
+                    resultSet.getLong("cardinality"),
+                    resultSet.getLong("sub_part") == 0 ? null : resultSet.getLong("sub_part"),
+                    resultSet.getString("packed"),
+                    resultSet.getString("nullable"),
+                    resultSet.getString("index_type"),
+                    resultSet.getString("comment"),
+                    resultSet.getString("index_comment"),
+                    resultSet.getLong("index_column_type"),
+                    resultSet.getLong("index_location"),
+                    resultSet.getString("index_table_name"),
+                    resultSet.getLong("index_status"),
+                    resultSet.getLong("version"),
+                    0,
+                    resultSet.getLong("visible"));
+            }
         }
 
         @Override
